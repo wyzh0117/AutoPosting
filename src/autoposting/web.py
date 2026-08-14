@@ -33,7 +33,7 @@ from .workbench import (
     _download_image as download_image,
 )
 
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.4.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -494,7 +494,7 @@ body.chat-expanded #article-view{flex:1 0 auto;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v0.3.4 · 本地服务</span>
+  <span id="service-status">v0.4.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
 </header>
 <main>

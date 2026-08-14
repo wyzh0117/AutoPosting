@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoposting"
+version = "0.4.0"
+description = "Configurable local MVP for traceable AI news drafting"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+autoposting = "autoposting.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

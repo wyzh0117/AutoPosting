@@ -166,7 +166,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("0.3.4", payload["version"])
+        self.assertEqual("0.4.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1239,7 +1239,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("0.3.4", html)
+        self.assertIn("0.4.0", html)
 
     def test_patch_020_compact_chat_contract(self) -> None:
         html = self._index()
