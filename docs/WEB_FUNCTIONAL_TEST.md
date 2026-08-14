@@ -11,7 +11,7 @@
 | 字段 | 值 |
 | --- | --- |
 | 接口地址 | `https://api.deepseek.com` |
-| API Key | `sk-6c7d88667641487fa47c570e3eb2a9ef` |
+| API Key | `sk-REPLACE-ME` |
 
 说明：工作台会把 `https://api.deepseek.com` 自动补成 `https://api.deepseek.com/v1`。也可直接填带 `/v1` 的地址。连接后选 `deepseek-chat` 做文章和对话。
 
