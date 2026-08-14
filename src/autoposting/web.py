@@ -247,8 +247,8 @@ button.seg.active{
 #hotspot-list li:nth-child(4){animation-delay:160ms;}
 #hotspot-list li:nth-child(5){animation-delay:200ms;}
 #hotspot-list li:nth-child(n+6){animation-delay:240ms;}
-#hotspot-list::-webkit-scrollbar, .dialog-content::-webkit-scrollbar, .article-scroll::-webkit-scrollbar, #chat-output::-webkit-scrollbar, #image-picker-list::-webkit-scrollbar{width:4px;}
-#hotspot-list::-webkit-scrollbar-thumb, .dialog-content::-webkit-scrollbar-thumb, .article-scroll::-webkit-scrollbar-thumb, #chat-output::-webkit-scrollbar-thumb, #image-picker-list::-webkit-scrollbar-thumb{background:var(--accent-gradient-2); border-radius:4px;}
+#hotspot-list::-webkit-scrollbar, .dialog-content::-webkit-scrollbar, .article-scroll::-webkit-scrollbar, #chat-output::-webkit-scrollbar, #image-picker-list::-webkit-scrollbar, #hook-list::-webkit-scrollbar{width:4px;}
+#hotspot-list::-webkit-scrollbar-thumb, .dialog-content::-webkit-scrollbar-thumb, .article-scroll::-webkit-scrollbar-thumb, #chat-output::-webkit-scrollbar-thumb, #image-picker-list::-webkit-scrollbar-thumb, #hook-list::-webkit-scrollbar-thumb{background:var(--accent-gradient-2); border-radius:4px;}
 .hotspot-item{
   display:block; width:100%; text-align:left;
   background:var(--bg-input); border:1px solid transparent;
@@ -281,6 +281,32 @@ button.seg.active{
 .ht-zh-unavailable{display:block; color:var(--warn); margin:0 0 .4rem; font-size:.82rem;}
 .ht-meta{display:block; font-size:.72rem; color:var(--text-muted); border-top:1px solid rgba(243, 238, 228, 0.05); padding-top:.65rem;}
 .hotspot-empty{padding:.8rem .2rem; color:var(--text-muted);}
+#hook-list{
+  list-style:none; margin:0 0 .75rem; padding:0 .3rem 0 0;
+  display:flex; flex-direction:column; gap:.55rem;
+  max-height:18rem; overflow-y:auto; overscroll-behavior:contain;
+  scrollbar-width:thin; scrollbar-gutter:stable;
+}
+#hook-list[hidden]{display:none;}
+.hook-card{
+  background:var(--bg-input); border:1px solid var(--border);
+  border-radius:var(--radius-md); padding:.65rem .75rem;
+}
+.hook-row{display:flex; align-items:flex-start; gap:.55rem;}
+.hook-row input{margin:.28rem 0 0; flex:0 0 auto;}
+.hook-body{min-width:0; flex:1 1 auto;}
+.hook-title-row{display:flex; flex-wrap:wrap; align-items:baseline; gap:.35rem .5rem; margin-bottom:.25rem;}
+.hook-phrase{font-weight:600; color:var(--text-main);}
+.hook-kind{
+  font-size:.68rem; color:var(--accent); font-weight:600;
+  background:rgba(196, 164, 106, 0.08); border:1px solid rgba(196, 164, 106, 0.18);
+  padding:.1rem .4rem; border-radius:4px;
+}
+.hook-priority{font-size:.68rem; color:var(--accent); font-weight:600;}
+.hook-why{margin:0 0 .3rem; font-size:.78rem; color:var(--text-muted); line-height:1.4;}
+.hook-results{margin:.15rem 0 0; padding:0 0 0 1.05rem; display:flex; flex-direction:column; gap:.25rem;}
+.hook-results a{color:var(--accent); word-break:break-word;}
+.hook-snippet{display:block; font-size:.75rem; color:var(--text-muted); line-height:1.4;}
 
 #article-empty{color:var(--text-muted); font-size:.9rem; padding:.75rem 0; margin:0; text-align:center;}
 #article-panel{min-height:0; height:auto; overflow:visible;}
@@ -515,9 +541,13 @@ body.chat-expanded #article-view{flex:1 0 auto;}
         <button type="button" id="seg-wechat" class="seg active" data-platform="wechat" aria-pressed="true">微信</button>
         <button type="button" id="seg-xhs" class="seg" data-platform="xiaohongshu" aria-pressed="false">小红书</button>
       </div>
+      <div class="row">
+      <button type="button" id="find-hooks-btn" disabled>找切口</button>
       <button type="button" id="generate-btn" class="btn-magic" disabled>生成文章</button>
+      </div>
     </div>
     <p id="article-status" role="status" aria-live="polite"></p>
+    <ul id="hook-list" hidden></ul>
     <p id="article-empty">尚未生成文章</p>
     <article id="article-view">
       <div id="article-scroll" class="article-scroll" hidden>
@@ -1148,6 +1178,7 @@ function showApiError(prefix, error) {
 function selectHotspot(item, button) {
   state.item = item;
   resetArticle();
+  clearHooks();
   var nodes = $("hotspot-list").querySelectorAll(".hotspot-item");
   nodes.forEach(function (node) {
     var active = node === button;
@@ -1155,6 +1186,7 @@ function selectHotspot(item, button) {
     node.classList.toggle("selected", active);
   });
   $("generate-btn").disabled = false;
+  $("find-hooks-btn").disabled = false;
 }
 
 function rankedCount(data) {
@@ -1466,6 +1498,92 @@ function renderArticle(data) {
   fitArticleBody();
 }
 
+state.hooks = [];
+state.chosenHookIds = [];
+
+function clearHooks() {
+  state.hooks = [];
+  state.chosenHookIds = [];
+  $("hook-list").textContent = "";
+  $("hook-list").hidden = true;
+}
+
+function selectedHookCards() {
+  return state.chosenHookIds.map(function (id) {
+    return state.hooks.find(function (hook) { return hook.hook_id === id; });
+  }).filter(Boolean);
+}
+
+function relabelHookCards() {
+  $("hook-list").querySelectorAll(".hook-card").forEach(function (card) {
+    var label = card.querySelector(".hook-priority");
+    if (!label) { return; }
+    var pos = state.chosenHookIds.indexOf(card.dataset.hookId);
+    label.textContent = pos === 0 ? "主切口" : (pos > 0 ? "须进开头" : "");
+  });
+}
+
+function renderHooks(hooks) {
+  state.hooks = hooks || [];
+  state.chosenHookIds = [];
+  var list = $("hook-list");
+  list.textContent = "";
+  state.hooks.forEach(function (hook) {
+    var card = el("li", "hook-card");
+    card.dataset.hookId = hook.hook_id;
+    var row = el("div", "hook-row");
+    var check = document.createElement("input");
+    check.type = "checkbox";
+    check.addEventListener("change", function () {
+      var id = hook.hook_id;
+      var pos = state.chosenHookIds.indexOf(id);
+      if (check.checked) {
+        if (pos < 0) { state.chosenHookIds.push(id); }
+      } else if (pos >= 0) {
+        state.chosenHookIds.splice(pos, 1);
+      }
+      relabelHookCards();
+    });
+    row.appendChild(check);
+    var body = el("div", "hook-body");
+    var titleRow = el("div", "hook-title-row");
+    titleRow.appendChild(el("span", "hook-phrase", hook.phrase || ""));
+    titleRow.appendChild(el("span", "hook-kind", hook.kind || ""));
+    titleRow.appendChild(el("span", "hook-priority", ""));
+    body.appendChild(titleRow);
+    if (hook.why) { body.appendChild(el("p", "hook-why", hook.why)); }
+    var results = el("ul", "hook-results");
+    (hook.results || []).slice(0, 3).forEach(function (result) {
+      var item = document.createElement("li");
+      var link = document.createElement("a");
+      link.href = result.url || "";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = result.title || result.url || "";
+      item.appendChild(link);
+      if (result.snippet) { item.appendChild(el("span", "hook-snippet", result.snippet)); }
+      results.appendChild(item);
+    });
+    if (results.childNodes.length) { body.appendChild(results); }
+    row.appendChild(body);
+    card.appendChild(row);
+    list.appendChild(card);
+  });
+  list.hidden = state.hooks.length === 0;
+}
+
+function findHooks() {
+  if (!state.item) { return; }
+  var button = $("find-hooks-btn");
+  busy(button, true);
+  api("/api/hooks/find", {item_id: state.item.item_id}).then(function (data) {
+    renderHooks(data.hooks || []);
+    status("article-status", (data.hooks && data.hooks.length) ? "" : (data.message || "未发现可用切口"), (data.hooks && data.hooks.length) ? "" : "error");
+  }).catch(function (error) {
+    status("article-status", showApiError("找切口失败：", error), "error");
+  }).then(function () { busy(button, false); });
+}
+
 function generate() {
   if (!state.item) { return; }
   var button = $("generate-btn");
@@ -1474,13 +1592,18 @@ function generate() {
     status("article-status", "请先在设置中填写模型", "error");
     return;
   }
-  busy(button, true);
-  api("/api/articles", {
+  var payload = {
     item_id: state.item.item_id,
     platform: state.platform,
     model: llm.model,
     effort: llm.effort,
-  }).then(function (data) {
+  };
+  var chosen = selectedHookCards();
+  if (chosen.length > 0) {
+    payload.chosen_hooks = chosen;
+  }
+  busy(button, true);
+  api("/api/articles", payload).then(function (data) {
     state.draft = data;
     renderArticle(data);
     $("publish-btn").disabled = false;
@@ -1734,6 +1857,7 @@ document.querySelectorAll("[data-rank]").forEach(function (tab) {
 });
 $("seg-wechat").addEventListener("click", function () { setPlatform("wechat"); });
 $("seg-xhs").addEventListener("click", function () { setPlatform("xiaohongshu"); });
+$("find-hooks-btn").addEventListener("click", findHooks);
 $("generate-btn").addEventListener("click", generate);
 $("save-article-btn").addEventListener("click", saveArticle);
 $("image-rescan").addEventListener("click", rescanImages);

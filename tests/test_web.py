@@ -1076,6 +1076,27 @@ class WebApiTests(unittest.TestCase):
         server = create_server(self.app, "localhost", 0)
         server.server_close()
 
+    def _index(self) -> str:
+        request = urllib.request.Request(self.base_url + "/", method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertIn("text/html", response.headers["Content-Type"])
+            return response.read().decode("utf-8")
+
+    def test_find_hooks_workbench_contract(self) -> None:
+        html = self._index()
+        self.assertIn("找切口", html)
+        self.assertIn('id="find-hooks-btn"', html)
+        self.assertIn('id="hook-list"', html)
+        self.assertIn('api("/api/hooks/find"', html)
+        self.assertIn("chosen_hooks", html)
+        self.assertIn("主切口", html)
+        self.assertIn("须进开头", html)
+        self.assertIn("state.chosenHookIds", html)
+        self.assertIn("function clearHooks()", html)
+        self.assertIn("clearHooks()", html)
+        self.assertLess(html.index("找切口"), html.index("生成文章"))
+        self.assertNotIn('api("/api/hooks/find"', html.split("function generate()")[1].split("function persistArticle()")[0])
+
 
 class IndexPageContractTests(unittest.TestCase):
     def setUp(self) -> None:
