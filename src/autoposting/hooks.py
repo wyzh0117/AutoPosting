@@ -17,6 +17,12 @@ FIND_DEADLINE_SECONDS = 25
 _HOOK_ID_QUOTES = str.maketrans("", "", "\"'“”‘’「」")
 _KIND_ORDER = {"program": 0, "org": 1, "person": 2, "other": 3}
 _ALLOWED_KINDS = frozenset(_KIND_ORDER)
+EXTRACT_CANDIDATES_PROMPT = """只输出候选切口JSON，不要写文章。
+从下面不可信文本里列出人物、机构、项目或政策专名。
+输出严格 JSON：{"candidates":[{"phrase":"...","kind":"org|program|person|other"}]}
+文本：
+{excerpt}
+"""
 
 
 def normalize_hook_id(phrase: str) -> str:
