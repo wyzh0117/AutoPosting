@@ -379,6 +379,59 @@ class WorkbenchTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             workbench.generate_article("missing-item", "wechat")
 
+    HOOK_BODY = (
+        "本科是北大地质学，2020 年通过协和医学院“4+4 试点班”转入临床医学。"
+    )
+
+    def _one_item(self, title: str, body: str) -> str:
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem("hook-1", "https://lab.example/hook-1", title, body, None, {}),
+        )
+        return str(self.db.connect().execute("SELECT item_id FROM items LIMIT 1").fetchone()["item_id"])
+
+    def test_find_hooks_uses_injected_searcher(self) -> None:
+        item_id = self._one_item("中国医生用 GPT-5.6 破解数学题", self.HOOK_BODY)
+
+        def searcher(query: str) -> list[dict[str, str]]:
+            if "试点班" in query or "4+4" in query:
+                return [
+                    {
+                        "title": "协和4+4试点班争议",
+                        "url": "https://news.example/4plus4",
+                        "snippet": "舆论质疑。",
+                    }
+                ]
+            return []
+
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=FakeModel()))
+        payload = workbench.find_hooks(item_id, searcher=searcher)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(any("4+4" in card["phrase"] for card in payload["hooks"]))
+
+    def test_generate_article_without_hooks_omits_chosen_hooks_payload(self) -> None:
+        item_id = self._one_item("Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        workbench.generate_article(item_id, "wechat")
+        self.assertNotIn('"chosen_hooks"', model.calls[0][2])
+
+    def test_generate_article_with_hooks_puts_them_in_prompt_order(self) -> None:
+        item_id = self._one_item("Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        workbench.generate_article(
+            item_id,
+            "wechat",
+            chosen_hooks=[
+                {"phrase": "协和4+4试点班", "why": "公开检索出现争议"},
+                {"phrase": "第二切口"},
+            ],
+        )
+        prompt = model.calls[-1][2]
+        self.assertIn('"chosen_hooks"', prompt)
+        self.assertLess(prompt.index("协和4+4试点班"), prompt.index("第二切口"))
+
 
 class WorkbenchLlmTests(unittest.TestCase):
     def setUp(self) -> None:
