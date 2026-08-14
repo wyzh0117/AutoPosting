@@ -1500,6 +1500,7 @@ function renderArticle(data) {
 
 state.hooks = [];
 state.chosenHookIds = [];
+state.findHooksGen = 0;
 
 function clearHooks() {
   state.hooks = [];
@@ -1574,14 +1575,20 @@ function renderHooks(hooks) {
 
 function findHooks() {
   if (!state.item) { return; }
+  var itemId = state.item.item_id;
+  var gen = ++state.findHooksGen;
   var button = $("find-hooks-btn");
   busy(button, true);
-  api("/api/hooks/find", {item_id: state.item.item_id}).then(function (data) {
+  api("/api/hooks/find", {item_id: itemId}).then(function (data) {
+    if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
     renderHooks(data.hooks || []);
     status("article-status", (data.hooks && data.hooks.length) ? "" : (data.message || "未发现可用切口"), (data.hooks && data.hooks.length) ? "" : "error");
   }).catch(function (error) {
+    if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
     status("article-status", showApiError("找切口失败：", error), "error");
-  }).then(function () { busy(button, false); });
+  }).then(function () {
+    if (gen === state.findHooksGen) { busy(button, false); }
+  });
 }
 
 function generate() {

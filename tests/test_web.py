@@ -1094,6 +1094,8 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("state.chosenHookIds", html)
         self.assertIn("function clearHooks()", html)
         self.assertIn("clearHooks()", html)
+        self.assertIn("var itemId = state.item.item_id", html)
+        self.assertIn("state.item.item_id !== itemId", html)
         self.assertLess(html.index("找切口"), html.index("生成文章"))
         self.assertNotIn('api("/api/hooks/find"', html.split("function generate()")[1].split("function persistArticle()")[0])
 
