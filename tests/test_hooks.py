@@ -4,8 +4,10 @@ from autoposting.hooks import (
     EMPTY_HOOKS_MESSAGE,
     extract_rule_phrases,
     filter_results,
+    find_hooks,
     normalize_hook_id,
     sanitize_chosen_hooks,
+    select_search_queue,
 )
 
 
@@ -62,3 +64,63 @@ class HookUnitTests(unittest.TestCase):
         self.assertEqual(["协和4+4", "第二切口"], [item["phrase"] for item in cleaned])
         self.assertTrue(cleaned[0]["hook_id"])
         self.assertEqual(EMPTY_HOOKS_MESSAGE, "未发现可用切口")
+
+
+class HookSearchTests(unittest.TestCase):
+    def test_title_core_does_not_fill_search_queue(self) -> None:
+        title = "中国医生用 GPT-5.6 破解 Crouzeix 猜想"
+        extras = (
+            [{"phrase": "GPT-5.6", "kind": "other"}, {"phrase": "Crouzeix", "kind": "person"}]
+            + [{"phrase": f"项目{index}试点班", "kind": "program"} for index in range(8)]
+        )
+        queue = select_search_queue(extras, title, limit=8)
+        self.assertEqual(8, len(queue))
+        self.assertTrue(all("试点班" in item["phrase"] for item in queue))
+
+    def test_find_hooks_returns_controversy_card_only(self) -> None:
+        def searcher(query: str) -> list[dict[str, str]]:
+            if "4+4" in query or "试点班" in query:
+                return [
+                    {
+                        "title": "协和4+4试点班争议",
+                        "url": "https://news.example/4plus4",
+                        "snippet": "该培养方案曾引发舆论。",
+                    }
+                ]
+            return [
+                {
+                    "title": query.replace(" 争议", "") + " 人物简介",
+                    "url": "https://news.example/bio",
+                    "snippet": "履历介绍，无风波。",
+                }
+            ]
+
+        hooks = find_hooks(
+            "中国医生用 GPT-5.6 破解 22 年数学难题",
+            FIXTURE,
+            searcher,
+        )
+        self.assertTrue(hooks)
+        self.assertTrue(any("4+4" in card["phrase"] for card in hooks))
+        self.assertTrue(all("争议" in " ".join(r["title"] + r["snippet"] for r in card["results"]) for card in hooks))
+        self.assertIn("公开检索出现", hooks[0]["why"])
+
+    def test_find_hooks_empty_when_searcher_returns_nothing(self) -> None:
+        self.assertEqual([], find_hooks("标题", "没有专名", lambda query: []))
+
+    def test_single_search_failure_does_not_kill_others(self) -> None:
+        def searcher(query: str) -> list[dict[str, str]]:
+            if "地质" in query:
+                raise OSError("timeout")
+            if "试点班" in query or "4+4" in query:
+                return [
+                    {
+                        "title": "协和4+4试点班风波",
+                        "url": "https://news.example/4plus4",
+                        "snippet": "舆论质疑选拔公平。",
+                    }
+                ]
+            return []
+
+        hooks = find_hooks("数学题", FIXTURE, searcher)
+        self.assertTrue(any("4+4" in card["phrase"] for card in hooks))
