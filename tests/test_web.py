@@ -275,6 +275,52 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("POST", "/api/articles", {"item_id": "missing", "platform": "wechat"})
         self.assertEqual(404, status)
 
+    def test_find_hooks_endpoint_and_articles_accept_chosen_hooks(self) -> None:
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem(
+                "hook-api",
+                "https://lab.example/hook-api",
+                "中国医生用 GPT-5.6 破解数学题",
+                "本科经协和医学院4+4试点班转入临床医学。",
+                None,
+                {},
+            ),
+        )
+        item_id = str(self.db.connect().execute("SELECT item_id FROM items LIMIT 1").fetchone()["item_id"])
+
+        def fake_fetch(url: str) -> bytes:
+            if "4" in url and "试点" in url or "4%2B4" in url or "%E8%AF%95%E7%82%B9" in url:
+                return (
+                    "<html><body>"
+                    '<a class="result__a" href="https://news.example/4plus4">协和4+4试点班争议</a>'
+                    '<a class="result__snippet">该项目曾引发舆论质疑。</a>'
+                    "</body></html>"
+                ).encode("utf-8")
+            return b"<html></html>"
+
+        self.app.workbench.page_fetcher = fake_fetch
+
+        status, payload = self._request("POST", "/api/hooks/find", {"item_id": "missing"})
+        self.assertEqual(404, status)
+
+        status, payload = self._request("POST", "/api/hooks/find", {"item_id": item_id})
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertIn("hooks", payload)
+
+        status, article = self._request(
+            "POST",
+            "/api/articles",
+            {
+                "item_id": item_id,
+                "platform": "wechat",
+                "chosen_hooks": [{"phrase": "协和4+4试点班", "why": "公开检索出现争议"}],
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertIn("AIGC", article["body"])
+
     def test_articles_returns_502_with_stable_code_when_llm_unavailable(self) -> None:
         item_id = self._insert_item(self.sources[0], "w1", "Model One news", "https://lab.example/w1")
         app = WebApp(
