@@ -1,0 +1,22 @@
+{
+  "topic": "frontier-model-release",
+  "now": "2026-08-08T12:00:00Z",
+  "last_triggered_at": null,
+  "baseline_counts": [1, 1, 1, 1, 1, 1, 1],
+  "config": {
+    "window_minutes": 60,
+    "min_items": 6,
+    "min_sources": 3,
+    "baseline_days": 7,
+    "stddev_multiplier": 3.0,
+    "cooldown_hours": 6
+  },
+  "observations": [
+    {"source_id": "openai_news", "tier": "S1", "observed_at": "2026-08-08T11:55:00Z"},
+    {"source_id": "verified_staff", "tier": "S2", "observed_at": "2026-08-08T11:50:00Z"},
+    {"source_id": "trusted_media", "tier": "S3", "observed_at": "2026-08-08T11:45:00Z"},
+    {"source_id": "openai_news", "tier": "S1", "observed_at": "2026-08-08T11:35:00Z"},
+    {"source_id": "verified_staff", "tier": "S2", "observed_at": "2026-08-08T11:25:00Z"},
+    {"source_id": "trusted_media", "tier": "S3", "observed_at": "2026-08-08T11:15:00Z"}
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "event": "Example AI release",
+  "claims": [
+    {
+      "text": "The official source announced the release.",
+      "source_ids": ["openai_news"],
+      "confidence": "high",
+      "traceable": true,
+      "exceeds_evidence": false,
+      "verbatim_quote_chars": 0
+    }
+  ],
+  "unknowns": [
+    "Independent benchmark results have not been verified."
+  ],
+  "conflicts": []
+}

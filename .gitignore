@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+.env
+data/
+output/
+
+.DS_Store
+.superpowers/
+
+# Local history; 0.4.0 is already tracked
+archives/autoposting-patch-0.1*
+archives/autoposting-patch-0.2*
+archives/autoposting-patch-0.3*

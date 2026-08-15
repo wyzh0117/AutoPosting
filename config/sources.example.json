@@ -1,0 +1,326 @@
+{
+  "sources": [
+    {
+      "source_id": "openai_news",
+      "name": "OpenAI News",
+      "type": "rss",
+      "url_or_handle": "https://openai.com/news/rss.xml",
+      "tier": "S1",
+      "topics": ["models", "research", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "deepseek_official",
+      "name": "DeepSeek Official",
+      "type": "sitemap",
+      "url_or_handle": "https://api-docs.deepseek.com/sitemap.xml",
+      "tier": "S1",
+      "topics": ["models", "research", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "google_ai_blog",
+      "name": "Google AI",
+      "type": "rss",
+      "url_or_handle": "https://blog.google/technology/ai/rss/",
+      "tier": "S1",
+      "topics": ["models", "research", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "google_deepmind",
+      "name": "Google DeepMind",
+      "type": "rss",
+      "url_or_handle": "https://deepmind.google/blog/rss.xml",
+      "tier": "S1",
+      "topics": ["models", "research"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "huggingface_blog",
+      "name": "Hugging Face Blog",
+      "type": "rss",
+      "url_or_handle": "https://huggingface.co/blog/feed.xml",
+      "tier": "S1",
+      "topics": ["models", "research", "products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "nvidia_ai_blog",
+      "name": "NVIDIA Generative AI",
+      "type": "rss",
+      "url_or_handle": "https://blogs.nvidia.com/blog/category/generative-ai/feed/",
+      "tier": "S1",
+      "topics": ["models", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "techcrunch_ai",
+      "name": "TechCrunch AI",
+      "type": "rss",
+      "url_or_handle": "https://techcrunch.com/category/artificial-intelligence/feed/",
+      "tier": "S3",
+      "topics": ["models", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "arstechnica_ai",
+      "name": "Ars Technica AI",
+      "type": "rss",
+      "url_or_handle": "https://arstechnica.com/ai/feed/",
+      "tier": "S3",
+      "topics": ["models", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "theverge_ai",
+      "name": "The Verge AI",
+      "type": "rss",
+      "url_or_handle": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+      "tier": "S3",
+      "topics": ["models", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "thedecoder_ai",
+      "name": "The Decoder AI",
+      "type": "rss",
+      "url_or_handle": "https://the-decoder.com/feed/",
+      "tier": "S3",
+      "topics": ["models", "products", "research"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "ithome",
+      "name": "IT之家",
+      "type": "rss",
+      "url_or_handle": "https://www.ithome.com/rss/",
+      "tier": "S3",
+      "topics": ["models", "products", "company"],
+      "enabled": true,
+      "fetch_interval": "15m",
+      "content_filter": "ai"
+    },
+    {
+      "source_id": "simonw_blog",
+      "name": "Simon Willison",
+      "type": "rss",
+      "url_or_handle": "https://simonwillison.net/atom/everything/",
+      "tier": "S3",
+      "topics": ["models", "research", "products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "interconnects",
+      "name": "Interconnects",
+      "type": "rss",
+      "url_or_handle": "https://www.interconnects.ai/feed",
+      "tier": "S3",
+      "topics": ["research", "models"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "hn_frontpage",
+      "name": "Hacker News",
+      "type": "rss",
+      "url_or_handle": "https://news.ycombinator.com/rss",
+      "tier": "S4",
+      "topics": ["models", "research", "products"],
+      "enabled": true,
+      "fetch_interval": "15m",
+      "content_filter": "ai"
+    },
+    {
+      "source_id": "aihot_aggregate",
+      "name": "AIHOT Aggregate (disabled, second-hand)",
+      "type": "web",
+      "url_or_handle": "https://aihot.virxact.com/",
+      "tier": "S2",
+      "topics": ["models", "research", "products", "company"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_openai",
+      "name": "X: OpenAI",
+      "type": "x",
+      "url_or_handle": "@OpenAI",
+      "tier": "S1",
+      "topics": ["models", "products", "company"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_deepmind",
+      "name": "X: Google DeepMind",
+      "type": "x",
+      "url_or_handle": "@GoogleDeepMind",
+      "tier": "S1",
+      "topics": ["models", "research"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_google_ai",
+      "name": "X: Google AI",
+      "type": "x",
+      "url_or_handle": "@GoogleAI",
+      "tier": "S1",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_deepseek",
+      "name": "X: DeepSeek",
+      "type": "x",
+      "url_or_handle": "@deepseek_ai",
+      "tier": "S1",
+      "topics": ["models", "research", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_anthropic",
+      "name": "X: Anthropic",
+      "type": "x",
+      "url_or_handle": "@AnthropicAI",
+      "tier": "S1",
+      "topics": ["models", "research", "company"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_qwen",
+      "name": "X: Qwen",
+      "type": "x",
+      "url_or_handle": "@Alibaba_Qwen",
+      "tier": "S1",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_zai",
+      "name": "X: Z.ai",
+      "type": "x",
+      "url_or_handle": "@Zai_org",
+      "tier": "S1",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_huggingface",
+      "name": "X: Hugging Face",
+      "type": "x",
+      "url_or_handle": "@huggingface",
+      "tier": "S1",
+      "topics": ["models", "research", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_minimax",
+      "name": "X: MiniMax",
+      "type": "x",
+      "url_or_handle": "@MiniMax_AI",
+      "tier": "S1",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": true
+    },
+    {
+      "source_id": "x_sama",
+      "name": "X: Sam Altman",
+      "type": "x",
+      "url_or_handle": "@sama",
+      "tier": "S4",
+      "topics": ["models", "company"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_karpathy",
+      "name": "X: Andrej Karpathy",
+      "type": "x",
+      "url_or_handle": "@karpathy",
+      "tier": "S4",
+      "topics": ["models", "research"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_kimmonismus",
+      "name": "X: kimmonismus",
+      "type": "x",
+      "url_or_handle": "@kimmonismus",
+      "tier": "S4",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_testingcatalog",
+      "name": "X: Testing Catalog",
+      "type": "x",
+      "url_or_handle": "@testingcatalog",
+      "tier": "S4",
+      "topics": ["models", "products"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_emollick",
+      "name": "X: Ethan Mollick",
+      "type": "x",
+      "url_or_handle": "@emollick",
+      "tier": "S4",
+      "topics": ["research", "products"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "x_bcherny",
+      "name": "X: Boris Cherny",
+      "type": "x",
+      "url_or_handle": "@bcherny",
+      "tier": "S4",
+      "topics": ["products", "research"],
+      "enabled": false,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "staff_account_placeholder",
+      "name": "Employee X account - replace after manual verification",
+      "type": "x",
+      "url_or_handle": "@replace_after_manual_verification",
+      "tier": "S2",
+      "topics": ["models"],
+      "enabled": false,
+      "fetch_interval": "15m",
+      "identity_verified": false
+    }
+  ]
+}
