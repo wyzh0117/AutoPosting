@@ -1,0 +1,29 @@
+{
+  "canvas": { "width": 1080, "height": 1440, "overflow": "hidden" },
+  "maxItems": 10,
+  "maxTags": 6,
+  "maxFeatures": 5,
+  "maxAudience": 4,
+  "maxHow": 4,
+  "maxScene": 4,
+  "maxWorkflow": 5,
+  "titleMaxLines": 2,
+  "descriptionMaxChars": 42,
+  "keyMessageMaxChars": 96,
+  "taglineMaxChars": 28,
+  "urlMaxChars": 36,
+  "minFontPx": 13,
+  "numberFormat": "compact-k",
+  "progress": "relative-to-max",
+  "imageFit": "cover",
+  "logoFit": "contain",
+  "priority": [
+    "title",
+    "keyMessage",
+    "rank",
+    "metric",
+    "features",
+    "url",
+    "decoration"
+  ]
+}

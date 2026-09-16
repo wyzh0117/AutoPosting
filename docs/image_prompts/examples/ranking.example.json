@@ -1,0 +1,87 @@
+{
+  "page": "ranking-overview",
+  "brand": "AutoPosting",
+  "series": "GitHub 本周爆火 AI 项目榜",
+  "issue": "第27期",
+  "dateRange": "2026-08-25 — 2026-08-31",
+  "kicker": "WEEKLY RANKING",
+  "title": "GitHub",
+  "subtitle": "本周爆火 AI 项目榜",
+  "source": "GitHub Search + Trending",
+  "footer": "专业 AI 科技媒体 · 每周更新",
+  "tags": ["Agent", "RAG", "MCP", "CLI", "Multi-Agent"],
+  "items": [
+    {
+      "rank": 1,
+      "name": "agency-agents",
+      "description": "把一个 AI 团队塞进电脑里",
+      "category": "AI Agent",
+      "logo": "",
+      "url": "https://github.com/example/agency-agents",
+      "metric": { "label": "Stars", "value": 11000 }
+    },
+    {
+      "rank": 2,
+      "name": "paper-rag",
+      "description": "把论文变成可检索的知识库",
+      "category": "RAG",
+      "logo": "",
+      "url": "https://github.com/example/paper-rag",
+      "metric": { "label": "Stars", "value": 8600 }
+    },
+    {
+      "rank": 3,
+      "name": "local-mcp",
+      "description": "给本地模型接上标准工具协议",
+      "category": "MCP",
+      "logo": "",
+      "url": "https://github.com/example/local-mcp",
+      "metric": { "label": "Stars", "value": 7200 }
+    },
+    {
+      "rank": 4,
+      "name": "draft-kit",
+      "description": "把长文压成可发布的信息卡片",
+      "category": "Writing",
+      "logo": "",
+      "url": "https://github.com/example/draft-kit",
+      "metric": { "label": "Stars", "value": 5400 }
+    },
+    {
+      "rank": 5,
+      "name": "eval-bench",
+      "description": "用同一套题检验不同模型",
+      "category": "Eval",
+      "logo": "",
+      "url": "https://github.com/example/eval-bench",
+      "metric": { "label": "Stars", "value": 4100 }
+    },
+    {
+      "rank": 6,
+      "name": "voice-loop",
+      "description": "实时语音进出，中间是一个 Agent",
+      "category": "Voice",
+      "logo": "",
+      "url": "https://github.com/example/voice-loop",
+      "metric": { "label": "Stars", "value": 3300 }
+    },
+    {
+      "rank": 7,
+      "name": "tiny-reasoner",
+      "description": "小模型上的分步推理脚手架",
+      "category": "Reasoning",
+      "logo": "",
+      "url": "https://github.com/example/tiny-reasoner",
+      "metric": { "label": "Stars", "value": 2100 }
+    },
+    {
+      "rank": 8,
+      "name": "dataset-garden",
+      "description": "整理、清洗、版本化训练语料",
+      "category": "Data",
+      "logo": "",
+      "url": "https://github.com/example/dataset-garden",
+      "metric": { "label": "Stars", "value": 1800 }
+    }
+  ]
+}

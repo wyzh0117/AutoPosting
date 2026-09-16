@@ -16,7 +16,7 @@ Authoritative details live in `README.md` and `AGENTS.md`; this skill is the dis
 - Web service binds `127.0.0.1:8080` (or `localhost`). Start it directly with:
   `PYTHONPATH=src python3 -m autoposting.cli web --db data/autoposting.db --sources config/sources.example.json --port 8080`
 - Restart with `ServiceController` in `service_control.py` (macOS Tk GUI, one start/stop button).
-- **Restart drops in-process WeChat credentials and writing style.** Model endpoints in SQLite and the macOS keychain survive.
+- **Restart drops writing style.** Model endpoints, WeChat/X/Xiaohongshu credentials, and model API keys survive in SQLite and the macOS keychain.
 
 ## Version bumps (all five places, in lockstep)
 
@@ -29,7 +29,9 @@ When the package version changes, update ALL of:
 
 ## Article prompting
 
-All article-model instructions live in `docs/ARTICLE_PROMPT.md`. Edit **only that file** to change how drafts are written. Do not put new 调教 copy in `llm.py`. Settings → 写作风格 is an extra overlay only.
+Article-model instructions live in `docs/ARTICLE_BASE_PROMPT.md` and named files under `docs/article_styles/` (`AI专家.md`, `经验分享.md`). Option values are `AI专家` and `经验分享`. The base file owns shared facts, output, priority, and platform rules; the style files own the selectable writing types. Do not put new 调教 copy in `llm.py`. Settings → 写作风格 is the highest-priority prompt overlay.
+
+GitHub weekly image prompts live in `docs/image_prompts/` (`STYLE.md`, `cover.md`, `poster.md`). Edit those files rather than `image_gen.py`. HTML visual pages (design system / components / schemas / renderer) also live there plus `src/autoposting/visual/`; do not fold page layout back into `STYLE.md`. Fetch weekly ranking and render images are separate API steps.
 
 ## Functional acceptance
 

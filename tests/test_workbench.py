@@ -55,12 +55,23 @@ class FakeModel:
             )
         marker = "body 必须原样包含每个来源 ID："
         source_ids = prompt.split(marker, 1)[1].splitlines()[0].strip() if marker in prompt else ""
+        citation_lines = "\n".join(
+            f"官方发布了最新进展，{source_id.strip()}。"
+            for source_id in source_ids.split(",")
+            if source_id.strip()
+        )
         body = (
-            f"导语：今日要点。\n核心信息：官方消息。\n来源与未知项：{source_ids}\n"
+            f"导语：今日要点。\n核心信息：官方消息。\n{citation_lines}\n"
             "AIGC 声明：本文由 AI 辅助生成。"
         )
+        payload = {"title": "模型一正式发布", "body": body}
+        if "caption" in prompt:
+            payload["caption"] = (
+                f"这件事刚被公开确认。\n- 官方发布了最新进展\n- 细节仍以原文为准\n"
+                f"来源：{source_ids}\nAIGC 声明：本文由 AI 辅助生成。"
+            )
         return types.SimpleNamespace(
-            stdout=json.dumps({"title": "模型一正式发布", "body": body}, ensure_ascii=False),
+            stdout=json.dumps(payload, ensure_ascii=False),
             stderr="",
             returncode=0,
         )
@@ -267,10 +278,10 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual("xiaohongshu", xiaohongshu["platform"])
         self.assertIn("body", first)
         self.assertIn("AIGC", first["body"])
-        self.assertIn("lab_blog", first["body"])
-        self.assertIn("media_feed", first["body"])
-        self.assertIn("【信息来源 2 条 · 原文 2 篇】", first["body"])
-        self.assertIn("原文链接", first["body"])
+        self.assertNotIn("lab_blog", first["body"])
+        self.assertNotIn("media_feed", first["body"])
+        self.assertNotIn("【信息来源", first["body"])
+        self.assertNotIn("原文链接", first["body"])
         self.assertIn("https://lab.example/a1", first["body"])
         self.assertIn("https://media.example/a1", first["body"])
         self.assertEqual(["lab_blog", "media_feed"], list(first["source_ids"]))
@@ -280,15 +291,23 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("media_feed", event["fact_list_json"])
         draft = self.db.get_draft(first["draft_id"])
         self.assertEqual({"lab_blog", "media_feed"}, set(json.loads(draft["source_ids_json"])))
-        self.assertEqual("openai-compatible/unconfigured:none:article-v4", draft["generator"])
-        self.assertEqual("article-v4", draft["processing_version"])
+        self.assertEqual("openai-compatible/unconfigured:none:article-v12", draft["generator"])
+        self.assertEqual("article-v12", draft["processing_version"])
         self.assertEqual("HOTSPOT_ITEM", event["trigger_type"])
         self.assertEqual(2, len(model.calls))
-        self.assertIn("前因与脉络", model.calls[0][2])
+        self.assertEqual("AI专家", first["prompt_style"])
+        self.assertNotIn("caption", first)
+        self.assertIn("导语：今日要点", xiaohongshu["body"])
+        self.assertEqual(xiaohongshu["body"], xiaohongshu["caption"])
+        self.assertIn("导语：今日要点", xiaohongshu["manuscript"])
+        self.assertEqual("cover", xiaohongshu["cards"][0]["kind"])
+        self.assertEqual(1080, xiaohongshu["cards"][0]["width"])
+        self.assertEqual(1920, xiaohongshu["cards"][0]["height"])
+        self.assertIn("一般人容易看漏的角度", model.calls[0][2])
         self.assertIn("background", model.calls[0][2])
         self.assertEqual([], (first.get("assets") or {}).get("candidates", first.get("assets") or []))
 
-    def test_generate_article_attaches_source_images_and_credits(self) -> None:
+    def test_generate_article_attaches_source_images_without_source_credits(self) -> None:
         lab = self.sources[0]
         self.db.insert_item(
             lab,
@@ -318,11 +337,10 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(3, len(result["assets"]["candidates"]))
         self.assertEqual("article-assets-v2", result["assets"]["schema"])
         self.assertTrue(result["assets"]["cover_id"])
-        self.assertEqual(3, len(result["assets"]["body_ids"]))
-        self.assertIn("配图（来自原文，非 AI 生成）", result["body"])
-        self.assertIn("封面：", result["body"])
-        self.assertIn("https://lab.example/a.jpg", result["body"])
-        self.assertIn("来源 lab_blog", result["body"])
+        self.assertEqual([], result["assets"]["body_ids"])
+        self.assertNotIn("配图（来自原文，非 AI 生成）", result["body"])
+        self.assertNotIn("https://lab.example/a.jpg", result["body"])
+        self.assertNotIn("来源 lab_blog", result["body"])
 
     def test_generate_article_fetches_page_opengraph_image(self) -> None:
         lab = self.sources[0]
@@ -352,7 +370,7 @@ class WorkbenchTests(unittest.TestCase):
         result = workbench.generate_article(item_id, "wechat")
         self.assertEqual(1, len(result["assets"]["candidates"]))
         self.assertIn("opengraph-image", result["assets"]["candidates"][0]["url"])
-        self.assertIn("封面：", result["body"])
+        self.assertNotIn("配图（来自原文，非 AI 生成）", result["body"])
 
     def test_s4_only_item_can_generate_discussion_article(self) -> None:
         rumor = self.sources[2]
@@ -365,8 +383,9 @@ class WorkbenchTests(unittest.TestCase):
 
         result = workbench.generate_article(item_id, "wechat")
 
-        self.assertIn("【信息来源 1 条 · 原文 1 篇】", result["body"])
-        self.assertIn("https://rumor.example/r1", result["body"])
+        self.assertIn("[官方发布了最新进展](https://rumor.example/r1)", result["body"])
+        self.assertNotIn("【信息来源", result["body"])
+        self.assertNotIn("原文链接", result["body"])
         self.assertIn("讨论提示", result["body"])
         self.assertIn("某某称", result["body"])
         event = self.db.connect().execute("SELECT status FROM events LIMIT 1").fetchone()
@@ -431,6 +450,49 @@ class WorkbenchTests(unittest.TestCase):
         prompt = model.calls[-1][2]
         self.assertIn('"chosen_hooks"', prompt)
         self.assertLess(prompt.index("协和4+4试点班"), prompt.index("第二切口"))
+
+    def _named_item(self, external_id: str, title: str, body: str) -> str:
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem(external_id, f"https://lab.example/{external_id}", title, body, None, {}),
+        )
+        return str(
+            self.db.connect()
+            .execute("SELECT item_id FROM items WHERE title = ?", (title,))
+            .fetchone()["item_id"]
+        )
+
+    def test_generate_article_one_item_ids_matches_item_id_path(self) -> None:
+        item_id = self._named_item("one-path", "Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        first = workbench.generate_article(item_id, "wechat")
+        second = workbench.generate_article(item_id, "wechat", item_ids=[item_id])
+        self.assertEqual(first["event_id"], second["event_id"])
+        self.assertEqual(first["draft_id"], second["draft_id"])
+        self.assertEqual(first["source_ids"], second["source_ids"])
+        self.assertEqual(first["body"], second["body"])
+
+    def test_generate_article_item_ids_fuses_two_items_into_one_prompt(self) -> None:
+        first_id = self._named_item("fuse-a", "Alpha launch", "Alpha body from lab")
+        second_id = self._named_item("fuse-b", "Beta debate", "Beta body from media")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        result = workbench.generate_article(
+            first_id,
+            "wechat",
+            item_ids=[second_id, first_id],
+        )
+        prompt = model.calls[-1][2]
+        payload, _ = json.JSONDecoder().raw_decode(prompt.rsplit("数据：\n", 1)[1].strip())
+        self.assertIn("Alpha launch", payload["summary"])
+        self.assertIn("Alpha body from lab", payload["summary"])
+        self.assertIn("Beta debate", payload["summary"])
+        self.assertIn("Beta body from media", payload["summary"])
+        self.assertIsInstance(payload["title"], str)
+        self.assertTrue(payload["title"])
+        self.assertIn("lab_blog", result["source_ids"])
+        self.assertEqual(1, len(model.calls))
 
 
 class WorkbenchLlmTests(unittest.TestCase):
@@ -607,6 +669,10 @@ class WechatStubHandler(BaseHTTPRequestHandler):
             WechatStubHandler.requests.append(("POST", self.path, raw[:40]))
             self._send({"url": "https://mmbiz.qpic.cn/stub-uploaded"})
             return
+        if "material/add_material" in self.path:
+            WechatStubHandler.requests.append(("POST", self.path, raw[:40]))
+            self._send({"media_id": "stub-permanent-1", "url": "https://mmbiz.qpic.cn/stub-permanent"})
+            return
         if self.path.startswith("/cgi-bin/media/upload"):
             WechatStubHandler.requests.append(("POST", self.path, raw[:40]))
             self._send({"media_id": "stub-thumb-1", "type": "thumb"})
@@ -646,15 +712,20 @@ class WeChatPublisherTests(unittest.TestCase):
     def _draft(self) -> dict[str, object]:
         return {"title": "Model One 发布", "body": "第一行\nAIGC 声明：本文由自动化工具辅助生成。"}
 
-    def test_publish_runs_token_draft_submit_flow(self) -> None:
+    def test_publish_stops_at_draft_add_without_freepublish(self) -> None:
         publisher = WeChatPublisher(
-            "wx_app_id", "s3cr3t-value", "thumb-1", "测试作者", base_url=self.base_url
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            "测试作者",
+            base_url=self.base_url,
+            poster_renderer=lambda _title: b"",
         )
 
         result = publisher.publish(self._draft())
 
-        self.assertEqual("SUBMITTED", result["status"])
-        self.assertEqual("stub-publish-1", result["reference"])
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        self.assertEqual("stub-media-1", result["reference"])
         method, path, _ = WechatStubHandler.requests[0]
         self.assertEqual("GET", method)
         self.assertIn("/cgi-bin/token", path)
@@ -669,10 +740,9 @@ class WeChatPublisherTests(unittest.TestCase):
         self.assertEqual("测试作者", article["author"])
         self.assertEqual("Model One 发布", article["title"])
         self.assertIn("<p>第一行</p>", article["content"])
-        method, path, body = WechatStubHandler.requests[2]
-        self.assertEqual("POST", method)
-        self.assertIn("/cgi-bin/freepublish/submit", path)
-        self.assertEqual({"media_id": "stub-media-1"}, json.loads(body))
+        self.assertFalse(
+            any("/cgi-bin/freepublish/submit" in item[1] for item in WechatStubHandler.requests)
+        )
 
     def test_errcode_maps_to_secret_free_exception(self) -> None:
         WechatStubHandler.fail_errcode = 40013
@@ -710,6 +780,40 @@ class WeChatPublisherTests(unittest.TestCase):
         self.assertEqual("wechat_api_unavailable", str(raised.exception))
         self.assertNotIn("s3cr3t-value", str(raised.exception))
 
+    def _asset_draft(
+        self,
+        *,
+        cover_id: str = "c1",
+        body_ids: list[str] | None = None,
+        candidates: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        rows = candidates or [
+            {
+                "id": "c1",
+                "url": "https://lab.example/hero.jpg",
+                "source_id": "lab_blog",
+                "width": 900,
+                "height": 1200,
+            },
+            {
+                "id": "b1",
+                "url": "https://lab.example/body.jpg",
+                "source_id": "lab_blog",
+                "width": 750,
+                "height": 1000,
+            },
+        ]
+        return {
+            "title": "配图稿",
+            "body": "正文\nAIGC",
+            "assets": {
+                "schema": "article-assets-v2",
+                "candidates": rows,
+                "cover_id": cover_id,
+                "body_ids": list(body_ids if body_ids is not None else ["b1"]),
+            },
+        }
+
     def test_publish_uploads_source_images_and_embeds_three_by_four_figures(self) -> None:
         publisher = WeChatPublisher(
             "wx_app_id",
@@ -717,33 +821,200 @@ class WeChatPublisherTests(unittest.TestCase):
             "thumb-1",
             image_fetcher=lambda _url: b"\x89PNG\r\n\x1a\n" + b"\x00" * 16,
             base_url=self.base_url,
+            poster_renderer=lambda _title: b"POSTER-SHOULD-NOT-RUN",
+        )
+        draft = self._asset_draft()
+
+        result = publisher.publish(draft)
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        paths = [item[1] for item in WechatStubHandler.requests]
+        self.assertTrue(any("/cgi-bin/media/uploadimg" in path for path in paths))
+        self.assertTrue(any("material/add_material" in path and "type=image" in path for path in paths))
+        self.assertFalse(any("/cgi-bin/media/upload?" in path and "type=thumb" in path for path in paths))
+        add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
+        article = json.loads(add_body)["articles"][0]
+        self.assertEqual("stub-permanent-1", article["thumb_media_id"])
+        content = article["content"]
+        self.assertIn("https://mmbiz.qpic.cn/stub-uploaded", content)
+        self.assertIn("aspect-ratio:3/4", content)
+        self.assertIn('<a href="https://lab.example/body.jpg">', content)
+        self.assertNotIn("来源：lab_blog", content)
+        self.assertNotIn("https://lab.example/hero.jpg", content)
+
+    def test_publish_digest_uses_best_article_paragraph_and_strips_image_credits(self) -> None:
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            base_url=self.base_url,
+            poster_renderer=lambda _title: b"",
         )
         draft = {
             "title": "配图稿",
-            "body": "正文\nAIGC",
-            "assets": [
-                {
-                    "url": "https://lab.example/hero.jpg",
-                    "source_id": "lab_blog",
-                    "width": 900,
-                    "height": 1200,
-                }
-            ],
+            "body": (
+                "导语：这是一段足够精彩的摘要内容，用于展示文章核心进展和读者最关心的事实。\n"
+                "来源 lab_blog · https://lab.example/article\n"
+                "AIGC 声明：本文由自动化工具辅助生成。\n\n"
+                "配图（来自原文，非 AI 生成）\n"
+                "封面：来源 lab_blog · https://lab.example/hero.jpg"
+            ),
         }
 
         publisher.publish(draft)
 
-        paths = [item[1] for item in WechatStubHandler.requests]
-        self.assertTrue(any("/cgi-bin/media/uploadimg" in path for path in paths))
-        self.assertTrue(any("/cgi-bin/media/upload?" in path and "type=thumb" in path for path in paths))
         add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
         article = json.loads(add_body)["articles"][0]
-        self.assertEqual("stub-thumb-1", article["thumb_media_id"])
-        content = article["content"]
-        self.assertIn("https://mmbiz.qpic.cn/stub-uploaded", content)
-        self.assertIn("aspect-ratio:3/4", content)
-        self.assertIn("来源：lab_blog", content)
-        self.assertIn("https://lab.example/hero.jpg", content)
+        self.assertEqual(
+            "导语：这是一段足够精彩的摘要内容，用于展示文章核心进展和读者最关心的事实。",
+            article["digest"],
+        )
+        self.assertLessEqual(len(article["digest"]), 120)
+        self.assertNotIn("来自原文", article["content"])
+
+    def test_publish_preserves_safe_markdown_and_html_links(self) -> None:
+        publisher = WeChatPublisher("wx_app_id", "s3cr3t-value", "thumb-1")
+
+        content = publisher._filled_content(
+            {
+                "title": "链接稿",
+                "body": (
+                    "官方公告[详细说明](https://official.example/article)，"
+                    '<a href="https://existing.example/page">已有链接</a>。'
+                ),
+            },
+            "stub-token",
+        )
+
+        self.assertIn(
+            '<a href="https://official.example/article">详细说明</a>', content
+        )
+        self.assertIn(
+            '<a href="https://existing.example/page">已有链接</a>', content
+        )
+        self.assertNotIn("&lt;a", content)
+
+    def test_publish_uses_selected_cover_and_skips_title_poster(self) -> None:
+        posters: list[str] = []
+        fetched: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            fetched.append(url)
+            return b"\xff\xd8" + b"\x00" * 16
+
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "",
+            image_fetcher=fetch,
+            base_url=self.base_url,
+            poster_renderer=lambda title: posters.append(str(title)) or b"POSTER",
+        )
+
+        result = publisher.publish(self._asset_draft(body_ids=[]))
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        self.assertEqual(["https://lab.example/hero.jpg"], fetched)
+        self.assertEqual([], posters)
+        add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
+        article = json.loads(add_body)["articles"][0]
+        self.assertEqual("stub-permanent-1", article["thumb_media_id"])
+
+    def test_publish_uses_selected_body_image_when_cover_missing_not_poster(self) -> None:
+        posters: list[str] = []
+        fetched: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            fetched.append(url)
+            return b"\xff\xd8" + b"\x00" * 16
+
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "",
+            image_fetcher=fetch,
+            base_url=self.base_url,
+            poster_renderer=lambda title: posters.append(str(title)) or b"POSTER",
+        )
+
+        result = publisher.publish(self._asset_draft(cover_id="", body_ids=["b1"]))
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        self.assertEqual(["https://lab.example/body.jpg"], list(dict.fromkeys(fetched)))
+        self.assertEqual([], posters)
+
+    def test_publish_does_not_replace_selected_cover_with_poster_if_fetch_fails(self) -> None:
+        posters: list[str] = []
+
+        def fetch(_url: str) -> bytes:
+            raise OSError("hotlink blocked")
+
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            image_fetcher=fetch,
+            base_url=self.base_url,
+            poster_renderer=lambda title: posters.append(str(title)) or b"POSTER",
+        )
+
+        result = publisher.publish(self._asset_draft(body_ids=[]))
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        self.assertEqual([], posters)
+        add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
+        article = json.loads(add_body)["articles"][0]
+        self.assertEqual("thumb-1", article["thumb_media_id"])
+
+    def test_publish_without_cover_uploads_title_poster(self) -> None:
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "",
+            base_url=self.base_url,
+            poster_renderer=lambda title: b"\x89PNG\r\n\x1a\n" + title.encode("utf-8"),
+        )
+
+        result = publisher.publish(self._draft())
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        self.assertTrue(
+            any("material/add_material" in item[1] for item in WechatStubHandler.requests)
+        )
+        add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
+        article = json.loads(add_body)["articles"][0]
+        self.assertEqual("stub-permanent-1", article["thumb_media_id"])
+
+    def test_publish_uses_fallback_thumb_when_poster_fails(self) -> None:
+        def boom(_title: str) -> bytes:
+            raise RuntimeError("no chrome")
+
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            base_url=self.base_url,
+            poster_renderer=boom,
+        )
+
+        result = publisher.publish(self._draft())
+
+        self.assertEqual("DRAFT_SAVED", result["status"])
+        add_body = next(item[2] for item in WechatStubHandler.requests if "/cgi-bin/draft/add" in item[1])
+        article = json.loads(add_body)["articles"][0]
+        self.assertEqual("thumb-1", article["thumb_media_id"])
+
+    def test_publish_without_cover_or_poster_or_fallback_fails(self) -> None:
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "",
+            base_url=self.base_url,
+            poster_renderer=lambda _title: b"",
+        )
+
+        with self.assertRaisesRegex(PublicationError, "wechat_cover_required"):
+            publisher.publish(self._draft())
 
 
 if __name__ == "__main__":

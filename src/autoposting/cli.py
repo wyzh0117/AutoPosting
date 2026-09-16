@@ -101,6 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", type=int, default=8080)
 
+    visual_parser = subparsers.add_parser(
+        "visual-render", help="Render visual pages from example or content JSON to HTML/PNG"
+    )
+    visual_parser.add_argument("--example", action="store_true", help="Render bundled ranking and project examples")
+    visual_parser.add_argument("--input", help="Content JSON path (RankingContent or ProjectContent)")
+    visual_parser.add_argument("--out", default="output/visual", help="Output directory")
+    visual_parser.add_argument("--no-screenshot", action="store_true", help="Write HTML only")
+
     return parser
 
 
@@ -108,6 +116,10 @@ def _database(path: str) -> Database:
     database = Database(path)
     database.initialize()
     return database
+
+
+def _public_visual_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key != "html_text"}
 
 
 def _read_json(path: str | Path) -> Any:
@@ -340,6 +352,23 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
         app = WebApp(_database(args.db), load_sources(args.sources), args.packages)
         run_web(app, args.host, args.port)
         return {"ok": True, "stopped": True}
+
+    if args.command == "visual-render":
+        from .visual.pipeline import render_examples, render_page
+
+        out_dir = Path(args.out)
+        screenshot = not args.no_screenshot
+        if args.example:
+            rows = render_examples(out_dir, screenshot=screenshot)
+            return {"ok": True, "pages": [_public_visual_row(row) for row in rows], "output": str(out_dir)}
+        if not args.input:
+            raise ValueError("visual-render requires --example or --input")
+        payload = _read_json(args.input)
+        if not isinstance(payload, dict):
+            raise ValueError("content JSON must be an object")
+        page = str(payload.get("page") or "page")
+        row = render_page(payload, out_dir=out_dir / page, screenshot=screenshot)
+        return {"ok": True, "pages": [_public_visual_row(row)], "output": str(out_dir)}
 
     raise ValueError(f"Unknown command: {args.command}")
 

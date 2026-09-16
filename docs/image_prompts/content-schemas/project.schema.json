@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project.schema.json",
+  "title": "ProjectContent",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "page",
+    "brand",
+    "series",
+    "issue",
+    "rank",
+    "category",
+    "name",
+    "keyMessage",
+    "features",
+    "audience",
+    "url"
+  ],
+  "properties": {
+    "page": { "const": "project-detail" },
+    "brand": { "type": "string", "minLength": 1 },
+    "series": { "type": "string" },
+    "issue": { "type": "string" },
+    "pageNumber": { "type": "string" },
+    "rank": { "type": "integer", "minimum": 1 },
+    "category": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "tagline": { "type": "string" },
+    "description": { "type": "string" },
+    "keyMessage": { "type": "string", "minLength": 1 },
+    "heroVisual": { "type": "string" },
+    "logo": { "type": "string" },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "how": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "audience": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "scene": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "url": { "type": "string", "minLength": 1 },
+    "source": { "type": "string" },
+    "footer": { "type": "string" },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["label", "value"],
+        "properties": {
+          "label": { "type": "string" },
+          "value": { "type": "number" },
+          "display": { "type": "string" }
+        }
+      }
+    },
+    "story": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "caption": { "type": "string" },
+          "image": { "type": "string" }
+        }
+      }
+    }
+  }
+}

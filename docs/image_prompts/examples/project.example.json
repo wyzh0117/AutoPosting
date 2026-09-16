@@ -1,0 +1,36 @@
+{
+  "page": "project-detail",
+  "brand": "AutoPosting",
+  "series": "GitHub 本周爆火 AI 项目榜",
+  "issue": "第27期",
+  "pageNumber": "02 / 11",
+  "rank": 1,
+  "category": "AI Agent / 多智能体",
+  "name": "agency-agents",
+  "tagline": "把一个 AI 团队塞进电脑里",
+  "description": "将多个不同职责的 AI Agent 组织成一个协作团队，完成开发、内容、运营等不同工作。",
+  "keyMessage": "给想搭小型 AI 团队的人，在本地把开发和内容串成流水线时，把不同角色的助手组织起来一起干活。",
+  "logo": "",
+  "features": [
+    "把前端、运营、内容、社区等不同助手编成一支能一起干活的小团队。",
+    "下达一个目标后，各角色按职责分头产出，再把结果交给下一位。",
+    "交接是连续的：上一步的稿子或方案会成为下一步的输入。",
+    "只管分工和交接，并不代替你完成某一个具体业务功能。"
+  ],
+  "how": [
+    "先定角色和职责",
+    "用一个真实任务串起来",
+    "看哪里卡住就改那一句"
+  ],
+  "audience": [
+    "想搭小型 AI 团队的人",
+    "产品或运营想把流程交给助手"
+  ],
+  "scene": [
+    "本地把开发、内容和运营串成一条流水线",
+    "先用一个真实小任务看完整协作"
+  ],
+  "url": "https://github.com/example/agency-agents",
+  "source": "GitHub",
+  "footer": "专业 AI 科技媒体 · 每周更新"
+}

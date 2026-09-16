@@ -22,7 +22,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS sources (
     source_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap')),
+    type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit')),
     url_or_handle TEXT NOT NULL,
     tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
     topics_json TEXT NOT NULL,
@@ -156,11 +156,30 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
 );
 
 CREATE TABLE IF NOT EXISTS model_endpoint_purposes (
-    purpose TEXT PRIMARY KEY CHECK (purpose IN ('article', 'chat')),
+    purpose TEXT PRIMARY KEY CHECK (purpose IN ('article', 'chat', 'translation', 'leaderboard', 'image')),
     endpoint_id TEXT NOT NULL REFERENCES model_endpoints(endpoint_id),
     model TEXT NOT NULL,
     effort TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS github_weekly (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    week_start TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    repos_json TEXT NOT NULL,
+    xhs_title TEXT NOT NULL,
+    xhs_body TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    images_json TEXT NOT NULL DEFAULT '[]',
+    visual_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS skill_finder (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    query TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
@@ -224,6 +243,14 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._ensure_sitemap_source_type(connection)
+            self._ensure_reddit_source_type(connection)
+            self._ensure_translation_model_purpose(connection)
+            self._ensure_leaderboard_model_purpose(connection)
+            self._ensure_image_model_purpose(connection)
+            self._ensure_github_weekly_images(connection)
+            self._ensure_github_weekly_visual(connection)
+            self._ensure_skill_finder(connection)
+            self._ensure_hotspot_favorites(connection)
 
     @staticmethod
     def _ensure_sitemap_source_type(connection: sqlite3.Connection) -> None:
@@ -256,6 +283,371 @@ class Database:
             """
         )
         connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _ensure_reddit_source_type(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'"
+        ).fetchone()
+        sql = str(row["sql"] if row is not None else "")
+        if "reddit" in sql:
+            return
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            CREATE TABLE sources_new (
+                source_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit')),
+                url_or_handle TEXT NOT NULL,
+                tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
+                topics_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                fetch_interval_minutes INTEGER NOT NULL CHECK (fetch_interval_minutes > 0),
+                last_fetched_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO sources_new SELECT * FROM sources;
+            DROP TABLE sources;
+            ALTER TABLE sources_new RENAME TO sources;
+            """
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _ensure_translation_model_purpose(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'model_endpoint_purposes'"
+        ).fetchone()
+        sql = str(row["sql"] if row is not None else "")
+        if "translation" in sql:
+            return
+        connection.executescript(
+            """
+            CREATE TABLE model_endpoint_purposes_new (
+                purpose TEXT PRIMARY KEY CHECK (
+                    purpose IN ('article', 'chat', 'translation')
+                ),
+                endpoint_id TEXT NOT NULL REFERENCES model_endpoints(endpoint_id),
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO model_endpoint_purposes_new
+                SELECT * FROM model_endpoint_purposes;
+            DROP TABLE model_endpoint_purposes;
+            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            """
+        )
+
+    @staticmethod
+    def _ensure_leaderboard_model_purpose(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'model_endpoint_purposes'"
+        ).fetchone()
+        sql = str(row["sql"] if row is not None else "")
+        if "leaderboard" in sql:
+            return
+        connection.executescript(
+            """
+            CREATE TABLE model_endpoint_purposes_new (
+                purpose TEXT PRIMARY KEY CHECK (
+                    purpose IN ('article', 'chat', 'translation', 'leaderboard', 'image')
+                ),
+                endpoint_id TEXT NOT NULL REFERENCES model_endpoints(endpoint_id),
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO model_endpoint_purposes_new
+                SELECT * FROM model_endpoint_purposes;
+            DROP TABLE model_endpoint_purposes;
+            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            """
+        )
+
+    @staticmethod
+    def _ensure_image_model_purpose(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'model_endpoint_purposes'"
+        ).fetchone()
+        sql = str(row["sql"] if row is not None else "")
+        if "'image'" in sql:
+            return
+        connection.executescript(
+            """
+            CREATE TABLE model_endpoint_purposes_new (
+                purpose TEXT PRIMARY KEY CHECK (
+                    purpose IN ('article', 'chat', 'translation', 'leaderboard', 'image')
+                ),
+                endpoint_id TEXT NOT NULL REFERENCES model_endpoints(endpoint_id),
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO model_endpoint_purposes_new
+                SELECT * FROM model_endpoint_purposes;
+            DROP TABLE model_endpoint_purposes;
+            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            """
+        )
+
+    @staticmethod
+    def _ensure_github_weekly_images(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(github_weekly)").fetchall()
+        }
+        if "images_json" not in columns:
+            connection.execute(
+                "ALTER TABLE github_weekly ADD COLUMN images_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
+    @staticmethod
+    def _ensure_github_weekly_visual(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(github_weekly)").fetchall()
+        }
+        if "visual_json" not in columns:
+            connection.execute(
+                "ALTER TABLE github_weekly ADD COLUMN visual_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    @staticmethod
+    def _ensure_skill_finder(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skill_finder (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                query TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _ensure_hotspot_favorites(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hotspot_favorites (
+                item_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL,
+                favorited_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def save_github_weekly(
+        self,
+        week_start: str,
+        repos: list[dict[str, object]],
+        xhs_title: str,
+        xhs_body: str,
+        model_used: str = "",
+        images: list[dict[str, object]] | None = None,
+        visual: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        now = _utc_now()
+        payload = json.dumps(repos, ensure_ascii=False)
+        images_json = json.dumps(images or [], ensure_ascii=False)
+        visual_payload = visual or {}
+        visual_json = json.dumps(visual_payload, ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO github_weekly (
+                    id, week_start, fetched_at, repos_json, xhs_title, xhs_body,
+                    model_used, images_json, visual_json
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    week_start = excluded.week_start,
+                    fetched_at = excluded.fetched_at,
+                    repos_json = excluded.repos_json,
+                    xhs_title = excluded.xhs_title,
+                    xhs_body = excluded.xhs_body,
+                    model_used = excluded.model_used,
+                    images_json = excluded.images_json,
+                    visual_json = excluded.visual_json
+                """,
+                (week_start, now, payload, xhs_title, xhs_body, model_used, images_json, visual_json),
+            )
+        return {
+            "week_start": week_start,
+            "fetched_at": now,
+            "repos": repos,
+            "xhs_title": xhs_title,
+            "xhs_body": xhs_body,
+            "model_used": model_used,
+            "images": images or [],
+            "visual": visual_payload,
+        }
+
+    def get_github_weekly(self) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM github_weekly WHERE id = 1").fetchone()
+        if row is None:
+            return None
+        try:
+            repos = json.loads(str(row["repos_json"]))
+        except json.JSONDecodeError:
+            repos = []
+        if not isinstance(repos, list):
+            repos = []
+        try:
+            images = json.loads(str(row["images_json"] if "images_json" in row.keys() else "[]"))
+        except (json.JSONDecodeError, KeyError):
+            images = []
+        if not isinstance(images, list):
+            images = []
+        try:
+            visual = json.loads(str(row["visual_json"] if "visual_json" in row.keys() else "{}"))
+        except (json.JSONDecodeError, KeyError):
+            visual = {}
+        if not isinstance(visual, dict):
+            visual = {}
+        return {
+            "week_start": str(row["week_start"]),
+            "fetched_at": str(row["fetched_at"]),
+            "repos": repos,
+            "xhs_title": str(row["xhs_title"]),
+            "xhs_body": str(row["xhs_body"]),
+            "model_used": str(row["model_used"]),
+            "images": images,
+            "visual": visual,
+        }
+
+    def save_skill_finder(self, payload: dict[str, object]) -> dict[str, object]:
+        now = _utc_now()
+        body = dict(payload)
+        body["fetched_at"] = now
+        query = str(body.get("query") or "")
+        with self.connect() as connection:
+            self._ensure_skill_finder(connection)
+            connection.execute(
+                """
+                INSERT INTO skill_finder (id, query, fetched_at, payload_json)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    query = excluded.query,
+                    fetched_at = excluded.fetched_at,
+                    payload_json = excluded.payload_json
+                """,
+                (query, now, json.dumps(body, ensure_ascii=False)),
+            )
+        return body
+
+    def get_skill_finder(self) -> dict[str, object] | None:
+        with self.connect() as connection:
+            self._ensure_skill_finder(connection)
+            row = connection.execute("SELECT * FROM skill_finder WHERE id = 1").fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("query", str(row["query"]))
+        payload.setdefault("fetched_at", str(row["fetched_at"]))
+        return payload
+
+    def add_hotspot_favorite(
+        self,
+        item_id: str,
+        title: str,
+        summary: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise ValueError("item_id required")
+        now = _utc_now()
+        body = dict(payload)
+        body.setdefault("item_id", item_id)
+        body.setdefault("title", title)
+        body.setdefault("summary", summary)
+        with self.connect() as connection:
+            self._ensure_hotspot_favorites(connection)
+            connection.execute(
+                """
+                INSERT INTO hotspot_favorites (
+                    item_id, title, summary, payload_json, favorited_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    payload_json = excluded.payload_json,
+                    favorited_at = excluded.favorited_at
+                """,
+                (
+                    item_id,
+                    str(title or ""),
+                    str(summary or ""),
+                    json.dumps(body, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return {
+            "item_id": item_id,
+            "title": str(title or ""),
+            "summary": str(summary or ""),
+            "payload": body,
+            "favorited_at": now,
+        }
+
+    def list_hotspot_favorites(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            self._ensure_hotspot_favorites(connection)
+            rows = connection.execute(
+                """
+                SELECT item_id, title, summary, payload_json, favorited_at
+                FROM hotspot_favorites
+                ORDER BY favorited_at DESC, item_id DESC
+                """
+            ).fetchall()
+        items: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            item = dict(payload)
+            item.update(
+                {
+                    "item_id": str(row["item_id"]),
+                    "title": str(row["title"]),
+                    "summary": str(row["summary"]),
+                    "favorited_at": str(row["favorited_at"]),
+                    "payload": payload,
+                }
+            )
+            items.append(item)
+        return items
+
+    def remove_hotspot_favorite(self, item_id: str) -> bool:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise ValueError("item_id required")
+        with self.connect() as connection:
+            self._ensure_hotspot_favorites(connection)
+            cursor = connection.execute(
+                "DELETE FROM hotspot_favorites WHERE item_id = ?",
+                (item_id,),
+            )
+        return cursor.rowcount > 0
 
     def upsert_source(self, source: Source) -> None:
         now = _utc_now()
@@ -724,6 +1116,21 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_source_urls(self, source_ids: object) -> dict[str, set[str]]:
+        ids = sorted({str(value).strip() for value in source_ids if str(value).strip()})
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT source_id, source_url FROM item_sources WHERE source_id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        urls: dict[str, set[str]] = {source_id: set() for source_id in ids}
+        for row in rows:
+            urls[str(row["source_id"])].add(str(row["source_url"]))
+        return urls
+
     def list_sources(self) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -737,14 +1144,21 @@ class Database:
         return [dict(row) for row in rows]
 
     def list_hotspot_candidates(
-        self, since: str, limit: int = 10, sort: str = "time", pool: int = 40
+        self,
+        since: str,
+        limit: int = 10,
+        sort: str = "time",
+        pool: int = 40,
+        lane: str = "hotspots",
     ) -> list[dict[str, object]]:
         if sort not in {"time", "heat"}:
             raise ValueError("sort must be time or heat")
+        if lane not in {"hotspots", "viewpoints"}:
+            raise ValueError("lane must be hotspots or viewpoints")
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT item_id, title, content_text, published_at, fetched_at, raw_json
+                SELECT item_id, source_id, title, content_text, published_at, fetched_at, raw_json
                 FROM items
                 WHERE COALESCE(published_at, fetched_at) >= ?
                 ORDER BY COALESCE(published_at, fetched_at) DESC, item_id
@@ -768,7 +1182,7 @@ class Database:
             source_meta: dict[str, tuple[str, str]] = {}
             all_source_ids = {
                 source_id for pairs in sources_by_item.values() for source_id, _ in pairs
-            }
+            } | {str(row["source_id"]) for row in rows}
             if all_source_ids:
                 placeholders = ", ".join("?" for _ in all_source_ids)
                 for row in connection.execute(
@@ -782,7 +1196,17 @@ class Database:
         for row in rows:
             item_id = str(row["item_id"])
             pairs = sources_by_item.get(item_id, [])
+            if not pairs:
+                pairs = [(str(row["source_id"]), "")]
             source_ids = [source_id for source_id, _ in pairs]
+            has_reddit = any(
+                source_meta.get(source_id, ("S4", "rss"))[1] == "reddit"
+                for source_id in source_ids
+            )
+            if lane == "viewpoints" and not has_reddit:
+                continue
+            if lane == "hotspots" and has_reddit:
+                continue
             if should_hide_candidate(str(row["title"]), source_ids):
                 continue
             engagement = engagement_from_raw(row["raw_json"])
@@ -998,7 +1422,7 @@ class Database:
     def set_model_purpose(
         self, purpose: str, endpoint_id: str, model: str, effort: str
     ) -> None:
-        """Persist the active endpoint selection for a purpose ('article'/'chat')."""
+        """Persist the active endpoint selection for article/chat/translation/leaderboard."""
         with self.connect() as connection:
             connection.execute(
                 """

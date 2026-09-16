@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ranking.schema.json",
+  "title": "RankingContent",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "page",
+    "brand",
+    "series",
+    "issue",
+    "dateRange",
+    "title",
+    "subtitle",
+    "items"
+  ],
+  "properties": {
+    "page": { "const": "ranking-overview" },
+    "brand": { "type": "string", "minLength": 1 },
+    "series": { "type": "string", "minLength": 1 },
+    "issue": { "type": "string", "minLength": 1 },
+    "dateRange": { "type": "string", "minLength": 1 },
+    "kicker": { "type": "string" },
+    "title": { "type": "string", "minLength": 1 },
+    "subtitle": { "type": "string", "minLength": 1 },
+    "source": { "type": "string" },
+    "footer": { "type": "string" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/rankingItem" }
+    }
+  },
+  "$defs": {
+    "rankingItem": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["rank", "name", "description", "metric"],
+      "properties": {
+        "rank": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "logo": { "type": "string" },
+        "category": { "type": "string" },
+        "url": { "type": "string" },
+        "status": { "type": "string" },
+        "metric": {
+          "type": "object",
+          "required": ["label", "value"],
+          "properties": {
+            "label": { "type": "string" },
+            "value": { "type": "number" },
+            "display": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

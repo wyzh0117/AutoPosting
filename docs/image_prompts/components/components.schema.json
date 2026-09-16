@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComponentLibrary",
+  "type": "object",
+  "required": ["components"],
+  "properties": {
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "purpose", "requiredFields"],
+        "properties": {
+          "name": { "type": "string" },
+          "purpose": { "type": "string" },
+          "requiredFields": { "type": "array", "items": { "type": "string" } },
+          "optionalFields": { "type": "array", "items": { "type": "string" } },
+          "variants": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

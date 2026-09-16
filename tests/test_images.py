@@ -1,14 +1,18 @@
 import struct
 import unittest
+from unittest.mock import patch
 
 from autoposting.images import (
     IMAGE_SECTION_TITLE,
+    _PublicRedirectHandler,
+    _validate_public_page_url,
     append_image_credits,
     apply_selection,
     build_asset_bundle,
     collect_article_images,
     extract_image_urls_from_feed_fields,
     extract_image_urls_from_html,
+    figure_html,
     is_chrome_image_url,
     is_usable_content_image,
     normalize_assets,
@@ -30,6 +34,42 @@ def _png(width: int, height: int) -> bytes:
 
 
 class ImageHelperTests(unittest.TestCase):
+    def test_figure_links_image_to_original_page_without_source_caption(self) -> None:
+        rendered = figure_html(
+            {
+                "url": "https://cdn.example/image.jpg",
+                "source_url": "https://news.example/article",
+            },
+            "https://mmbiz.qpic.cn/uploaded.jpg",
+        )
+
+        self.assertIn('<a href="https://news.example/article">', rendered)
+        self.assertIn('src="https://mmbiz.qpic.cn/uploaded.jpg"', rendered)
+        self.assertNotIn("来源", rendered)
+
+    def test_original_page_fetch_rejects_private_network_targets(self) -> None:
+        with patch(
+            "autoposting.images.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 80))],
+        ):
+            with self.assertRaisesRegex(ValueError, "page_url_not_public"):
+                _validate_public_page_url("http://localhost/article")
+
+        with patch(
+            "autoposting.images.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+        ):
+            _validate_public_page_url("https://example.com/article")
+
+        with patch(
+            "autoposting.images.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("10.0.0.8", 80))],
+        ):
+            with self.assertRaisesRegex(ValueError, "page_url_not_public"):
+                _PublicRedirectHandler().redirect_request(
+                    None, None, 302, "Found", {}, "http://internal.example/next"
+                )
+
     def test_extracts_rss_enclosure_and_html_images(self) -> None:
         urls = extract_image_urls_from_feed_fields(
             page_url="https://news.example/story",
@@ -171,16 +211,18 @@ class ImageHelperTests(unittest.TestCase):
         self.assertEqual(5, len(bundle["candidates"]))
         cover_id, body_ids = suggest_selection(bundle["candidates"])
         self.assertEqual(images[0]["id"], cover_id)
-        self.assertEqual(3, len(body_ids))
-        self.assertNotIn(cover_id, body_ids)
-        bundle = apply_selection(bundle, cover_id, body_ids)
+        self.assertEqual([], body_ids)
+        chosen_body = [str(images[index]["id"]) for index in (1, 2, 3)]
+        bundle = apply_selection(bundle, cover_id, chosen_body)
         body = append_image_credits("正文 lab_blog AIGC", selected_body_images(bundle), None)
-        self.assertIn(IMAGE_SECTION_TITLE, body)
-        self.assertIn("正文：", body)
-        self.assertIn("https://lab.example/4.jpg", body)
+        self.assertNotIn(IMAGE_SECTION_TITLE, body)
+        self.assertNotIn("正文：", body)
+        self.assertNotIn("https://lab.example/4.jpg", body)
         self.assertNotIn("https://lab.example/5.jpg", body)
         few = build_asset_bundle(images[:2])
-        self.assertEqual(2, len(few["body_ids"]))
+        self.assertEqual(few["cover_id"], images[0]["id"])
+        self.assertEqual([], few["body_ids"])
         legacy = normalize_assets([{"url": "https://lab.example/1.jpg", "source_id": "lab_blog"}])
         self.assertEqual("article-assets-v2", legacy["schema"])
-        self.assertEqual(1, len(legacy["body_ids"]))
+        self.assertTrue(legacy["cover_id"])
+        self.assertEqual([], legacy["body_ids"])

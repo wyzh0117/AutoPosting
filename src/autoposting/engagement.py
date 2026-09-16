@@ -32,6 +32,136 @@ PROMOTED_NOTE = (
     "文中按「某某称」转述。"
 )
 HN_ITEM_RE = re.compile(r"(?:news\.ycombinator\.com/item\?id=|hn_id=)(\d+)")
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_HTML_LINK_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
+_RAW_URL_RE = re.compile(r"https?://[^\s)\]}>，。；、]+", re.IGNORECASE)
+_SOURCE_LINE_RE = re.compile(
+    r"^\s*(?:来源|信息源|信息来源|原文|原文链接|图片来源|配图来源|参考来源|事实说明)(?:与未知项|索引)?\s*[:：].*$",
+    re.IGNORECASE,
+)
+
+
+def _safe_source_url(value: object) -> str:
+    """Return only ordinary public link syntax supplied by a source record."""
+    url = str(value or "").strip()
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or any(char.isspace() for char in url)
+    ):
+        return ""
+    return url
+
+
+def _plain_text_spans(text: str) -> list[tuple[int, int]]:
+    """Identify existing links so source IDs inside their markup are untouched."""
+    spans = [match.span() for match in _MARKDOWN_LINK_RE.finditer(text)]
+    spans.extend(match.span() for match in _HTML_LINK_RE.finditer(text))
+    spans.extend(match.span() for match in _RAW_URL_RE.finditer(text))
+    return sorted(spans)
+
+
+def _replace_first_source_id(text: str, source_id: str, url: str) -> str:
+    if not source_id or not url:
+        return text
+    protected = _plain_text_spans(text)
+    pattern = re.compile(
+        rf"(?<![\w.-]){re.escape(source_id)}(?![\w.-])"
+    )
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if any(left <= start < right for left, right in protected):
+            continue
+        sentence_start = max(
+            text.rfind(boundary, 0, start) for boundary in "。！？；\n"
+        ) + 1
+        anchor_start = sentence_start
+        prior_links = [
+            right
+            for left, right in protected
+            if sentence_start <= left < start and right <= start
+        ]
+        if prior_links:
+            anchor_start = max(anchor_start, max(prior_links))
+        while anchor_start < start and text[anchor_start].isspace():
+            anchor_start += 1
+        anchor_end = start
+        while anchor_end > anchor_start and text[anchor_end - 1] in "，,：:、;； \t":
+            anchor_end -= 1
+        if anchor_end <= anchor_start:
+            continue
+        anchor = text[anchor_start:anchor_end]
+        if anchor in {
+            "来源", "信息源", "信息来源", "原文", "原文链接",
+            "图片来源", "配图来源", "参考来源", "事实说明",
+        }:
+            sentence_end = len(text)
+            for boundary in "。！？；\n":
+                position = text.find(boundary, end)
+                if position >= 0:
+                    sentence_end = min(sentence_end, position)
+            follow_start = end
+            while follow_start < sentence_end and text[follow_start] in "，,：:、;； \t":
+                follow_start += 1
+            follow_end = sentence_end
+            while follow_end > follow_start and text[follow_end - 1] in "，,：:、;； \t":
+                follow_end -= 1
+            if follow_end <= follow_start:
+                continue
+            return (
+                text[:sentence_start]
+                + f"[{text[follow_start:follow_end]}]({url})"
+                + text[follow_end:]
+            )
+        if any(
+            left < anchor_end and right > anchor_start for left, right in protected
+        ):
+            continue
+        return text[:anchor_start] + f"[{anchor}]({url})" + text[end:]
+    return text
+
+
+def _inline_source_links(text: str, records: list[tuple[str, str]]) -> str:
+    for source_id, url in sorted(records, key=lambda item: len(item[0]), reverse=True):
+        text = _replace_first_source_id(text, source_id, url)
+    return text
+
+
+def source_citation_id(source_id: str, occurrence: int) -> str:
+    return source_id if occurrence == 1 else f"{source_id}#{occurrence}"
+
+
+def _source_only_line(line: str, source_ids: tuple[str, ...]) -> bool:
+    match = _SOURCE_LINE_RE.match(line)
+    if match is None:
+        return False
+    _prefix, tail = line.split("：", 1) if "：" in line else line.split(":", 1)
+    residual = tail
+    for source_id in source_ids:
+        residual = re.sub(re.escape(source_id), "", residual)
+    residual = _MARKDOWN_LINK_RE.sub("", residual)
+    residual = _HTML_LINK_RE.sub("", residual)
+    residual = _RAW_URL_RE.sub("", residual)
+    residual = re.sub(r"[\s,，、。；！？|:：()（）\[\]<>·•—–-]+", "", residual)
+    if not residual:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_.\-]+", tail.strip()))
+
+
+def _remove_source_tail(text: str, source_ids: tuple[str, ...]) -> str:
+    footer_at = text.rfind(FOOTER_MARK)
+    if footer_at >= 0:
+        text = text[:footer_at].rstrip()
+    lines = [
+        line for line in text.splitlines() if not _source_only_line(line, source_ids)
+    ]
+    return "\n".join(lines).strip()
 
 
 @dataclass(frozen=True)
@@ -102,7 +232,7 @@ def engagement_kind(source_id: str, url: str = "", source_type: str = "") -> str
         return "x"
     if "news.ycombinator.com" in blob or source_id == "hn_frontpage":
         return "hn"
-    if "reddit.com" in blob:
+    if source_type == "reddit" or "reddit.com" in blob:
         return "reddit"
     return "generic"
 
@@ -155,29 +285,59 @@ def frame_article_body(
     *,
     discussion: bool = False,
     promoted: bool = False,
+    inline_sources: bool = False,
 ) -> str:
     seen_sources: list[str] = []
-    links: list[tuple[str, str, str]] = []
+    links: list[tuple[str, str, str, str]] = []
     seen_urls: set[str] = set()
+    source_occurrences: dict[str, int] = {}
     for record in records:
         source_id = str(record.get("source_id") or "").strip()
         if source_id and source_id not in seen_sources:
             seen_sources.append(source_id)
-        url = str(record.get("source_url") or record.get("url") or "").strip()
+        url = _safe_source_url(record.get("source_url") or record.get("url"))
         name = str(record.get("name") or source_id or "来源").strip()
         if url and url not in seen_urls:
             seen_urls.add(url)
-            links.append((name, source_id, url))
+            source_occurrences[source_id] = source_occurrences.get(source_id, 0) + 1
+            links.append(
+                (name, source_id, url, str(record.get("citation_id") or "").strip()
+                 or source_citation_id(source_id, source_occurrences[source_id]))
+            )
+    text = HEADER_PATTERN.sub("", (body or "").strip()).strip()
+    if inline_sources:
+        source_links: list[tuple[str, str]] = []
+        seen_link_source_ids: set[str] = set()
+        for _name, source_id, url, citation_id in links:
+            if citation_id and citation_id not in seen_link_source_ids:
+                seen_link_source_ids.add(citation_id)
+                source_links.append((citation_id, url))
+        source_markers = tuple(
+            marker
+            for _name, source_id, _url, citation_id in links
+            for marker in (source_id, citation_id)
+            if marker
+        )
+        text = _remove_source_tail(text, source_markers)
+        text = _inline_source_links(
+            text,
+            source_links,
+        )
+        if discussion:
+            text = "\n".join(
+                [text, "", PROMOTED_NOTE if promoted else DISCUSSION_NOTE]
+            ).strip()
+        return text
+
     source_count = len(seen_sources)
     article_count = len(links) or source_count
     header = f"【信息来源 {source_count} 条 · 原文 {article_count} 篇】"
-    text = HEADER_PATTERN.sub("", (body or "").strip()).strip()
     footer_at = text.rfind(FOOTER_MARK)
     if footer_at >= 0:
         text = text[:footer_at].rstrip()
     lines = [header, "", text, "", "原文链接"]
     if links:
-        for name, source_id, url in links:
+        for name, source_id, url, _citation_id_value in links:
             label = f"{name}（{source_id}）" if source_id else name
             lines.append(f"- {label}：{url}")
     else:

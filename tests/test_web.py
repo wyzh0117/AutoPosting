@@ -1,19 +1,26 @@
 import json
+import shutil
 import socket
+import subprocess
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
 
 from autoposting.db import Database
+from autoposting.images import default_page_fetcher
 from autoposting.llm import LLMService
 from autoposting.models import FeedItem, Source
 from autoposting.publishing import PublicationError, PublicationService
 from autoposting.web import WebApp, create_server
 
+from test_github_weekly import TRENDING_HTML
 from test_workbench import FakeModel, WechatStubHandler, _feed
 
 
@@ -73,6 +80,19 @@ class ModelStubHandler(BaseHTTPRequestHandler):
         pass
 
 
+class RelatedSearchModel:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> object:
+        self.calls.append(argv)
+        return types.SimpleNamespace(
+            stdout=json.dumps({"query": "模型发布 最新进展 新闻"}, ensure_ascii=False),
+            stderr="",
+            returncode=0,
+        )
+
+
 class FakeCredentialStore:
     def __init__(self) -> None:
         self.secrets: dict[str, str] = {}
@@ -119,16 +139,19 @@ class WebApiTests(unittest.TestCase):
             [("w1", "Model One news", "https://lab.example/w1", 5), ("w2", "Model Two news", "https://lab.example/w2", 60)]
         )
         self.credentials = FakeCredentialStore()
+        self.model = FakeModel()
         self.app = WebApp(
             self.db,
             self.sources,
             self.root / "packages",
             fetcher=lambda _: self.feed,
             wechat_base_url=self.wechat_stub_url,
-            llm_service=LLMService(self.db, runner=FakeModel()),
+            llm_service=LLMService(self.db, runner=self.model),
+            translation_service=LLMService(self.db, runner=self.model),
             credential_store=self.credentials,
             page_fetcher=lambda _: b"",
         )
+        self.app._wechat_poster_renderer = lambda _title: b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
         self.server = create_server(self.app, "127.0.0.1", 0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -162,11 +185,135 @@ class WebApiTests(unittest.TestCase):
         )
         return str(self.db.connect().execute("SELECT item_id FROM items LIMIT 1").fetchone()["item_id"])
 
+    def test_github_weekly_refresh_uses_fixed_template(self) -> None:
+        self.app.github_fetcher = (
+            lambda url: TRENDING_HTML if "trending" in url else {"items": []}
+        )
+        status, payload = self._request("POST", "/api/github-weekly", {})
+        self.assertEqual(200, status)
+        self.assertGreaterEqual(int(payload["count"]), 2)
+        self.assertEqual("本周值得关注的github ai项目前10", payload["xhs_title"])
+        self.assertIn("llm-cli", payload["xhs_body"])
+        self.assertIn("https://github.com/acme/llm-cli", payload["xhs_body"])
+        self.assertEqual("llm-cli", payload["repos"][0]["name"])
+        self.assertTrue(payload["repos"][0]["summary"])
+        self.assertFalse(payload["repos"][0]["enriched"])
+        self.assertEqual(len(payload["repos"]) + 1, len(payload["images"]))
+        self.assertEqual("cover", payload["images"][0]["kind"])
+        self.assertIn("3:4", payload["images"][0]["prompt"])
+        self.assertEqual("本周爆火ai工具", payload["images"][0]["title"])
+        self.assertIn("3:4", payload["images"][0]["prompt"])
+        status2, saved = self._request("GET", "/api/github-weekly")
+        self.assertEqual(200, status2)
+        self.assertEqual(payload["repos"][0]["full_name"], saved["repos"][0]["full_name"])
+
+    def test_github_weekly_refresh_does_not_call_image_model(self) -> None:
+        calls: list[str] = []
+        self.app.github_fetcher = (
+            lambda url: TRENDING_HTML if "trending" in url else {"items": []}
+        )
+        self.app.image_generator = lambda prompt: calls.append(prompt) or (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
+            b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        status, payload = self._request("POST", "/api/github-weekly", {})
+        self.assertEqual(200, status)
+        self.assertEqual([], calls)
+        self.assertTrue(payload["images"])
+        self.assertTrue(all(not image.get("url") for image in payload["images"]))
+
+    def test_github_weekly_render_applies_theme_and_palette(self) -> None:
+        self.app.github_fetcher = (
+            lambda url: TRENDING_HTML if "trending" in url else {"items": []}
+        )
+        seen: dict[str, object] = {}
+
+        def fake_render(repos, jobs, out_dir, theme="dark", palette=None):
+            seen["theme"] = theme
+            seen["palette"] = palette
+            seen["count"] = len(repos)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rendered = []
+            for job in jobs:
+                filename = f"{job['id']}.png"
+                (out_dir / filename).write_bytes(b"png")
+                row = dict(job)
+                row["file"] = filename
+                row["url"] = f"/api/generated/github-weekly/{filename}"
+                rendered.append(row)
+            return rendered
+
+        self.app.visual_renderer = fake_render
+        self._request("POST", "/api/github-weekly", {})
+        status, payload = self._request(
+            "POST",
+            "/api/github-weekly/render",
+            {
+                "theme": "light",
+                "palette": {"main": "#F3EFE4", "secondary": "#FFFCF6", "accent": "#C45C26"},
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("light", seen["theme"])
+        self.assertEqual("#C45C26", seen["palette"]["accent"])
+        self.assertTrue(payload["images"][0]["url"])
+        self.assertEqual("light", payload["visual"]["theme"])
+        self.assertEqual("#C45C26", payload["visual"]["palette"]["accent"])
+
+    def test_github_weekly_image_renders_one_job_and_accepts_palette(self) -> None:
+        self.app.github_fetcher = (
+            lambda url: TRENDING_HTML if "trending" in url else {"items": []}
+        )
+        seen: dict[str, object] = {}
+
+        def fake_render(repos, jobs, out_dir, theme="dark", palette=None):
+            seen["theme"] = theme
+            seen["palette"] = palette
+            seen["job_ids"] = [job["id"] for job in jobs]
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rendered = []
+            for job in jobs:
+                filename = f"{job['id']}.png"
+                (out_dir / filename).write_bytes(b"png")
+                row = dict(job)
+                row["file"] = filename
+                row["url"] = f"/api/generated/github-weekly/{filename}"
+                rendered.append(row)
+            return rendered
+
+        self.app.visual_renderer = fake_render
+        status, weekly = self._request("POST", "/api/github-weekly", {})
+        self.assertEqual(200, status)
+        image_id = str(weekly["images"][0]["id"])
+        later_id = str(weekly["images"][1]["id"])
+        status, payload = self._request(
+            "POST",
+            "/api/github-weekly/image",
+            {
+                "id": image_id,
+                "theme": "light",
+                "palette": {"main": "#F3EFE4", "secondary": "#FFFCF6", "accent": "#C45C26"},
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("light", seen["theme"])
+        self.assertEqual("#C45C26", seen["palette"]["accent"])
+        self.assertEqual([image_id], seen["job_ids"])
+        self.assertEqual(image_id, payload["id"])
+        self.assertTrue(payload["url"])
+        saved = self._request("GET", "/api/github-weekly")[1]
+        by_id = {str(image["id"]): image for image in saved["images"]}
+        self.assertTrue(by_id[image_id]["url"])
+        self.assertFalse(by_id[later_id].get("url"))
+        self.assertEqual("light", saved["visual"]["theme"])
+        self.assertEqual("#C45C26", saved["visual"]["palette"]["accent"])
+
     def test_status_and_index_placeholder(self) -> None:
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("0.4.0", payload["version"])
+        self.assertEqual("1.2.9", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -250,6 +397,55 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual("translated", payload["candidates"][0]["translation_status"])
         self.assertTrue(payload["candidates"][0]["title_zh"])
 
+    def _insert_named(self, source: Source, external_id: str, title: str, url: str) -> str:
+        self.db.insert_item(
+            source,
+            FeedItem(external_id, url, title, f"{title} 内容", None, {}),
+        )
+        return str(
+            self.db.connect()
+            .execute("SELECT item_id FROM items WHERE title = ?", (title,))
+            .fetchone()["item_id"]
+        )
+
+    def test_favorites_api_add_list_remove_round_trip(self) -> None:
+        item_id = self._insert_named(
+            self.sources[0], "fav-1", "Favorite news", "https://lab.example/fav-1"
+        )
+        status, added = self._request("POST", "/api/favorites", {"item_id": item_id})
+        self.assertEqual(200, status)
+        self.assertTrue(added["ok"])
+        status, listed = self._request("GET", "/api/favorites")
+        self.assertEqual(200, status)
+        self.assertEqual([item_id], [item["item_id"] for item in listed["items"]])
+        self.assertEqual("Favorite news", listed["items"][0]["title"])
+        status, deleted = self._request("DELETE", "/api/favorites", {"item_id": item_id})
+        self.assertEqual(200, status)
+        self.assertTrue(deleted["ok"])
+        status, empty = self._request("GET", "/api/favorites")
+        self.assertEqual([], empty["items"])
+
+    def test_articles_item_ids_length_two_hits_fuse_path(self) -> None:
+        first_id = self._insert_named(
+            self.sources[0], "fuse-a", "Alpha launch", "https://lab.example/fuse-a"
+        )
+        second_id = self._insert_named(
+            self.sources[1], "fuse-b", "Beta debate", "https://media.example/fuse-b"
+        )
+        status, payload = self._request(
+            "POST",
+            "/api/articles",
+            {"item_ids": [second_id, first_id], "platform": "wechat"},
+        )
+        self.assertEqual(200, status)
+        prompt = self.model.calls[-1][2]
+        data, _ = json.JSONDecoder().raw_decode(prompt.rsplit("数据：\n", 1)[1].strip())
+        self.assertIn("Alpha launch", data["summary"])
+        self.assertIn("Beta debate", data["summary"])
+        self.assertIn("Alpha launch 内容", data["summary"])
+        self.assertIn("Beta debate 内容", data["summary"])
+        self.assertEqual({"lab_blog", "media_feed"}, set(payload["source_ids"]))
+
     def test_articles_endpoint_is_idempotent_per_item(self) -> None:
         item_id = self._insert_item(self.sources[0], "w1", "Model One news", "https://lab.example/w1")
 
@@ -260,13 +456,13 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(200, status2)
         self.assertEqual(first["event_id"], second["event_id"])
         self.assertEqual(first["draft_id"], second["draft_id"])
+        self.assertEqual("AI专家", first["prompt_style"])
         self.assertEqual("DRAFTED", first["status"])
         self.assertIn("AIGC", first["body"])
-        self.assertIn("lab_blog", first["body"])
-        self.assertIn("【信息来源 1 条 · 原文 1 篇】", first["body"])
         self.assertIn("https://lab.example/w1", first["body"])
+        self.assertNotIn("【信息来源", first["body"])
         self.assertEqual(
-            "openai-compatible/unconfigured:none:article-v4",
+            "openai-compatible/unconfigured:none:article-v12",
             self.db.get_draft(first["draft_id"])["generator"],
         )
 
@@ -274,6 +470,316 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(400, status)
         status, payload = self._request("POST", "/api/articles", {"item_id": "missing", "platform": "wechat"})
         self.assertEqual(404, status)
+
+    def test_related_search_uses_draft_context_and_search_web(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "related", "Model One news", "https://lab.example/related"
+        )
+        _, article = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
+        )
+        body = "第一段背景。\n\n第二段包含选中关键词。\n\n第三段补充。\n\n第四段不应传给模型。\n\nAIGC lab_blog"
+        self._request(
+            "POST",
+            "/api/articles/edit",
+            {"draft_id": article["draft_id"], "title": "Model One news", "body": body},
+        )
+        search_html = (
+            '<a class="result__a" href="https://news.example/unrelated">无关结果</a>'
+            '<div class="result__snippet">其他新闻</div>'
+            '<a class="result__a" href="https://news.example/model">选中关键词相关新闻</a>'
+            '<div class="result__snippet">选中关键词最新进展摘要</div>'
+        ).encode("utf-8")
+        requested_urls: list[str] = []
+
+        def fetch_related(url: str) -> bytes:
+            requested_urls.append(url)
+            return search_html if "duckduckgo.com/html" in url else b""
+
+        self.app.workbench.page_fetcher = fetch_related
+        self.app._article_model_configured = False
+        selection = "选中关键词"
+        start = body.index(selection)
+        model_calls_before = len(self.model.calls)
+        status, payload = self._request(
+            "POST",
+            "/api/related-search",
+            {
+                "draft_id": article["draft_id"],
+                "selected_text": selection,
+                "selection_start": start,
+                "selection_end": start + len(selection),
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(selection, payload["query"])
+        self.assertEqual(selection, parse_qs(urlsplit(requested_urls[0]).query)["q"][0])
+        self.assertEqual("https://news.example/model", payload["items"][0]["url"])
+        self.assertEqual(1, len(payload["items"]))
+        self.assertEqual(model_calls_before, len(self.model.calls))
+
+    def test_related_search_default_fetch_route_is_thread_safe(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "related-default", "Default related", "https://lab.example/related-default"
+        )
+        _, article = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
+        )
+        body = (
+            "背景。\n\nOpenAI rogue agent swarm。\n\n补充。\n\n"
+            "[原文](https://lab.example/related-default)\n\n"
+            "AIGC 声明：本文由 AI 辅助生成。"
+        )
+        self._request(
+            "POST",
+            "/api/articles/edit",
+            {"draft_id": article["draft_id"], "title": "Default related", "body": body},
+        )
+        self.app.workbench.page_fetcher = default_page_fetcher
+        with patch(
+            "autoposting.workbench.search_related_news",
+            return_value=("OpenAI rogue agent swarm", [{
+                "title": "相关报道", "url": "https://news.example/report", "snippet": "摘要"
+            }]),
+        ) as search:
+            selection = "OpenAI rogue agent swarm。"
+            start = body.index(selection)
+            payload = {
+                "draft_id": article["draft_id"],
+                "selected_text": selection,
+                "selection_start": start,
+                "selection_end": start + len(selection),
+            }
+            responses: list[tuple[int, dict[str, object]]] = []
+
+            def request() -> None:
+                responses.append(self._request("POST", "/api/related-search", payload))
+
+            threads = [threading.Thread(target=request) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+
+        self.assertEqual([(200, responses[0][1]), (200, responses[1][1])], responses)
+        self.assertEqual(2, search.call_count)
+        self.assertTrue(all(call.kwargs["fetcher"] is None for call in search.call_args_list))
+
+    def test_related_search_rejects_invalid_selection_offsets(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "related-invalid", "Model One news", "https://lab.example/related-invalid"
+        )
+        _, article = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
+        )
+        status, payload = self._request(
+            "POST",
+            "/api/related-search",
+            {
+                "draft_id": article["draft_id"],
+                "selection": "伪造内容",
+                "selection_start": 0,
+                "selection_end": 4,
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertIn("selection", payload["error"])
+
+    def test_related_search_hides_unexpected_search_errors(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "related-error", "Model One news", "https://lab.example/related-error"
+        )
+        _, article = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
+        )
+        body = str(article["body"])
+        model = RelatedSearchModel()
+        service = LLMService(self.db, runner=model)
+        self.app.llm_service = service
+        self.app.workbench.llm_service = service
+        self.app._article_model_configured = True
+
+        def fail_fetcher(_url: str) -> bytes:
+            raise RuntimeError("secret upstream failure")
+
+        self.app.workbench.page_fetcher = fail_fetcher
+        paragraphs = [part.strip() for part in body.splitlines() if part.strip()]
+        selection = paragraphs[0][: min(12, len(paragraphs[0]))]
+        start = body.index(selection)
+        status, payload = self._request(
+            "POST",
+            "/api/related-search",
+            {
+                "draft_id": article["draft_id"],
+                "selected_text": selection,
+                "selection_start": start,
+                "selection_end": start + len(selection),
+            },
+        )
+        self.assertEqual(502, status, payload)
+        self.assertEqual("related_search_failed", payload["error"])
+        self.assertNotIn("secret upstream failure", json.dumps(payload, ensure_ascii=False))
+
+    def test_article_prompt_style_selects_file_and_scopes_cache(self) -> None:
+        item_id = self._insert_item(self.sources[0], "style", "Style news", "https://lab.example/style")
+
+        status, first = self._request(
+            "POST",
+            "/api/articles",
+            {"item_id": item_id, "platform": "wechat", "prompt_style": "经验分享"},
+        )
+        call_count = len(self.model.calls)
+        status2, second = self._request(
+            "POST",
+            "/api/articles",
+            {"item_id": item_id, "platform": "wechat", "prompt_style": "经验分享"},
+        )
+        status3, third = self._request(
+            "POST",
+            "/api/articles",
+            {"item_id": item_id, "platform": "wechat", "prompt_style": "AI专家"},
+        )
+        bad_status, _ = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat", "prompt_style": "8"}
+        )
+
+        self.assertEqual((200, 200, 200, 400), (status, status2, status3, bad_status))
+        self.assertEqual("经验分享", first["prompt_style"])
+        self.assertEqual(first["draft_id"], second["draft_id"])
+        self.assertEqual(first["draft_id"], third["draft_id"])
+        self.assertEqual(call_count, len(self.model.calls) - 1)
+        prompts = [call[2] for call in self.model.calls]
+        self.assertTrue(any("拆解" in prompt for prompt in prompts))
+        self.assertTrue(any("一般人容易看漏的角度" in prompt for prompt in prompts))
+
+    def test_xiaohongshu_article_returns_caption_and_9x16_cards(self) -> None:
+        item_id = self._insert_item(self.sources[0], "xhs1", "Model One news", "https://lab.example/xhs1")
+
+        status, payload = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "xiaohongshu"}
+        )
+
+        self.assertEqual(200, status)
+        self.assertIn("导语：今日要点", payload["body"])
+        self.assertEqual(payload["body"], payload["caption"])
+        self.assertIn("导语：今日要点", payload["manuscript"])
+        self.assertEqual("cover", payload["cards"][0]["kind"])
+        self.assertEqual(1080, payload["cards"][0]["width"])
+        self.assertEqual(1920, payload["cards"][0]["height"])
+        self.assertEqual("@小红书号", payload["cards"][0]["handle"])
+
+    def test_original_endpoint_fetches_article_and_translates_after_it(self) -> None:
+        item_id = self._insert_item(self.sources[0], "original", "Original news", "https://lab.example/original")
+        paragraph = "This is the complete English article body with verified context. " * 8
+        self.app.workbench.page_fetcher = lambda _: (
+            f"<html><nav>menu noise</nav><article><h1>Original news</h1>"
+            f"<p>{paragraph}</p><script>bad()</script></article></html>"
+        ).encode()
+
+        status, payload = self._request("POST", "/api/original", {"item_id": item_id})
+        translated_status, translated = self._request(
+            "POST", "/api/original/translate", {"item_id": item_id}
+        )
+        missing_status, _ = self._request("POST", "/api/original", {"item_id": "missing"})
+
+        self.assertEqual(200, status)
+        self.assertEqual(200, translated_status)
+        self.assertEqual(404, missing_status)
+        self.assertEqual("Original news", payload["title"])
+        self.assertIn("complete English article body", payload["content"])
+        self.assertNotIn("menu noise", payload["content"])
+        self.assertEqual("page", payload["content_source"])
+        self.assertTrue(payload["translatable"])
+        self.assertIn("中文摘要", translated["translation"])
+        self.assertEqual("https://lab.example/original", payload["sources"][0]["url"])
+
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem(
+                "unsafe-original",
+                "javascript:alert(1)",
+                '<img src=x onerror="alert(1)">',
+                "<script>alert(1)</script> visible text",
+                None,
+                {},
+            ),
+        )
+        unsafe_id = str(
+            self.db.connect()
+            .execute("SELECT item_id FROM items WHERE external_id = ?", ("unsafe-original",))
+            .fetchone()["item_id"]
+        )
+        unsafe_status, unsafe = self._request("POST", "/api/original", {"item_id": unsafe_id})
+        self.assertEqual(200, unsafe_status)
+        self.assertEqual('<img src=x onerror="alert(1)">', unsafe["title"])
+        self.assertEqual("<script>alert(1)</script> visible text", unsafe["content"])
+        self.assertEqual([], unsafe["sources"])
+        for index, url in enumerate(("data:text/plain,unsafe", "file:///tmp/unsafe"), start=1):
+            external_id = f"unsafe-scheme-{index}"
+            self.db.insert_item(
+                self.sources[0],
+                FeedItem(external_id, url, f"unsafe {index}", f"stored text {index}", None, {}),
+            )
+            item_id = str(
+                self.db.connect()
+                .execute("SELECT item_id FROM items WHERE external_id = ?", (external_id,))
+                .fetchone()["item_id"]
+            )
+            scheme_status, scheme_payload = self._request(
+                "POST", "/api/original", {"item_id": item_id}
+            )
+            self.assertEqual(200, scheme_status)
+            self.assertEqual([], scheme_payload["sources"])
+
+    def test_original_translation_requires_translation_model(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "translation-required", "English report", "https://lab.example/en"
+        )
+        app = WebApp(
+            self.db,
+            self.sources,
+            self.root / "unconfigured-translation",
+            page_fetcher=lambda _: b"<article><p>English body text.</p></article>",
+        )
+        with self.assertRaisesRegex(ValueError, "translation_model_not_configured"):
+            app.translate_original(item_id)
+
+    def test_original_fetch_failure_is_retried(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "retry-original", "Retry English report", "https://lab.example/retry"
+        )
+        calls = 0
+
+        def flaky_fetcher(_: str) -> bytes:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("temporary timeout")
+            return ("<article><p>" + "Recovered full article text. " * 15 + "</p></article>").encode()
+
+        self.app.workbench.page_fetcher = flaky_fetcher
+
+        first = self.app.original(item_id)
+        second = self.app.original(item_id)
+
+        self.assertEqual("feed", first["content_source"])
+        self.assertEqual("page", second["content_source"])
+        self.assertEqual(2, calls)
+
+    def test_english_body_with_cjk_brand_in_title_is_translatable(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "mixed-title", "千问 Qwen model report", "https://lab.example/mixed"
+        )
+        self.app.workbench.page_fetcher = lambda _: (
+            "<article><p>" + "This English report contains detailed benchmark context. " * 12
+            + "</p></article>"
+        ).encode()
+
+        original = self.app.original(item_id)
+        translated = self.app.translate_original(item_id)
+
+        self.assertTrue(original["translatable"])
+        self.assertIn("中文摘要", translated["translation"])
 
     def test_find_hooks_endpoint_and_articles_accept_chosen_hooks(self) -> None:
         self.db.insert_item(
@@ -363,7 +869,7 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertTrue(payload["configured"])
-        self.assertEqual("测试作者", payload["author"])
+        self.assertNotIn("author", payload)
         self.assertNotIn("top-secret-value", json.dumps(payload))
         self.assertNotIn("wx123", json.dumps(payload))
 
@@ -372,6 +878,52 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn("top-secret-value", json.dumps(status_payload))
         database_bytes = self.root.joinpath("autoposting.db").read_bytes()
         self.assertNotIn(b"top-secret-value", database_bytes)
+        self.assertIn("account:wechat", self.credentials.secrets)
+
+    def test_wechat_config_restores_after_restart_and_can_be_deleted(self) -> None:
+        self._request(
+            "POST",
+            "/api/config",
+            {
+                "platform": "wechat",
+                "app_id": "wx123",
+                "app_secret": "top-secret-value",
+                "thumb_media_id": "thumb-1",
+                "author": "测试作者",
+            },
+        )
+        restarted = WebApp(
+            self.db,
+            self.sources,
+            self.root / "restarted-packages",
+            credential_store=self.credentials,
+            page_fetcher=lambda _: b"",
+        )
+        self.assertIsNotNone(restarted.wechat_config)
+        self.assertEqual("wx123", restarted.wechat_config["app_id"])
+        self.assertEqual("top-secret-value", restarted.wechat_config["app_secret"])
+        self.assertTrue(restarted.status()["platforms"]["wechat"]["configured"])
+        serialized = json.dumps(restarted.status())
+        self.assertNotIn("top-secret-value", serialized)
+        self.assertNotIn("wx123", serialized)
+
+        status, payload = self._request(
+            "POST", "/api/config/delete", {"platform": "wechat"}
+        )
+        self.assertEqual(200, status)
+        self.assertFalse(payload["configured"])
+        self.assertNotIn("account:wechat", self.credentials.secrets)
+        self.assertIsNone(self.app.wechat_config)
+
+    def test_config_wechat_allows_empty_thumb_media_id(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/config",
+            {"platform": "wechat", "app_id": "wx123", "app_secret": "top-secret-value", "author": ""},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload["configured"])
+        self.assertNotIn("top-secret-value", json.dumps(payload))
 
     def test_config_xiaohongshu_and_unknown_platform(self) -> None:
         status, payload = self._request(
@@ -521,6 +1073,11 @@ class WebApiTests(unittest.TestCase):
                 "/api/chat/model",
                 {"model": "model-b", "base_url": first_url, "api_key": "first-key"},
             )
+            translation_status, translation_saved = self._request(
+                "POST",
+                "/api/translation/model",
+                {"model": "model-a", "base_url": first_url, "api_key": "first-key"},
+            )
             self._request(
                 "POST",
                 "/api/models",
@@ -563,18 +1120,49 @@ class WebApiTests(unittest.TestCase):
 
         self.assertEqual(second_url, restored["llm"]["base_url"])
         self.assertEqual(first_url, restored["chat_llm"]["base_url"])
+        self.assertEqual(200, translation_status)
+        self.assertEqual("model-a", translation_saved["translation_llm"]["model"])
+        self.assertEqual(first_url, restored["translation_llm"]["base_url"])
         self.assertEqual(2, len(restored["model_endpoints"]))
         self.assertTrue(all(endpoint["credential_available"] for endpoint in restored["model_endpoints"]))
         self.assertEqual(first_url, switched["llm"]["base_url"])
         self.assertEqual([second["id"]], [endpoint["id"] for endpoint in deleted["model_endpoints"]])
         self.assertFalse(deleted["llm"]["configured"])
         self.assertFalse(deleted["chat_llm"]["configured"])
+        self.assertFalse(deleted["translation_llm"]["configured"])
         serialized = json.dumps(restored)
         self.assertNotIn("first-key", serialized)
         self.assertNotIn("second-key", serialized)
         database_bytes = self.root.joinpath("autoposting.db").read_bytes()
         self.assertNotIn(b"first-key", database_bytes)
         self.assertNotIn(b"second-key", database_bytes)
+
+    def test_models_probe_keeps_saved_model_list(self) -> None:
+        stub = ThreadingHTTPServer(("127.0.0.1", 0), ModelStubHandler)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        remote_url = f"http://127.0.0.1:{stub.server_address[1]}/v1"
+        try:
+            self._request(
+                "POST",
+                "/api/models",
+                {"base_url": remote_url, "api_key": "keep-key", "models": ["kept-model"]},
+            )
+            status, probed = self._request(
+                "POST",
+                "/api/models",
+                {
+                    "base_url": remote_url,
+                    "api_key": "keep-key",
+                    "persist": False,
+                },
+            )
+            stored = self.db.get_model_endpoint(probed["endpoint_id"])
+        finally:
+            stub.shutdown()
+            stub.server_close()
+        self.assertEqual(200, status)
+        self.assertEqual(["model-a", "model-b"], probed["models"])
+        self.assertEqual(["kept-model"], json.loads(str(stored["models_json"])))
 
     def test_articles_require_successfully_configured_remote_model(self) -> None:
         item_id = self._insert_item(
@@ -814,8 +1402,8 @@ class WebApiTests(unittest.TestCase):
         )
 
         self.assertEqual(200, status)
-        self.assertEqual("SUBMITTED", payload["status"])
-        self.assertEqual("stub-publish-1", payload["reference"])
+        self.assertEqual("DRAFT_SAVED", payload["status"])
+        self.assertEqual("stub-media-1", payload["reference"])
         archive_path = Path(str(payload["archive_path"]))
         self.assertTrue(archive_path.exists())
         archived = json.loads(archive_path.read_text(encoding="utf-8"))
@@ -827,10 +1415,13 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn(b"top-secret-value", database_bytes)
         self.assertNotIn(b"stub-token-123", database_bytes)
         attempt = self.db.get_latest_publication_attempt(article["draft_id"])
-        self.assertEqual("SUBMITTED", attempt["status"])
-        self.assertEqual("stub-publish-1", attempt["response_reference"])
+        self.assertEqual("DRAFT_SAVED", attempt["status"])
+        self.assertEqual("stub-media-1", attempt["response_reference"])
         for _, _, body in WechatStubHandler.requests:
-            if body and "top-secret-value" in body:
+            if not body:
+                continue
+            text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else body
+            if "top-secret-value" in text:
                 self.fail("secret leaked into API request body")
 
     def test_schedule_publish_creates_pending_job(self) -> None:
@@ -1087,7 +1678,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("找切口", html)
         self.assertIn('id="find-hooks-btn"', html)
         self.assertIn('id="hook-list"', html)
-        self.assertIn('api("/api/hooks/find"', html)
+        self.assertIn('waitApi("hooks", "/api/hooks/find"', html)
         self.assertIn("chosen_hooks", html)
         self.assertIn("主切口", html)
         self.assertIn("须进开头", html)
@@ -1097,7 +1688,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("var itemId = state.item.item_id", html)
         self.assertIn("state.item.item_id !== itemId", html)
         self.assertLess(html.index("找切口"), html.index("生成文章"))
-        self.assertNotIn('api("/api/hooks/find"', html.split("function generate()")[1].split("function persistArticle()")[0])
+        self.assertNotIn('waitApi("hooks"', html.split("function generate()")[1].split("function persistArticle(")[0])
 
 
 class IndexPageContractTests(unittest.TestCase):
@@ -1154,8 +1745,10 @@ class IndexPageContractTests(unittest.TestCase):
             "config-btn",
         ):
             self.assertIn(f'id="{button_id}"', html)
-        self.assertIn('id="publish-btn" disabled', html)
-        self.assertIn('id="schedule-btn" disabled', html)
+        self.assertIn('id="publish-btn" disabled class="primary">到草稿</button>', html)
+        self.assertIn('id="schedule-btn" disabled>定时到草稿</button>', html)
+        self.assertIn("function publishButtonLabel()", html)
+        self.assertIn('return state.platform === "wechat" ? "到草稿" : "发布"', html)
         self.assertIn('id="schedule-at"', html)
         self.assertIn("<dialog", html)
         self.assertIn('id="config-dialog"', html)
@@ -1164,13 +1757,62 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="config-cancel"', html)
         self.assertIn("showModal", html)
         self.assertIn('config-dialog").close()', html)
-        self.assertIn("form.reset()", html)
+        self.assertIn("form.app_secret.value = \"\"", html)
         self.assertIn("aria-label", html)
 
     def test_platform_segmented_control(self) -> None:
         html = self._index()
         self.assertIn('data-platform="wechat"', html)
         self.assertIn('data-platform="xiaohongshu"', html)
+
+    def test_top_nav_holds_lanes_and_platforms(self) -> None:
+        html = self._index()
+        self.assertIn('id="app-nav"', html)
+        self.assertIn('data-lane="hotspots"', html)
+        self.assertIn('data-lane="viewpoints"', html)
+        self.assertIn('data-lane="github"', html)
+        self.assertIn('data-lane="skills"', html)
+        self.assertIn("Skill查找器", html)
+        nav = html[html.index('id="app-nav"') : html.index('id="wait-banner"')]
+        self.assertIn('data-lane="skills"', nav)
+        self.assertIn('data-platform="wechat"', nav)
+        self.assertIn('data-platform="xiaohongshu"', nav)
+        self.assertNotIn('data-lane="skills"', html[html.index('id="hotspots-panel"') : html.index('id="article-panel"')])
+        self.assertLess(html.index('id="app-nav"'), html.index('id="wait-banner"'))
+        self.assertGreater(html.index('id="wait-banner"'), html.index("</header>"))
+        self.assertLess(html.index('id="wait-banner"'), html.index("<main>"))
+        self.assertIn("lane === \"skills\"", html)
+        self.assertIn("body.lane-skills", html)
+        self.assertIn("/api/skills/search", html)
+        self.assertIn('id="skill-query"', html)
+        self.assertIn('id="skills-gallery"', html)
+
+    def test_github_cover_css_is_three_by_four(self) -> None:
+        html = self._index()
+        self.assertRegex(html, r"\.gh-cover\{[^}]*aspect-ratio:3/4")
+        self.assertRegex(html, r"\.gh-poster\{[^}]*aspect-ratio:3/4")
+        self.assertRegex(html, r"\.xhs-paper\{[^}]*aspect-ratio:9/16")
+        self.assertRegex(html, r"\.gh-tile\{[^}]*aspect-ratio:4/3")
+        self.assertIn(".gh-tile.gh-cover{aspect-ratio:3/4;}", html)
+        self.assertIn(".gh-tile.gh-poster{aspect-ratio:3/4;}", html)
+        self.assertIn("object-fit:contain", html)
+        from autoposting.llm import IMAGE_ASPECT_RATIO
+
+        self.assertEqual("9:16", IMAGE_ASPECT_RATIO)
+        overview = (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "image_prompts"
+            / "page-schemas"
+            / "ranking-overview.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("画布 3:4", overview)
+        self.assertNotIn("画布 9:16", overview)
+        cover = (
+            Path(__file__).resolve().parents[1] / "docs" / "image_prompts" / "cover.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("3:4", cover)
+        self.assertIn("1080", cover)
 
     def test_api_paths_and_approve_before_publish(self) -> None:
         html = self._index()
@@ -1194,7 +1836,12 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("function resetArticle()", html)
         self.assertIn("state.draft = null", html)
         self.assertIn("state.item = item;\n  resetArticle();", html)
-        self.assertIn("state.platform = platform;\n  resetArticle();", html)
+        self.assertIn(
+            "state.platform = platform;\n"
+            '  document.body.classList.toggle("platform-xhs", platform === "xiaohongshu");\n'
+            "  resetArticle();",
+            html,
+        )
 
     def test_manual_required_handling(self) -> None:
         html = self._index()
@@ -1210,7 +1857,8 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertEqual(1, html.count("仍需在官方创作中心人工提交"))
         self.assertIn("#package-path{overflow-wrap:anywhere; word-break:normal", html)
         self.assertIn('var completed = false;', html)
-        self.assertIn('button.dataset.originalLabel = result.manual_required ? "已生成发布包" : "已提交";', html)
+        self.assertIn('button.dataset.originalLabel = result.manual_required ? "已生成发布包" : "已到草稿";', html)
+        self.assertIn("已写入公众号草稿箱", html)
         self.assertIn("if (completed) { button.disabled = true; }", html)
 
     def test_first_wechat_configuration_resumes_pending_publish(self) -> None:
@@ -1219,7 +1867,8 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("openSettings(true)", html)
         self.assertIn("var resumePublish = state.pendingPublish", html)
         self.assertIn("state.pendingPublish = false", html)
-        self.assertIn("if (resumePublish) { publish(); }", html)
+        self.assertIn("if (resumePublish) {", html)
+        self.assertIn("publish();", html)
 
     def test_hotspot_and_article_render_fields(self) -> None:
         html = self._index()
@@ -1231,19 +1880,167 @@ class IndexPageContractTests(unittest.TestCase):
     def test_hotspot_candidate_wording_and_note(self) -> None:
         html = self._index()
         self.assertIn("热点候选", html)
+        self.assertIn("观点候选", html)
+        self.assertIn('data-lane="viewpoints"', html)
+        self.assertIn("function setLane(", html)
         self.assertIn("热度看独立来源数和讨论量", html)
+        self.assertIn("GitHub 周榜", html)
+        self.assertIn("GitHub AI 项目周榜", html)
+        self.assertNotIn("GitHub AI项目周榜", html)
+        self.assertIn("body.lane-github .rank-toolbar", html)
+        self.assertIn('data-lane="github"', html)
+        self.assertIn("榜单模型", html)
+        self.assertIn("用于榜单", html)
+        self.assertIn("本周爆火ai工具", html)
+        self.assertIn("本周值得关注的github ai项目前10", html)
+        self.assertIn("exportGithubImages", html)
+        self.assertIn("github-gallery", html)
+        self.assertIn("github-select-all", html)
+        self.assertIn("grid-template-columns:repeat(3", html)
+        self.assertIn("aspect-ratio:3/4", html)
+        self.assertIn("/api/github-weekly", html)
+        self.assertIn("出图模型", html)
+        self.assertIn("用于出图", html)
+        self.assertNotIn("请选 qwen-image / wan", html)
+        self.assertIn("9:16", html)
+        self.assertIn("aspect-ratio:9/16", html)
+        self.assertIn("本周新建", html)
+        self.assertIn("/api/leaderboard/model", html)
+        self.assertIn("抓取周榜", html)
+        self.assertIn("生成图片", html)
+        self.assertIn("浅色", html)
+        self.assertIn("暗色", html)
+        self.assertIn("gh-color-main", html)
+        self.assertIn("gh-color-secondary", html)
+        self.assertIn("gh-color-accent", html)
+        self.assertIn("/api/github-weekly/render", html)
+        self.assertIn("renderGithubWeeklyImages", html)
+        self.assertIn("/api/github-weekly/image", html)
+        self.assertIn("waitApi(\"github_render\"", html)
+        self.assertIn('id="wait-banner"', html)
+        self.assertNotIn("position:fixed; top:4.6rem; right:1.4rem", html)
+        self.assertIn("#wait-jobs{display:flex; flex-direction:column; gap:.55rem; pointer-events:none;}", html)
+        self.assertIn(".wait-stop{\n  pointer-events:auto;", html)
+        self.assertLess(html.index('id="wait-banner"'), html.index("<main>"))
+        self.assertGreater(html.index('id="wait-banner"'), html.index("</header>"))
+        self.assertIn("function waitStart(", html)
+        self.assertIn("function waitProgress(", html)
+        self.assertIn("function waitDone(", html)
+        self.assertIn("function waitStop(", html)
+        self.assertIn("waitJobs", html)
+        self.assertIn("AbortController", html)
+        self.assertIn("wait-stop", html)
+        self.assertIn("已停止", html)
+        self.assertIn("WAIT_HINTS", html)
+        self.assertIn('waitStart("github_render"', html)
+        self.assertIn('waitStart("collect"', html)
+        self.assertIn('waitStart("generate"', html)
+        self.assertIn('waitStart("hooks"', html)
+        self.assertIn('waitStart("github_fetch"', html)
+        self.assertIn('waitStart("translate"', html)
+        self.assertNotIn('waitStart("chat"', html)
+        self.assertIn('waitStart("original"', html)
+        self.assertIn('waitStart("publish"', html)
+        self.assertIn("is-running", html)
+        self.assertIn("is-queued", html)
+        self.assertIn("已全部生成", html)
+        self.assertIn("已用", html)
+        self.assertIn("每张大约", html)
+        self.assertIn("通常", html)
+        self.assertNotIn("return generateMissingGithubImages();", html)
+        self.assertIn("function proxiedImage(url)", html)
+        self.assertIn('url.indexOf("/api/generated/") === 0', html)
 
     def test_bilingual_card_contract(self) -> None:
         html = self._index()
         self.assertIn("原文", html)
         self.assertIn("中文（AI翻译，非官方表述）", html)
-        self.assertIn("未翻译（未配置模型）", html)
+        self.assertIn("未翻译（未配置翻译模型）", html)
+
+    def test_index_html_ignores_query_string(self) -> None:
+        request = urllib.request.Request(self.base_url + "/?reload=1", method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertIn("text/html", response.headers["Content-Type"])
+            html = response.read().decode("utf-8")
+        self.assertIn("AutoPosting", html)
+        self.assertIn("GitHub 周榜", html)
+        self.assertIn("GitHub AI 项目周榜", html)
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("0.4.0", html)
+        self.assertIn("1.2.9", html)
+        self.assertIn("没有已选配图时才生成标题大字报", html)
+        self.assertIn('card.kind === "cover" && !card.image_url', html)
+        self.assertNotIn('"700 72px "', html)
+        self.assertIn('700 72px "Songti SC"', html)
 
-    def test_patch_020_compact_chat_contract(self) -> None:
+    def test_generated_weekly_image_is_not_browser_cached(self) -> None:
+        folder = self.root / "packages" / "github-weekly"
+        folder.mkdir(parents=True)
+        (folder / "cover.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+        request = urllib.request.Request(self.base_url + "/api/generated/github-weekly/cover.png")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(200, response.status)
+            cache = response.headers.get("Cache-Control") or ""
+            self.assertIn("no-store", cache)
+            self.assertNotIn("max-age=300", cache)
+
+    def test_github_gallery_cache_busts_image_urls(self) -> None:
+        html = self._index()
+        self.assertIn("function githubFreshUrl", html)
+        self.assertIn("githubFreshUrl(image.url)", html)
+        self.assertRegex(html, r"\.gh-tile\{[^}]*aspect-ratio:4/3")
+        self.assertIn('image.kind === "cover" ? " gh-cover"', html)
+        self.assertIn('image.kind === "poster" ? " gh-poster"', html)
+        self.assertIn('openGithubLightbox(index)', html)
+        self.assertIn('openSkillsLightbox(index)', html)
+
+    def test_patch_042_style_selector_and_original_reader_contract(self) -> None:
+        html = self._index()
+        self.assertIn('id="prompt-style-select"', html)
+        self.assertIn('<option value="AI专家" selected>AI专家</option>', html)
+        self.assertIn('<option value="经验分享">经验分享</option>', html)
+        self.assertNotIn("1 消息", html)
+        self.assertNotIn('option value="8"', html)
+        self.assertNotIn("新闻特写", html)
+        self.assertIn('id="xhs-cards"', html)
+        self.assertIn("xhs-cards", html)
+        self.assertIn("grid-template-columns:repeat(3", html)
+        self.assertIn("aspect-ratio:9/16", html)
+        self.assertIn("canvas.height = 1920", html)
+        self.assertLess(html.index('id="prompt-style-select"'), html.index('id="find-hooks-btn"'))
+        self.assertIn('prompt_style: $("prompt-style-select").value', html)
+        self.assertIn('id="open-original-btn" disabled', html)
+        self.assertLess(html.index("时间优先"), html.index("打开原文"))
+        self.assertIn('id="original-dialog"', html)
+        self.assertIn('waitApi("original", "/api/original"', html)
+        self.assertIn('$("original-content").textContent = data.content', html)
+        self.assertIn('link.rel = "noopener noreferrer"', html)
+        self.assertIn("function clearHotspotSelection(", html)
+        self.assertIn('button.classList.toggle("selected", selected)', html)
+        self.assertIn('busy($("open-original-btn"), false)', html)
+
+    def test_patch_043_translation_model_and_original_translation_contract(self) -> None:
+        html = self._index()
+        self.assertIn('name="translation_model"', html)
+        self.assertIn('id="endpoint-use-translation"', html)
+        self.assertIn('waitApi("assign", paths[purpose], payload)', html)
+        self.assertIn('translation: {model: "", base_url: "", configured: false, enabled: false}', html)
+        self.assertIn('state.translation.model || state.llm.model', html)
+        self.assertIn('hotspotGen: 0', html)
+        self.assertIn('if (gen !== state.hotspotGen) { return null; }', html)
+        self.assertIn('id="original-translate"', html)
+        self.assertIn('id="original-translation-wrap"', html)
+        self.assertIn('waitApi("original_tr", "/api/original/translate"', html)
+        self.assertLess(html.index('id="original-content"'), html.index('id="original-translation"'))
+        self.assertIn('.model-role-row', html)
+        self.assertIn('flex:0 0 36px', html)
+        self.assertIn('white-space:nowrap; border-color:transparent; background:transparent', html)
+        self.assertIn('.original-head{display:flex; width:100%; min-width:0;', html)
+        self.assertIn('.original-head-actions{display:flex; flex:0 0 auto; flex-wrap:nowrap', html)
+        self.assertIn('aria-label="关闭" title="关闭">×</button>', html)
+
+    def test_patch_020_chat_ui_and_setting_removed(self) -> None:
         html = self._index()
         for element_id in (
             "chat-input",
@@ -1251,38 +2048,99 @@ class IndexPageContractTests(unittest.TestCase):
             "chat-send-btn",
             "chat-output",
         ):
-            self.assertIn(f'id="{element_id}"', html)
-        self.assertIn('id="chat-output"', html)
-        self.assertIn('hidden aria-live="polite"', html)
-        self.assertIn('name="chat_model"', html)
-        self.assertIn('id="endpoint-use-chat"', html)
-        self.assertIn('api("/api/chat"', html)
-        self.assertIn('"/api/chat/model"', html)
-        self.assertIn("min-height:100dvh", html)
-        self.assertIn("overflow-y:auto", html)
+            self.assertNotIn(f'id="{element_id}"', html)
+        self.assertNotIn('name="chat_model"', html)
+        self.assertNotIn('id="endpoint-use-chat"', html)
+        self.assertNotIn('waitApi("chat", "/api/chat"', html)
+        self.assertNotIn("state.chat", html)
+        self.assertNotIn("function sendChat()", html)
         self.assertIn(".article-scroll[hidden]{display:none;}", html)
-        self.assertIn("if (button.disabled) { return; }", html)
-        self.assertIn("state.chatMessages.slice(-48)", html)
-        self.assertIn("if (!state.chat.configured)", html)
         self.assertIn("@media (max-width: 360px)", html)
 
-    def test_patch_021_chat_output_expands_page_without_message_bubbles(self) -> None:
+    def test_patch_041_compact_model_labels_without_chat_picker(self) -> None:
         html = self._index()
-        self.assertIn('document.body.classList.add("chat-expanded")', html)
+        self.assertNotIn('<textarea id="chat-input" rows="3"', html)
+        self.assertIn('var option = el("option", "", model);', html)
+        self.assertNotIn('model + " · " + endpoint.base_url', html)
+        self.assertIn('if (purpose === "article") { payload.effort = "none"; }', html)
+        self.assertNotIn("function fitChatInput()", html)
+        self.assertNotIn("min-height:72px; max-height:40vh", html)
+
+    def test_patch_021_chat_output_removed(self) -> None:
+        html = self._index()
         self.assertIn("function fitArticleBody", html)
         self.assertIn("min-height:calc(100dvh - 8.1rem)", html)
-        self.assertIn("body.chat-expanded{min-height:100dvh; overflow-y:auto;}", html)
-        self.assertIn("body.chat-expanded main{flex:1 0 auto;}", html)
-        self.assertIn("body.chat-expanded #article-view{flex:1 0 auto;}", html)
-        self.assertIn(".chat-section.chat-active{flex:0 0 auto; overflow:visible;}", html)
-        self.assertIn("#chat-output{", html)
-        self.assertIn("overflow:visible", html)
-        chat_content = html[html.index(".chat-content{") : html.index(".chat-msg-error")]
-        self.assertIn("background:transparent", chat_content)
-        self.assertIn("border-top:1px solid var(--border)", chat_content)
-        self.assertIn("border-bottom:1px solid var(--border)", chat_content)
-        self.assertIn("border-radius:0", chat_content)
-        self.assertNotIn("border:1px solid", chat_content)
+        self.assertNotIn("body.chat-expanded", html)
+        self.assertNotIn(".chat-section", html)
+
+    def test_related_search_and_news_supplement_contract(self) -> None:
+        html = self._index()
+        for element_id in (
+            "related-search-btn",
+            "news-supplement-btn",
+            "news-supplement-drawer",
+            "news-supplement-list",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("function selectedArticleContext()", html)
+        self.assertIn("selectionStart", html)
+        self.assertIn("selectionEnd", html)
+        self.assertIn('waitApi("related_search", "/api/related-search"', html)
+        self.assertIn("function renderNewsSupplements()", html)
+        self.assertIn("function toggleNewsSupplementDrawer(", html)
+        self.assertIn("toggleNewsSupplementDrawer(true)", html)
+        self.assertIn('link.rel = "noopener noreferrer"', html)
+        self.assertIn(r"var separator = /\r?\n[ \t]*\r?\n/g;", html)
+        self.assertIn('if (next) { toggleFavoritesDrawer(false); }', html)
+        self.assertIn('if (next) { toggleNewsSupplementDrawer(false); }', html)
+        self.assertIn("function invalidateRelatedSearch()", html)
+        self.assertIn('if (waitRunning("related_search")) { waitStop("related_search"); }', html)
+        self.assertIn("requestDraftId", html)
+        self.assertIn("requestSessionKey", html)
+        self.assertIn("state.articleDirty ? persistArticle(\"related_search\")", html)
+
+    def test_news_supplement_title_focuses_picked_dock(self) -> None:
+        html = self._index()
+        supplements_js = html.split("function renderNewsSupplements(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("focusNewsSupplement(item)", supplements_js)
+        self.assertIn("function focusNewsSupplement(item)", html)
+        self.assertIn("state.newsFocus", html)
+
+    def test_favorites_open_redraws_focus_dock_and_refresh_keeps_favorite_focus(self) -> None:
+        html = self._index()
+        self.assertIn("var favorite = state.favoriteIds && state.favoriteIds[selectedId];", html)
+        favorites_js = html.split("function toggleFavoritesDrawer(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("renderPickedDock();", favorites_js)
+
+    def test_runtime_index_javascript_parses_with_node(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        html = self._index()
+        script = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        result = subprocess.run(
+            [node, "--check"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_article_session_survives_lane_switch_and_late_generation(self) -> None:
+        html = self._index()
+        self.assertIn("articleSessions: {}", html)
+        self.assertIn("function articleSessionKey(", html)
+        self.assertIn("function rememberArticleSession(", html)
+        self.assertIn("function restoreArticleSession(", html)
+        self.assertIn("rememberArticleSession(state.lane)", html)
+        self.assertIn("restoreArticleSession(lane)", html)
+        self.assertIn("var requestLane = state.lane", html)
+        self.assertIn("storeGeneratedArticle(requestKey, data, requestItem)", html)
+        self.assertIn("requestGen !== state.articleRequestGen", html)
+        self.assertIn("collectGen: 0", html)
+        self.assertIn("var requestGen = ++state.collectGen", html)
+        self.assertIn("requestGen !== state.collectGen", html)
 
     def test_patch_013_article_layout_and_model_controls(self) -> None:
         html = self._index()
@@ -1312,7 +2170,7 @@ class IndexPageContractTests(unittest.TestCase):
             self.assertIn(f'name="{name}"', html)
         self.assertIn('type="file"', html)
         self.assertIn("FileReader", html)
-        self.assertIn('api("/api/style"', html)
+        self.assertIn('waitApi("save", "/api/style"', html)
         self.assertIn("form.elements.style.value", html)
         self.assertIn("grid-template-columns:minmax(0, 1fr)", html)
         self.assertIn('data-settings-platform="wechat"', html)
@@ -1324,15 +2182,19 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('<select name="model"', html)
         self.assertIn('name="effort"', html)
         self.assertIn('id="endpoint-connect"', html)
-        self.assertIn('api("/api/models"', html)
+        self.assertIn('waitApi("models", "/api/models"', html)
+        self.assertIn("获取可用模型", html)
+        self.assertIn("添加自定义提供方", html)
+        self.assertIn("一键配置全部入口", html)
+        self.assertIn("name=\"article_provider\"", html)
         self.assertIn(".dialog-content{display:flex; flex-direction:column; gap:.8rem; min-height:0; overflow-y:auto", html)
 
     def test_patch_022_model_management_contract(self) -> None:
         html = self._index()
-        self.assertIn('<select name="chat_model"', html)
+        self.assertNotIn('<select name="chat_model"', html)
         self.assertIn('id="endpoint-connect"', html)
         self.assertIn('id="endpoint-use-article"', html)
-        self.assertIn('id="endpoint-use-chat"', html)
+        self.assertNotIn('id="endpoint-use-chat"', html)
         self.assertIn('id="endpoint-list"', html)
         self.assertIn("编辑模型", html)
         self.assertIn('api("/api/model-endpoints/delete"', html)
@@ -1347,14 +2209,11 @@ class IndexPageContractTests(unittest.TestCase):
         html = self._index()
         self.assertIn("state.articleDirty = true", html)
         self.assertIn('state.articleDirty = true;\n    $("publish-btn").disabled = false;', html)
-        self.assertIn("function persistArticle()", html)
-        self.assertIn("state.articleDirty ? persistArticle() : Promise.resolve()", html)
+        self.assertIn("function persistArticle(", html)
+        self.assertIn("state.articleDirty ? persistArticle(", html)
         self.assertIn('api("/api/articles/edit"', html)
         self.assertNotIn('status("publish-status", "请先保存修改"', html)
-        self.assertIn(
-            ".chat-row > .model-picker,.chat-row > input,.chat-row > button{height:40px; min-height:40px; padding-top:0; padding-bottom:0;}",
-            html,
-        )
+        self.assertIn(".article-field-head{display:flex; align-items:center;", html)
         self.assertIn("display:inline-flex; align-items:center; justify-content:center", html)
         height_rule = (
             "select,input[type=text],input[type=password]{height:40px; padding-top:0; padding-bottom:0;}"
@@ -1372,10 +2231,11 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("function currentHours()", html)
         self.assertIn("function schedulePublish()", html)
         self.assertIn("function connectEndpoint()", html)
-        self.assertIn('api("/api/schedule"', html)
-        self.assertIn("连接并拉取模型", html)
+        self.assertIn('waitApi("schedule", "/api/schedule"', html)
+        self.assertIn("获取可用模型", html)
         self.assertIn("用于文章", html)
-        self.assertIn("和 Hermes 一样", html)
+        self.assertIn("persist: true", html)
+        self.assertIn("一键配置全部入口", html)
 
     def test_patch_025_source_health_and_dual_rank_tabs(self) -> None:
         html = self._index()
@@ -1397,13 +2257,17 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("function persistImages()", html)
         self.assertIn('api("/api/articles/images"', html)
         self.assertIn("/api/image-proxy?url=", html)
-        self.assertIn("设为封面", html)
-        self.assertIn("加入正文", html)
+        self.assertIn('type="checkbox"', html)
+        self.assertIn("image-check", html)
+        self.assertIn("cover-check", html)
+        self.assertIn("body-check", html)
+        self.assertNotIn("设为封面", html)
+        self.assertNotIn("加入正文", html)
         self.assertIn("上移", html)
         self.assertIn("下移", html)
-        self.assertIn("封面和正文分开选", html)
+        self.assertIn("默认只勾选封面", html)
         self.assertIn('id="image-rescan"', html)
-        self.assertIn('api("/api/articles/images/rescan"', html)
+        self.assertIn('waitApi("rescan", "/api/articles/images/rescan"', html)
         self.assertIn("未从原文找到配图", html)
         self.assertIn("点击预览可看大图", html)
 
@@ -1469,8 +2333,8 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("overflow:hidden", panel)
         opened = html[html.index("#hotspots-panel.sources-open{") : html.index("#hotspots-panel.sources-open{") + 120]
         self.assertIn("max-height:none", opened)
-        self.assertLess(html.index('id="article-model"'), html.index('class="chat-section"'))
-        self.assertLess(html.index('id="article-scroll"'), html.index('class="chat-section"'))
+        self.assertLess(html.index('id="article-model"'), html.index('id="publish-status"'))
+        self.assertLess(html.index('id="article-scroll"'), html.index('id="publish-status"'))
         self.assertIn("#article-view{flex:0 0 auto", html)
         self.assertIn("align-items:start", html)
         self.assertIn("点开看来源", html)
@@ -1511,6 +2375,209 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", html)
         self.assertNotIn("placeholder", html)
         self.assertNotIn('name="app_secret" value', html)
+
+    def test_favorites_button_drawer_multiselect_and_reflow_contract(self) -> None:
+        html = self._index()
+        header = html[html.index("<header>") : html.index("</header>")]
+        self.assertRegex(
+            header,
+            r'id="config-btn">设置</button>\s*<button type="button" id="favorites-btn">收藏</button>',
+        )
+        self.assertIn('id="favorites-drawer"', html)
+        self.assertIn("is-picked", html)
+        self.assertIn("body.favorites-open", html)
+        self.assertRegex(
+            html,
+            r"body\.favorites-open[^{]*\{[^}]*(margin-right|padding-right|grid-template)",
+        )
+        self.assertIn("state.pickedIds", html)
+        self.assertIn("ht-title", html)
+        generate_js = html.split("function generate()")[1].split("function persistArticle(")[0]
+        self.assertIn("item_ids", generate_js)
+        self.assertIn("pickedIdList()", generate_js)
+
+    def test_hotspot_selected_css_is_quiet_focus_not_pick_gold(self) -> None:
+        html = self._index()
+        selected_start = html.index(".hotspot-item.selected{")
+        selected_before = html.index(".hotspot-item.selected::before{")
+        selected = html[selected_start:selected_before]
+        picked_start = html.index(".fav-item.is-picked, .hotspot-item.is-picked{")
+        picked = html[picked_start : html.index("}", picked_start) + 1]
+        self.assertIn("box-shadow:inset", picked)
+        self.assertIn("rgba(196, 164, 106", picked)
+        before_block = html[selected_before : html.index("}", selected_before) + 1]
+        self.assertIn("width:3px", before_block)
+        self.assertNotIn("accent-glow", selected)
+        self.assertNotIn("rgba(196, 164, 106", selected)
+        self.assertNotIn("box-shadow:inset", selected)
+        self.assertNotIn("linear-gradient", selected)
+
+    def test_select_hotspot_reclick_keeps_selection_visible(self) -> None:
+        html = self._index()
+        select_js = html.split("function selectHotspot(item, button)")[1].split(
+            "function clearHotspotSelection("
+        )[0]
+        self.assertNotIn("clearHotspotSelection()", select_js)
+        self.assertIn("state.item.item_id === item.item_id", select_js)
+        self.assertIn('classList.toggle("selected", active)', select_js)
+        self.assertIn('setAttribute("aria-pressed", String(active))', select_js)
+        self.assertIn('typeof renderPickedDock === "function"', select_js)
+        self.assertIn("renderPickedDock()", select_js)
+        clear_js = html.split("function clearHotspotSelection(")[1].split(
+            "function pickedIdList()"
+        )[0]
+        self.assertIn("state.item = null", clear_js)
+        self.assertIn("classList.remove", clear_js)
+        self.assertIn('"selected"', clear_js)
+        self.assertIn('typeof renderPickedDock === "function"', clear_js)
+        title_click = html[html.index('title.addEventListener("click"') : html.index("button.appendChild(title)")]
+        self.assertIn("event.stopPropagation()", title_click)
+        self.assertIn("togglePicked(item.item_id)", title_click)
+
+    def test_generate_still_sends_item_ids_from_picked_id_list_when_picks_exist(self) -> None:
+        html = self._index()
+        generate_js = html.split("function generate()")[1].split("function persistArticle(")[0]
+        self.assertIn("var picked = pickedIdList();", generate_js)
+        self.assertIn("if (picked.length >= 1)", generate_js)
+        self.assertIn("payload.item_ids = picked;", generate_js)
+        self.assertIn("payload.item_id = state.item.item_id;", generate_js)
+        self.assertLess(
+            generate_js.index("if (picked.length >= 1)"),
+            generate_js.index("payload.item_id = state.item.item_id;"),
+        )
+
+    def test_picked_dock_markup_is_last_child_of_hotspots_panel(self) -> None:
+        html = self._index()
+        panel = html[html.index('id="hotspots-panel"') : html.index('id="article-panel"')]
+        self.assertIn('id="source-health-wrap"', panel)
+        self.assertNotIn('id="picked-dock"', panel)
+        self.assertIn('id="picked-dock"', html)
+        self.assertRegex(html, r'<aside id="picked-dock" hidden')
+        self.assertGreater(html.index('id="picked-dock"'), html.index("</main>"))
+        self.assertEqual(html.count('id="picked-dock"'), 1)
+
+    def test_picked_dock_css_hides_on_github_and_skills_lanes(self) -> None:
+        html = self._index()
+        self.assertRegex(
+            html,
+            r"body\.lane-github #picked-dock\s*,\s*body\.lane-skills #picked-dock\s*\{[^}]*display:\s*none\s*!important",
+        )
+        dock_css = html.split("#picked-dock{")[1].split("}")[0]
+        self.assertIn("position:fixed", dock_css)
+        self.assertIn("bottom:", dock_css)
+        self.assertIn("right:", dock_css)
+        self.assertIn("bottom:1.5rem", dock_css)
+        self.assertIn("right:1.5rem", dock_css)
+        self.assertIn("z-index:25", dock_css)
+        self.assertIn("flex-direction:column", dock_css)
+        self.assertIn("max-width:18rem", dock_css)
+        self.assertIn("max-height:40vh", dock_css)
+        self.assertIn("overflow-y:auto", dock_css)
+        self.assertIn("pointer-events:auto", dock_css)
+        self.assertIn("border:", dock_css)
+        self.assertIn("border-radius:", dock_css)
+        self.assertIn("padding:", dock_css)
+        self.assertNotIn("position:absolute", dock_css)
+        fav_css = html.split("body.favorites-open #picked-dock{")[1].split("}")[0]
+        self.assertIn("right:", fav_css)
+        self.assertIn("--favorites-drawer-w", fav_css)
+        chip_css = html.split(".picked-dock-chip{")[1].split("}")[0]
+        self.assertIn("pointer-events:auto", chip_css)
+        self.assertIn("text-align:left", chip_css)
+        self.assertIn("justify-content:flex-start", chip_css)
+        self.assertIn("display:flex", chip_css)
+        self.assertIn("font-size:.82rem", chip_css)
+        self.assertIn("line-height:1.5", chip_css)
+        self.assertIn("padding:.75rem .8rem", chip_css)
+        self.assertIn("min-height:3.4rem", chip_css)
+        label_css = html.split(".picked-dock-chip-label{")[1].split("}")[0]
+        self.assertIn("overflow:hidden", label_css)
+        self.assertIn("white-space:normal", label_css)
+        self.assertIn("-webkit-line-clamp:2", label_css)
+
+    def test_render_picked_dock_wraps_titles_in_clamped_inner_labels(self) -> None:
+        html = self._index()
+        dock_js = html.split("function renderPickedDock(")[1].split("\nfunction ")[0]
+        self.assertIn('el("button", "picked-dock-chip")', dock_js)
+        self.assertIn('el("span", "picked-dock-chip-label", title)', dock_js)
+        self.assertIn('el("span", "picked-dock-chip-label", state.item.title || "")', dock_js)
+
+    def test_article_editor_keeps_adaptive_height_and_scroll_anchor(self) -> None:
+        html = self._index()
+        body_css = html.split("#article-body{", 1)[1].split("}", 1)[0]
+        self.assertIn("height:auto", body_css)
+        self.assertIn("overflow-anchor:none", body_css)
+        fit_js = html.split("function fitArticleBody()", 1)[1].split("function renderArticle(", 1)[0]
+        self.assertIn("window.scrollY", fit_js)
+        self.assertIn("pageY", fit_js)
+        self.assertIn("stableY", fit_js)
+        self.assertIn("window.scrollTo(0, stableY)", fit_js)
+        self.assertIn('if (id === "article-body") { fitArticleBody(); }', html)
+
+    def test_render_picked_dock_function_and_toggle_picked_call(self) -> None:
+        html = self._index()
+        self.assertIn("function renderPickedDock(", html)
+        toggle_js = html.split("function togglePicked(")[1].split("\nfunction ")[0]
+        self.assertIn("renderPickedDock()", toggle_js)
+        hotspots_js = html.split("function renderHotspots(")[1].split("\nfunction ")[0]
+        self.assertIn("renderPickedDock()", hotspots_js)
+        favorites_js = html.split("function renderFavorites(")[1].split("\nfunction ")[0]
+        self.assertIn("renderPickedDock()", favorites_js)
+
+    def test_picked_dock_copy_selected_count_and_focus_fallback(self) -> None:
+        html = self._index()
+        dock_js = html.split("function renderPickedDock(")[1].split("\nfunction ")[0]
+        self.assertIn("已选", dock_js)
+        self.assertIn("焦点", dock_js)
+        self.assertIn("pickedIdList()", dock_js)
+        self.assertIn("togglePicked(", dock_js)
+        self.assertIn("state.favoriteIds", dock_js)
+        self.assertIn("state.rankings", dock_js)
+        self.assertIn("state.item", dock_js)
+        self.assertIn(".hidden", dock_js)
+
+    def test_picked_dock_renders_more_than_four_selected_items(self) -> None:
+        html = self._index()
+        dock_js = html.split("function renderPickedDock(")[1].split("\nfunction ")[0]
+        self.assertIn("ids.forEach", dock_js)
+        self.assertNotIn("slice(0, 4)", dock_js)
+
+    def test_render_favorites_includes_open_original_control(self) -> None:
+        html = self._index()
+        favorites_js = html.split("function renderFavorites(")[1].split("\nfunction ")[0]
+        self.assertIn("打开原文", favorites_js)
+        self.assertIn('el("button"', favorites_js)
+        self.assertIn("openOriginal(item)", favorites_js)
+        open_at = favorites_js.index("openOriginal(item)")
+        open_handler = favorites_js[favorites_js.rfind("addEventListener", 0, open_at) : open_at]
+        self.assertIn("event.stopPropagation()", open_handler)
+        self.assertNotIn("togglePicked", open_handler)
+
+    def test_open_original_uses_item_id_from_argument(self) -> None:
+        html = self._index()
+        self.assertIn("function openOriginal(item)", html)
+        self.assertIn("function closeOriginal(", html)
+        open_js = html.split("function openOriginal(item)")[1].split("\nfunction ")[0]
+        self.assertIn("item || state.item", open_js)
+        self.assertIn("var itemId = item.item_id", open_js)
+        self.assertIn('waitApi("original", "/api/original", {item_id: itemId})', open_js)
+        self.assertIn("item.title_zh || item.title", open_js)
+        self.assertNotIn("state.item.item_id !== itemId", open_js)
+        self.assertNotIn("state.item.title", open_js)
+        self.assertRegex(
+            html,
+            r'\$\("open-original-btn"\)\.addEventListener\("click", function \(\) \{ openOriginal\(\); \}\);',
+        )
+
+    def test_favorites_title_click_still_toggles_picked(self) -> None:
+        html = self._index()
+        favorites_js = html.split("function renderFavorites(")[1].split("\nfunction ")[0]
+        title_at = favorites_js.index('title.addEventListener("click"')
+        title_handler = favorites_js[title_at : title_at + 280]
+        self.assertIn("event.stopPropagation()", title_handler)
+        self.assertIn("togglePicked(item.item_id)", title_handler)
+        self.assertNotIn("openOriginal", title_handler)
+        self.assertIn('el("span", "ht-title"', favorites_js)
 
 
 if __name__ == "__main__":

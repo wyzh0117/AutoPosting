@@ -23,6 +23,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertTrue(payload["ok"])
 
+    def test_visual_render_example_writes_html(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            exit_code, payload = self._run(
+                ["visual-render", "--example", "--out", temp_dir, "--no-screenshot"]
+            )
+            self.assertEqual(0, exit_code)
+            self.assertTrue(payload["ok"])
+            self.assertNotIn("html_text", payload["pages"][0])
+            self.assertTrue(Path(payload["pages"][0]["html"]).is_file())
+
     def test_package_command_has_no_live_publishing_option(self) -> None:
         package_parser = next(
             action.choices["package"]

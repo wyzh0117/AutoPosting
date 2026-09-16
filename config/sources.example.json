@@ -1,6 +1,66 @@
 {
   "sources": [
     {
+      "source_id": "reddit_chatgpt",
+      "name": "Reddit r/ChatGPT",
+      "type": "reddit",
+      "url_or_handle": "ChatGPT",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "reddit_claude",
+      "name": "Reddit r/ClaudeAI",
+      "type": "reddit",
+      "url_or_handle": "ClaudeAI",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "reddit_localllama",
+      "name": "Reddit r/LocalLLaMA",
+      "type": "reddit",
+      "url_or_handle": "LocalLLaMA",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "reddit_promptengineering",
+      "name": "Reddit r/PromptEngineering",
+      "type": "reddit",
+      "url_or_handle": "PromptEngineering",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "reddit_openai",
+      "name": "Reddit r/OpenAI",
+      "type": "reddit",
+      "url_or_handle": "OpenAI",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
+      "source_id": "reddit_chatgptpromptgenius",
+      "name": "Reddit r/ChatGPTPromptGenius",
+      "type": "reddit",
+      "url_or_handle": "ChatGPTPromptGenius",
+      "tier": "S4",
+      "topics": ["products"],
+      "enabled": true,
+      "fetch_interval": "15m"
+    },
+    {
       "source_id": "openai_news",
       "name": "OpenAI News",
       "type": "rss",

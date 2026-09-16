@@ -7,6 +7,7 @@ data; the model is never allowed to execute instructions embedded in content.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -23,17 +24,25 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from .db import Database
-from .article_prompt import ARTICLE_PROMPT_VERSION, build_article_prompt
+from .article_prompt import (
+    ARTICLE_PROMPT_VERSION,
+    DEFAULT_ARTICLE_PROMPT_STYLE,
+    build_article_prompt,
+    load_article_style_prompt,
+)
 from .hooks import EXTRACT_CANDIDATES_PROMPT
+from .leaderboard_prompt import load_leaderboard_copy_prompt
 from .normalize import contains_source_id, content_hash
+from .xhs_cards import fill_xhs_caption
 
 LLM_MODEL = "unconfigured"
 LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/0.4.0"
+HTTP_USER_AGENT = "AutoPosting/1.2.9"
 LLM_TIMEOUT_SECONDS = 90
+LEADERBOARD_ENRICH_SECONDS = 25
 MAX_OUTPUT_CHARS = 100_000
 MAX_STYLE_CHARS = 50_000
 MAX_CHAT_MESSAGES = 50
@@ -43,6 +52,7 @@ TRANSLATE_TASK = "translate"
 ARTICLE_TASK = "article"
 TRANSLATION_PLATFORM = "general"
 TRANSLATE_PROMPT_VERSION = "translate-v1"
+LEADERBOARD_PROMPT_VERSION = "github-weekly-v1"
 
 TRANSLATION_UNAVAILABLE = "translation_unavailable"
 
@@ -111,6 +121,19 @@ class LLMError(Exception):
 
 
 KEYCHAIN_SERVICE = "autoposting"
+
+
+def _decode_keychain_password(secret: str) -> str:
+    """Undo `security find-generic-password -w` hex encoding of non-ASCII secrets."""
+    if len(secret) < 2 or len(secret) % 2 or any(char not in "0123456789abcdefABCDEF" for char in secret):
+        return secret
+    try:
+        text = bytes.fromhex(secret).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return secret
+    if any(ord(char) > 127 for char in text):
+        return text
+    return secret
 
 
 class MacOSKeychainCredentialStore:
@@ -183,7 +206,9 @@ class MacOSKeychainCredentialStore:
         if getattr(completed, "returncode", 1) != 0:
             return None
         secret = str(completed.stdout).rstrip("\r\n")
-        return secret or None
+        if not secret:
+            return None
+        return _decode_keychain_password(secret)
 
     def set(self, endpoint_id: str, api_key: str) -> None:
         completed = self._runner(
@@ -232,20 +257,306 @@ def _has_cjk(text: str) -> bool:
     return any("\u3400" <= char <= "\u4dbf" or "\u4e00" <= char <= "\u9fff" for char in text)
 
 
+_CAPTION_DASH_RE = re.compile(r"(?m)^-\s+\S")
+
+
+def _valid_xhs_caption(caption: object, source_ids: tuple[str, ...]) -> bool:
+    if not isinstance(caption, str):
+        return False
+    if not _has_cjk(caption) or "AIGC" not in caption:
+        return False
+    if any(not contains_source_id(caption, source_id) for source_id in source_ids):
+        return False
+    match = _CAPTION_DASH_RE.search(caption)
+    if match is None:
+        return False
+    lead = caption[: match.start()].strip()
+    return bool(lead) and _has_cjk(lead)
+
+
+def _placeholder_summary(text: str) -> bool:
+    stripped = text.strip().lower()
+    return not stripped or stripped in {"comments", "comment", "n/a", "-", "..."}
+
+
+def _content_to_text(content: object) -> str | None:
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item)
+            elif isinstance(item, dict):
+                for key in ("text", "content"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value)
+                        break
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def _message_text(message: object) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    text = _content_to_text(message.get("content"))
+    if text:
+        return text
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+    return None
+
+
 def parse_model_json(output: str) -> object:
-    """Accept bare JSON or a ```json fenced block; reject everything else."""
+    """Accept bare JSON, a fenced block, or JSON embedded in surrounding text."""
     text = output.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    if match is not None:
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fence is not None:
         try:
-            return json.loads(match.group(1))
+            return json.loads(fence.group(1).strip())
         except json.JSONDecodeError:
             pass
+    decoder = json.JSONDecoder()
+    found: object | None = None
+    for match in re.finditer(r"[\{\[]", text):
+        try:
+            obj, _end = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, (dict, list)):
+            found = obj
+    if found is not None:
+        return found
     raise LLMError("llm_invalid_output", "模型输出不是有效 JSON")
+
+
+_TITLE_KEYS = ("title", "标题", "headline", "题目")
+_BODY_KEYS = ("body", "正文", "content", "contents", "text", "内容", "markdown", "article")
+_CAPTION_KEYS = ("caption", "文案", "配文")
+_NEST_KEYS = (
+    "article",
+    "data",
+    "output",
+    "result",
+    "response",
+    "message",
+    "wechat",
+    "微信",
+    "xiaohongshu",
+    "小红书",
+    "payload",
+)
+
+
+def _join_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, list):
+        parts = [item for item in value if isinstance(item, str) and item.strip()]
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def _first_text(parsed: dict[str, object], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        text = _join_text(parsed.get(key))
+        if text:
+            return text
+    return None
+
+
+def _article_fields(parsed: object, *, depth: int = 0) -> dict[str, str] | None:
+    if not isinstance(parsed, dict) or depth > 2:
+        return None
+    title = _first_text(parsed, _TITLE_KEYS)
+    body = _first_text(parsed, _BODY_KEYS)
+    if title and body:
+        fields = {"title": title, "body": body}
+        caption = _first_text(parsed, _CAPTION_KEYS)
+        if caption:
+            fields["caption"] = caption
+        return fields
+    for key in _NEST_KEYS:
+        found = _article_fields(parsed.get(key), depth=depth + 1)
+        if found:
+            return found
+    for value in parsed.values():
+        found = _article_fields(value, depth=depth + 1)
+        if found:
+            return found
+    return None
+
+
+def _looks_dashscope(base_url: str) -> bool:
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    return "dashscope" in host or host.endswith(".aliyuncs.com") or "compatible-mode" in path
+
+
+def _dashscope_multimodal_url(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc or "dashscope.aliyuncs.com"
+    return f"{scheme}://{host}/api/v1/services/aigc/multimodal-generation/generation"
+
+
+IMAGE_ASPECT_RATIO = "9:16"
+IMAGE_SIZE_9X16 = "928*1664"
+_IMAGE_SIZE_FALLBACKS = (
+    "928*1664",
+    "720*1280",
+    "864*1536",
+    "810*1440",
+)
+
+
+def _canon_image_size(size: str) -> str:
+    return size.strip().replace("x", "*").replace("×", "*")
+
+
+def _parse_image_wh(size: str) -> tuple[int, int] | None:
+    text = _canon_image_size(size)
+    if "*" not in text:
+        return None
+    left, right = text.split("*", 1)
+    if not left.isdigit() or not right.isdigit():
+        return None
+    width, height = int(left), int(right)
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def resolve_image_size(model: str, size: str | None = None) -> str:
+    requested = _canon_image_size(size) if size else ""
+    parsed = _parse_image_wh(requested)
+    if parsed is not None:
+        width, height = parsed
+        if abs((width / height) - (9 / 16)) < 0.03:
+            return f"{width}*{height}"
+    return IMAGE_SIZE_9X16
+
+
+def image_size_candidates(model: str, size: str | None = None) -> list[str]:
+    primary = resolve_image_size(model, size)
+    ordered: list[str] = []
+    for item in (primary, *_IMAGE_SIZE_FALLBACKS):
+        if item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
+def _is_illegal_image_size(exc: LLMError) -> bool:
+    reason = exc.reason or ""
+    blob = reason.lower()
+    if "size" not in blob:
+        return False
+    return (
+        "不合法" in reason
+        or "invalid" in blob
+        or "illegal" in blob
+        or "not supported" in blob
+        or "unsupported" in blob
+    )
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+    message = ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                message = err["message"]
+            elif isinstance(parsed.get("message"), str):
+                message = str(parsed["message"])
+        if not message:
+            message = raw[:240]
+    return f"HTTP {exc.code}" + (f"：{message.strip()}" if message.strip() else "")
+
+
+def _decode_b64_image(raw: str) -> bytes:
+    blob = raw.strip()
+    if "base64," in blob:
+        blob = blob.split("base64,", 1)[1]
+    try:
+        data = base64.b64decode(blob)
+    except (ValueError, TypeError) as exc:
+        raise LLMError("llm_invalid_output", "出图 API 的 base64 无效") from exc
+    if not data:
+        raise LLMError("llm_invalid_output", "出图 API 的 base64 为空")
+    return data
+
+
+def _collect_image_refs(value: object, into: list[str]) -> None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("data:image", "http://", "https://")):
+            into.append(stripped)
+        elif len(stripped) > 80 and " " not in stripped[:40]:
+            into.append(stripped)
+        return
+    if isinstance(value, dict):
+        for key in ("b64_json", "image"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                into.append(raw.strip())
+        url = value.get("url")
+        if isinstance(url, str) and url.strip():
+            into.append(url.strip())
+        image_url = value.get("image_url")
+        if isinstance(image_url, dict):
+            nested = image_url.get("url")
+            if isinstance(nested, str) and nested.strip():
+                into.append(nested.strip())
+        elif isinstance(image_url, str) and image_url.strip():
+            into.append(image_url.strip())
+        for key in ("content", "message", "output"):
+            nested = value.get(key)
+            if nested is not None:
+                _collect_image_refs(nested, into)
+        for key in ("choices", "data", "results"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                _collect_image_refs(nested, into)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_image_refs(item, into)
+
+
+def _image_from_reference(value: str, timeout: int) -> bytes | None:
+    if value.startswith("data:image") and "base64," in value:
+        return _decode_b64_image(value)
+    if value.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(value, timeout=timeout) as response:
+                payload = response.read()
+        except (OSError, TimeoutError, urllib.error.URLError):
+            return None
+        return payload or None
+    if len(value) > 80 and " " not in value[:40]:
+        try:
+            return _decode_b64_image(value)
+        except LLMError:
+            return None
+    return None
 
 
 class HermesRunner:
@@ -339,7 +650,28 @@ class HermesRunner:
         settings: LLMSettings, messages: list[dict[str, str]]
     ) -> dict[str, object]:
         body: dict[str, object] = {"model": settings.model, "messages": messages}
-        if settings.effort != "none":
+        hostname = urlsplit(settings.base_url).hostname or ""
+        model = settings.model.lower()
+        # DeepSeek V4 defaults to thinking=high. effort=none must disable it
+        # or a "flash" ranking rewrite can think for minutes.
+        if model.startswith("deepseek-v4"):
+            if settings.effort == "none":
+                body["thinking"] = {"type": "disabled"}
+            else:
+                body["thinking"] = {"type": "enabled"}
+                body["reasoning_effort"] = settings.effort
+            return body
+        qwen38_dashscope = (
+            model.startswith("qwen3.8-")
+            and (hostname == "aliyuncs.com" or hostname.endswith(".aliyuncs.com"))
+        )
+        # qwen3.8-max thinks by default. effort=none must disable it;
+        # reasoning_effort "none" maps to enable_thinking=False on DashScope,
+        # and the explicit flag covers proxies that do not apply that mapping.
+        if qwen38_dashscope and settings.effort == "none":
+            body["enable_thinking"] = False
+        # DashScope qwen3.8 defaults to xhigh when this field is omitted.
+        if settings.effort != "none" or qwen38_dashscope:
             body["reasoning_effort"] = settings.effort
         return body
 
@@ -408,14 +740,138 @@ class HermesRunner:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise LLMError("llm_invalid_output", "模型 API 返回了无效 JSON") from exc
         try:
-            output = parsed["choices"][0]["message"]["content"]
+            message = parsed["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError("llm_invalid_output", "模型 API 响应缺少消息内容") from exc
+        output = _message_text(message)
         if not isinstance(output, str):
             raise LLMError("llm_invalid_output", "模型 API 没有返回文本")
         if len(output) > MAX_OUTPUT_CHARS:
             raise LLMError("llm_output_too_large", f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符")
         return output
+
+    def generate_image(
+        self, prompt: str, settings: LLMSettings, size: str | None = None
+    ) -> bytes:
+        last_error: LLMError | None = None
+        for candidate in image_size_candidates(settings.model, size):
+            try:
+                return self._generate_image_with_size(prompt, settings, candidate)
+            except LLMError as exc:
+                last_error = exc
+                if _is_illegal_image_size(exc):
+                    continue
+                break
+        try:
+            return self._generate_image_via_chat(prompt, settings)
+        except LLMError as exc:
+            if last_error is None:
+                raise
+            raise LLMError(
+                "llm_api_failed",
+                f"{exc.reason}（出图接口：{last_error.reason}）",
+                cause_code=exc.cause_code or exc.code,
+            ) from None
+
+    def _generate_image_with_size(
+        self, prompt: str, settings: LLMSettings, size: str | None
+    ) -> bytes:
+        compatible_url = f"{settings.base_url.rstrip('/')}/images/generations"
+        compatible_body: dict[str, object] = {
+            "model": settings.model,
+            "prompt": prompt,
+            "n": 1,
+        }
+        if size:
+            compatible_body["size"] = size
+        first_error: LLMError | None = None
+        try:
+            parsed = self._post_json(compatible_url, settings, compatible_body)
+            return self._decode_image_payload(parsed, settings)
+        except LLMError as exc:
+            first_error = exc
+            if not _looks_dashscope(settings.base_url):
+                raise
+        native_url = _dashscope_multimodal_url(settings.base_url)
+        parameters: dict[str, object] = {"n": 1, "watermark": False}
+        if size:
+            parameters["size"] = size
+        native_body = {
+            "model": settings.model,
+            "input": {
+                "messages": [{"role": "user", "content": [{"text": prompt}]}]
+            },
+            "parameters": parameters,
+        }
+        try:
+            parsed = self._post_json(native_url, settings, native_body)
+            return self._decode_image_payload(parsed, settings)
+        except LLMError as exc:
+            detail = exc.reason or exc.code
+            prior = first_error.reason if first_error is not None else ""
+            raise LLMError(
+                "llm_api_failed",
+                f"出图失败：{detail}" + (f"（兼容接口：{prior}）" if prior else ""),
+                cause_code=exc.cause_code or exc.code,
+            ) from None
+
+    def _generate_image_via_chat(self, prompt: str, settings: LLMSettings) -> bytes:
+        parsed = self._post_json(
+            f"{settings.base_url.rstrip('/')}/chat/completions",
+            settings,
+            {
+                "model": settings.model,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        return self._decode_image_payload(parsed, settings)
+
+    def _post_json(
+        self, url: str, settings: LLMSettings, body: dict[str, object]
+    ) -> dict[str, object]:
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {settings.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": HTTP_USER_AGENT,
+            },
+            method="POST",
+        )
+        timeout = max(self.timeout, 120)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                parsed = json.loads(raw)
+        except TimeoutError as exc:
+            raise LLMError("llm_timeout", f"出图请求超过 {timeout} 秒未返回") from exc
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            raise LLMError("llm_api_failed", f"出图 API 失败 {detail}") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise LLMError("llm_api_failed", "出图 API 请求失败") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LLMError("llm_invalid_output", "出图 API 返回了无效 JSON") from exc
+        if not isinstance(parsed, dict):
+            raise LLMError("llm_invalid_output", "出图 API 响应不是 JSON 对象")
+        return parsed
+
+    def _decode_image_payload(
+        self, parsed: dict[str, object], settings: LLMSettings
+    ) -> bytes:
+        candidates: list[str] = []
+        _collect_image_refs(parsed, candidates)
+        seen: set[str] = set()
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            decoded = _image_from_reference(item, timeout=max(self.timeout, 120))
+            if decoded:
+                return decoded
+        raise LLMError("llm_invalid_output", "出图 API 没有返回图片")
 
 
 class LLMService:
@@ -510,6 +966,23 @@ class LLMService:
         self._settings = candidate
         return candidate
 
+    def configure_verified_image(
+        self,
+        model: object,
+        base_url: object,
+        api_key: object,
+    ) -> LLMSettings:
+        candidate = validate_llm_settings(model, LLM_PROVIDER, "none", base_url, api_key)
+        if not candidate.base_url:
+            raise ValueError("base_url, api_key, and model are required")
+        self._settings = candidate
+        return candidate
+
+    def generate_image(self, prompt: str) -> bytes:
+        if not hasattr(self.runner, "generate_image"):
+            raise LLMError("llm_api_failed", "当前运行器不支持出图")
+        return self.runner.generate_image(prompt, self.settings)
+
     def chat(self, messages: list[dict[str, str]], model: str | None = None) -> str:
         """Send a native chat history to the independently configured chat model."""
         settings = self._settings
@@ -530,6 +1003,28 @@ class LLMService:
             base_url=settings.base_url,
             api_key=settings.api_key,
         )
+
+    def _run_deadline(self, prompt: str, settings: LLMSettings, seconds: float) -> str:
+        box: dict[str, object] = {}
+
+        def worker() -> None:
+            try:
+                box["text"] = self._run(prompt, settings)
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(max(0.05, float(seconds)))
+        if thread.is_alive():
+            raise LLMError("llm_timeout", f"榜单改写超过 {seconds:g} 秒未返回")
+        error = box.get("error")
+        if isinstance(error, Exception):
+            raise error
+        text = box.get("text")
+        if not isinstance(text, str):
+            raise LLMError("llm_invalid_output", "模型没有返回文本")
+        return text
 
     def extract_hook_candidates(self, excerpt: str) -> list[dict[str, str]]:
         """Optional extra phrases from the article model; never raises."""
@@ -606,7 +1101,7 @@ class LLMService:
                         TRANSLATE_PROMPT_VERSION,
                         content_hash(item["title"], item["summary"]),
                         settings.model,
-                        settings.provider,
+                        settings.base_url or settings.provider,
                         settings.effort,
                     )
                 )
@@ -670,38 +1165,27 @@ class LLMService:
             "要求：\n"
             f'- 输出 {{"{_TRANSLATIONS_KEY}": [{{"item_id": "...", "{_TITLE_ZH_KEY}": "...", "{_SUMMARY_ZH_KEY}": "..."}}]}}\n'
             "- 必须覆盖所有 item_id，不得遗漏，不得凭空增加 item_id\n"
-            "- title_zh/summary_zh 必须为包含中文的字符串，忠实翻译，不添加原文没有的事实\n"
+            "- title_zh 必须含中文，忠实翻译，不添加原文没有的事实\n"
+            "- summary_zh 必须是字符串；原文摘要为空或仅为 Comments 等占位时可以为空\n"
             f"数据：\n{json.dumps(payload, ensure_ascii=False)}"
         )
         parsed = parse_model_json(self._run(prompt, settings))
         if not isinstance(parsed, dict) or not isinstance(parsed.get(_TRANSLATIONS_KEY), list):
             raise LLMError("llm_translation_invalid", "翻译结果缺少 translations 数组")
-        translations = parsed[_TRANSLATIONS_KEY]
+        originals = {item["item_id"]: item for item in items}
         by_id: dict[str, dict[str, str]] = {}
-        for entry in translations:
-            if not isinstance(entry, dict):
-                raise LLMError("llm_translation_invalid", "翻译结果包含非对象条目")
-            entry_id = entry.get("item_id")
-            title_zh = entry.get(_TITLE_ZH_KEY)
-            summary_zh = entry.get(_SUMMARY_ZH_KEY)
-            if (
-                not isinstance(entry_id, str)
-                or not isinstance(title_zh, str)
-                or not isinstance(summary_zh, str)
-                or not _has_cjk(title_zh)
-                or not _has_cjk(summary_zh)
-            ):
-                raise LLMError("llm_translation_invalid", "翻译结果字段缺失或不含中文")
-            by_id[entry_id] = {
-                "title_zh": title_zh,
-                "summary_zh": summary_zh,
-                "status": "translated",
-                "error": "",
-            }
-        requested_ids = {item["item_id"] for item in items}
-        if set(by_id) != requested_ids:
-            raise LLMError("llm_translation_invalid", "翻译结果未完整覆盖候选条目")
+        for entry in parsed[_TRANSLATIONS_KEY]:
+            accepted = self._accepted_translation(entry, originals)
+            if accepted is None:
+                continue
+            entry_id, payload_zh = accepted
+            by_id[entry_id] = payload_zh
+        if not by_id:
+            raise LLMError("llm_translation_invalid", "翻译结果字段缺失或不含中文")
         for item in items:
+            item_id = item["item_id"]
+            if item_id not in by_id:
+                continue
             self.database.cache_set(
                 self._cache_key(
                     TRANSLATE_TASK,
@@ -709,7 +1193,7 @@ class LLMService:
                     TRANSLATE_PROMPT_VERSION,
                     content_hash(item["title"], item["summary"]),
                     settings.model,
-                    settings.provider,
+                    settings.base_url or settings.provider,
                     settings.effort,
                 ),
                 TRANSLATE_TASK,
@@ -720,17 +1204,43 @@ class LLMService:
                     {
                         _TRANSLATIONS_KEY: [
                             {
-                                "item_id": item["item_id"],
-                                _TITLE_ZH_KEY: by_id[item["item_id"]][_TITLE_ZH_KEY],
-                                _SUMMARY_ZH_KEY: by_id[item["item_id"]][_SUMMARY_ZH_KEY],
+                                "item_id": item_id,
+                                _TITLE_ZH_KEY: by_id[item_id][_TITLE_ZH_KEY],
+                                _SUMMARY_ZH_KEY: by_id[item_id][_SUMMARY_ZH_KEY],
                             }
-                            for item in items
                         ]
                     },
                     ensure_ascii=False,
                 ),
             )
         return by_id
+
+    @staticmethod
+    def _accepted_translation(
+        entry: object, originals: dict[str, dict[str, str]]
+    ) -> tuple[str, dict[str, str]] | None:
+        if not isinstance(entry, dict):
+            return None
+        entry_id = entry.get("item_id")
+        if isinstance(entry_id, int):
+            entry_id = str(entry_id)
+        if not isinstance(entry_id, str) or entry_id not in originals:
+            return None
+        title_zh = entry.get(_TITLE_ZH_KEY)
+        summary_zh = entry.get(_SUMMARY_ZH_KEY)
+        if not isinstance(title_zh, str) or not _has_cjk(title_zh):
+            return None
+        original_summary = str(originals[entry_id].get("summary") or "")
+        if not isinstance(summary_zh, str):
+            summary_zh = original_summary
+        elif not _has_cjk(summary_zh) and not _placeholder_summary(original_summary):
+            return None
+        return entry_id, {
+            "title_zh": title_zh,
+            "summary_zh": summary_zh,
+            "status": "translated",
+            "error": "",
+        }
 
     def _cached_translation(self, item_id: str, response_json: str) -> dict[str, str]:
         parsed = json.loads(response_json)
@@ -761,6 +1271,45 @@ class LLMService:
             "error_reason": "缓存中的翻译结果无效",
         }
 
+    def enrich_github_repos(self, repos: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Rewrite only summary/does/scene/how. Names, stars, URLs stay template-owned."""
+        from .github_weekly import apply_leaderboard_copy
+
+        if not repos:
+            return repos
+        settings = self.resolve_settings()
+        if settings.model == LLM_MODEL:
+            return repos
+        run_settings = settings
+        if self._injected_command_runner:
+            run_settings = validate_llm_settings(
+                settings.model, settings.provider, settings.effort, "", ""
+            )
+        elif not settings.base_url:
+            return repos
+        payload = [
+            {
+                "full_name": repo["full_name"],
+                "name": repo["name"],
+                "description": repo.get("description") or "",
+                "kind": repo.get("kind") or "",
+                "language": repo.get("language") or "",
+                "topics": repo.get("topics") or [],
+            }
+            for repo in repos
+        ]
+        prompt = (
+            f"{load_leaderboard_copy_prompt()}\n"
+            f"数据：\n{json.dumps(payload, ensure_ascii=False)}"
+        )
+        parsed = parse_model_json(
+            self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
+        )
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list):
+            raise LLMError("llm_invalid_output", "榜单结果缺少 items 数组")
+        return apply_leaderboard_copy(repos, [item for item in items if isinstance(item, dict)])
+
     def generate_article(
         self,
         platform: str,
@@ -772,12 +1321,18 @@ class LLMService:
         effort: str | None = None,
         style: str = "",
         background: dict[str, object] | None = None,
+        preset_style: str | None = None,
     ) -> dict[str, str]:
         """Generate a Chinese platform article; raises LLMError on any failure."""
         settings = self.resolve_settings(model, provider, effort)
+        if preset_style is None:
+            preset_style = load_article_style_prompt(DEFAULT_ARTICLE_PROMPT_STYLE)
         if not isinstance(style, str) or len(style) > MAX_STYLE_CHARS:
             raise LLMError("article_generation_failed", "文章风格必须是有效文本")
+        if not isinstance(preset_style, str) or len(preset_style) > MAX_STYLE_CHARS:
+            raise LLMError("article_generation_failed", "预设文章风格必须是有效文本")
         style = style.strip()
+        preset_style = preset_style.strip()
         background_payload = background if isinstance(background, dict) else {}
         digest = content_hash(
             title,
@@ -786,6 +1341,7 @@ class LLMService:
             + json.dumps(sorted(set(source_ids)), ensure_ascii=False)
             + "\n"
             + style
+            + ("\n" + preset_style if preset_style else "")
             + "\n"
             + json.dumps(background_payload, ensure_ascii=False, sort_keys=True),
         )
@@ -816,7 +1372,9 @@ class LLMService:
                 "background": background_payload,
             }
             try:
-                prompt = build_article_prompt(platform, source_ids, payload, style)
+                prompt = build_article_prompt(
+                    platform, source_ids, payload, style, preset_style=preset_style
+                )
             except ValueError as exc:
                 raise LLMError("article_generation_failed", "不支持的文章平台") from exc
             try:
@@ -844,14 +1402,20 @@ class LLMService:
     ) -> dict[str, str]:
         if not isinstance(parsed, dict):
             raise LLMError("article_generation_failed", "文章结果不是 JSON 对象")
-        title = parsed.get("title")
-        body = parsed.get("body")
-        if not isinstance(title, str) or not isinstance(body, str):
+        fields = _article_fields(parsed)
+        if fields is None:
             raise LLMError("article_generation_failed", "文章结果缺少 title 或 body 字段")
+        title = fields["title"]
+        body = fields["body"]
         if not _has_cjk(title) or not _has_cjk(body):
             raise LLMError("article_generation_failed", "文章标题或正文不含中文")
         if "AIGC" not in body or any(
             not contains_source_id(body, source_id) for source_id in source_ids
         ):
             raise LLMError("article_generation_failed", "文章缺少 AIGC 声明或来源索引")
-        return {"title": title, "body": body}
+        article = {"title": title, "body": body}
+        if platform == "xiaohongshu":
+            article["caption"] = fill_xhs_caption(
+                body, source_ids, fields.get("caption", parsed.get("caption"))
+            )
+        return article

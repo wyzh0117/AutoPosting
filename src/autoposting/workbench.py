@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .content import Claim, ContentWorkflow, Draft, FactList, FactValidationError
+from .article_fuse import fuse_hotspot_items
+from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE, load_article_style_prompt
+from .xhs_cards import build_xhs_cards
 from .db import Database
 from .engagement import (
     better_tier,
@@ -16,17 +20,27 @@ from .engagement import (
     engagement_from_raw,
     engagement_kind,
     frame_article_body,
+    source_citation_id,
 )
 from .images import (
-    append_image_credits,
     build_asset_bundle,
     collect_article_images,
     cover_image,
+    default_page_fetcher,
     figure_html,
+    guess_image_content_type,
     normalize_assets,
     selected_body_images,
+    strip_image_credits,
+    _safe_external_url,
 )
-from .background import gather_background, search_web
+from .title_poster import render_title_poster
+from .background import (
+    gather_background,
+    related_article_context,
+    search_related_news,
+    search_web,
+)
 from .hooks import EMPTY_HOOKS_MESSAGE, find_hooks as collect_hooks, sanitize_chosen_hooks
 from .ingestion import should_hide_candidate
 from .llm import ARTICLE_PROMPT_VERSION, LLMError, LLMService
@@ -40,23 +54,127 @@ HOTSPOT_HOUR_MIN = 1
 HOTSPOT_HOUR_MAX = 720
 HOTSPOT_LIMIT = 10
 HOTSPOT_POOL = 40
+
+
+def xhs_fields(
+    title: str,
+    caption: str,
+    assets: dict[str, object],
+    handle: str = "",
+) -> dict[str, object]:
+    cover = cover_image(assets)
+    cover_url = str(cover.get("url") or "") if cover else ""
+    built = build_xhs_cards(
+        title,
+        str(assets.get("manuscript") or ""),
+        cover_url=cover_url,
+        handle=handle,
+    )
+    return {
+        "manuscript": str(assets.get("manuscript") or ""),
+        "caption": caption,
+        "cards": built["cards"],
+        "card_size": {"width": built["width"], "height": built["height"]},
+    }
+
+
 XIAOHONGSHU_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish"
 DEFAULT_WECHAT_BASE_URL = "https://api.weixin.qq.com"
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", re.I)
+_HTML_LINK_RE = re.compile(
+    r"<a\b[^>]*\bhref=[\"'](https?://[^\"']+)[\"'][^>]*>(.*?)</a>",
+    re.I | re.DOTALL,
+)
 
 
 def _download_image(url: str) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        },
+    parsed = urlsplit(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    if parsed.scheme and parsed.netloc:
+        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read(10_000_000)
+
+
+def _wechat_image_payload(data: bytes, stem: str) -> tuple[bytes, str]:
+    mapping = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif"}
+    suffix = mapping.get(guess_image_content_type(data))
+    if suffix:
+        return data, stem + suffix
+    converted = _convert_to_jpeg(data)
+    if converted:
+        return converted, stem + ".jpg"
+    return data, stem + ".jpg"
+
+
+_safe_article_url = _safe_external_url
+
+
+def _article_line_html(line: str) -> str:
+    """Escape article text while preserving safe Markdown and HTML links."""
+    token_re = re.compile(
+        rf"({_MARKDOWN_LINK_RE.pattern}|{_HTML_LINK_RE.pattern})", re.I | re.DOTALL
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return response.read(2_000_000)
+    rendered: list[str] = []
+    cursor = 0
+    for match in token_re.finditer(line):
+        rendered.append(html.escape(line[cursor : match.start()]))
+        token = match.group(0)
+        markdown = _MARKDOWN_LINK_RE.fullmatch(token)
+        if markdown:
+            url = _safe_article_url(markdown.group(2))
+            if url:
+                rendered.append(
+                    f'<a href="{html.escape(url, quote=True)}">'
+                    f"{html.escape(markdown.group(1))}</a>"
+                )
+            else:
+                rendered.append(html.escape(token))
+        else:
+            anchor = _HTML_LINK_RE.fullmatch(token)
+            url = _safe_article_url(anchor.group(1)) if anchor else ""
+            if url and anchor:
+                rendered.append(
+                    f'<a href="{html.escape(url, quote=True)}">'
+                    f"{html.escape(re.sub(r'<[^>]+>', '', anchor.group(2)))}</a>"
+                )
+            else:
+                rendered.append(html.escape(token))
+        cursor = match.end()
+    rendered.append(html.escape(line[cursor:]))
+    return "".join(rendered)
+
+
+def _convert_to_jpeg(data: bytes) -> bytes:
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="autoposting-img-") as raw:
+            source = Path(raw) / "in.bin"
+            dest = Path(raw) / "out.jpg"
+            source.write_bytes(data)
+            result = subprocess.run(
+                ["sips", "-s", "format", "jpeg", str(source), "--out", str(dest)],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            if result.returncode == 0 and dest.is_file():
+                payload = dest.read_bytes()
+                if payload:
+                    return payload
+    except Exception:
+        return b""
+    return b""
 
 
 def _summary(content_text: str, max_chars: int = 200) -> str:
@@ -64,6 +182,65 @@ def _summary(content_text: str, max_chars: int = 200) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "…"
+
+
+def extract_wechat_digest(body: str, title: str = "", max_chars: int = 120) -> str:
+    """Choose a substantive article paragraph for the WeChat draft digest."""
+    text = strip_image_credits(str(body or ""))
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    candidates: list[str] = []
+    short_candidates: list[str] = []
+    for raw in re.split(r"\n\s*\n|\n", text):
+        paragraph = " ".join(html.unescape(raw).split()).strip(" -*#")
+        if not paragraph or paragraph == title.strip():
+            continue
+        lowered = paragraph.casefold()
+        if lowered.startswith(
+            (
+                "来源", "原文", "原文链接", "信息源", "信息来源", "参考来源", "来源索引",
+                "图片来源", "配图来源", "事实说明", "aigc", "讨论提示", "讨论说明", "讨论观察", "配图", "图片", "封面",
+            )
+        ):
+            continue
+        if len(paragraph) < 8:
+            if lowered.rstrip("：:") in {"导语", "核心信息", "正文", "结语"}:
+                continue
+            short_candidates.append(paragraph)
+            continue
+        candidates.append(paragraph)
+    if not candidates:
+        if not short_candidates:
+            return ""
+        return max(short_candidates, key=len)[:max_chars]
+    fact_markers = ("发布", "宣布", "确认", "上线", "推出", "达到", "增长", "更新", "获得")
+    chosen = max(
+        candidates,
+        key=lambda value: (any(marker in value for marker in fact_markers), len(value)),
+    )
+    return chosen[:max_chars]
+
+
+def _normalize_article_item_ids(
+    item_id: str, item_ids: list[str] | None
+) -> list[str]:
+    if item_ids is None:
+        return [item_id] if item_id else []
+    if not isinstance(item_ids, (list, tuple)):
+        raise ValueError("item_ids must be a list of strings")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in item_ids:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("item_ids must be a list of strings")
+        value = raw.strip()
+        if value not in seen:
+            seen.add(value)
+            cleaned.append(value)
+    if not cleaned and item_id:
+        return [item_id]
+    return cleaned
 
 
 def _parse_fetched_at(value: object) -> datetime | None:
@@ -163,10 +340,19 @@ class HotspotService:
             moment = moment.replace(tzinfo=timezone.utc)
         health: list[dict[str, object]] = []
         for source in self.sources:
+            if source.type == "reddit":
+                continue
             self.database.upsert_source(source)
             row = self.database.get_source(source.source_id)
             health.append(_source_health_entry(source, row, moment))
         return health
+
+    def _sources_for_lane(self, lane: str) -> tuple[Source, ...]:
+        if lane not in {"hotspots", "viewpoints"}:
+            raise ValueError("lane must be hotspots or viewpoints")
+        if lane == "viewpoints":
+            return tuple(source for source in self.sources if source.type == "reddit")
+        return tuple(source for source in self.sources if source.type != "reddit")
 
     def collect(
         self,
@@ -174,6 +360,7 @@ class HotspotService:
         *,
         force: bool = True,
         source_id: str | None = None,
+        lane: str = "hotspots",
     ) -> dict[str, object]:
         if isinstance(hours, bool) or not isinstance(hours, int):
             raise ValueError("hours must be an integer")
@@ -184,13 +371,13 @@ class HotspotService:
         only = (source_id,) if source_id else None
         batch = collect_sources(
             self.database,
-            self.sources,
+            self._sources_for_lane(lane),
             fetcher=self.fetcher,
             force=force,
             only_source_ids=only,
             x_bearer_token=self.x_bearer_token,
         )
-        payload = self.list_window(hours, translate=False)
+        payload = self.list_window(hours, translate=False, lane=lane)
         payload["collection"] = {
             "inserted": batch.inserted,
             "duplicates": batch.duplicates,
@@ -203,7 +390,9 @@ class HotspotService:
         }
         return payload
 
-    def list_window(self, hours: int = 4, *, translate: bool = True) -> dict[str, object]:
+    def list_window(
+        self, hours: int = 4, *, translate: bool = True, lane: str = "hotspots"
+    ) -> dict[str, object]:
         if isinstance(hours, bool) or not isinstance(hours, int):
             raise ValueError("hours must be an integer")
         if hours < HOTSPOT_HOUR_MIN or hours > HOTSPOT_HOUR_MAX:
@@ -214,14 +403,22 @@ class HotspotService:
         time_rows = [
             row
             for row in self.database.list_hotspot_candidates(
-                since.isoformat(), limit=HOTSPOT_LIMIT, sort="time", pool=HOTSPOT_POOL
+                since.isoformat(),
+                limit=HOTSPOT_LIMIT,
+                sort="time",
+                pool=HOTSPOT_POOL,
+                lane=lane,
             )
             if not should_hide_candidate(str(row["title"]), row.get("source_ids") or ())
         ]
         heat_rows = [
             row
             for row in self.database.list_hotspot_candidates(
-                since.isoformat(), limit=HOTSPOT_LIMIT, sort="heat", pool=HOTSPOT_POOL
+                since.isoformat(),
+                limit=HOTSPOT_LIMIT,
+                sort="heat",
+                pool=HOTSPOT_POOL,
+                lane=lane,
             )
             if not should_hide_candidate(str(row["title"]), row.get("source_ids") or ())
         ]
@@ -294,6 +491,39 @@ class Workbench:
             "message": EMPTY_HOOKS_MESSAGE if not hooks else "",
         }
 
+    def related_search(
+        self, draft_id: str, selection: str, selection_start: int, selection_end: int
+    ) -> dict[str, object]:
+        draft = self.database.get_draft(draft_id)
+        related_article_context(str(draft["body"]), selection, selection_start, selection_end)
+        try:
+            search_fetcher = None if self.page_fetcher is default_page_fetcher else self.page_fetcher
+            query, results = search_related_news(selection, fetcher=search_fetcher, limit=1)
+        except Exception:
+            raise LLMError(
+                "related_search_failed", "相关新闻检索失败", cause_code="search_failed"
+            ) from None
+        items: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for result in results:
+            url = str(result.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            items.append(
+                {
+                    "title": str(result.get("title") or "").strip(),
+                    "url": url,
+                    "snippet": str(result.get("snippet") or "").strip()[:280],
+                }
+            )
+        return {
+            "ok": True,
+            "query": query,
+            "items": items[:1],
+            "search_status": "ok" if items else "empty",
+        }
+
     def generate_article(
         self,
         item_id: str,
@@ -303,13 +533,53 @@ class Workbench:
         effort: str | None = None,
         style: str = "",
         chosen_hooks: object = None,
+        prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
+        xhs_handle: str = "",
+        item_ids: list[str] | None = None,
     ) -> dict[str, object]:
         if platform not in {"wechat", "xiaohongshu"}:
             raise ValueError(f"unsupported platform: {platform}")
+        ids = _normalize_article_item_ids(item_id, item_ids)
+        if len(ids) >= 2:
+            return self._generate_fused_article(
+                ids,
+                platform,
+                model=model,
+                provider=provider,
+                effort=effort,
+                style=style,
+                chosen_hooks=chosen_hooks,
+                prompt_style=prompt_style,
+                xhs_handle=xhs_handle,
+            )
+        if ids:
+            item_id = ids[0]
+        preset_style = load_article_style_prompt(prompt_style)
         item = self.database.get_item(item_id)
+        item_sources = self.database.get_item_sources(item_id)
         source_ids = tuple(
-            sorted({str(pair["source_id"]) for pair in self.database.get_item_sources(item_id)})
+            sorted({str(pair["source_id"]) for pair in item_sources})
         )
+        source_refs: list[dict[str, str]] = []
+        source_occurrences: dict[str, int] = {}
+        seen_source_refs: set[str] = set()
+        for pair in item_sources:
+            source_id = str(pair["source_id"])
+            source_url = str(pair.get("source_url") or "")
+            ref_key = f"{source_id}|{source_url}"
+            if ref_key in seen_source_refs:
+                continue
+            seen_source_refs.add(ref_key)
+            source_occurrences[source_id] = source_occurrences.get(source_id, 0) + 1
+            source_refs.append(
+                {
+                    "source_id": source_id,
+                    "citation_id": source_citation_id(
+                        source_id, source_occurrences[source_id]
+                    ),
+                    "source_url": source_url,
+                }
+            )
         summary = _summary(str(item["content_text"])) or str(item["title"])
         facts = FactList(
             event=str(item["title"]),
@@ -348,6 +618,7 @@ class Workbench:
         material = notes.source_excerpt or str(item["content_text"])
         hooks = sanitize_chosen_hooks(chosen_hooks)
         background = notes.as_prompt()
+        background["source_refs"] = source_refs
         if hooks:
             background["chosen_hooks"] = hooks
         article = self.llm_service.generate_article(
@@ -360,14 +631,15 @@ class Workbench:
             effort=settings.effort,
             style=style,
             background=background,
+            preset_style=preset_style,
         )
-        item_sources = self.database.get_item_sources(item_id)
         records: list[dict[str, str]] = []
         discussion = False
         promoted = False
         best_base = "S4"
         has_x = False
         engagement = engagement_from_raw(item.get("raw_json"))
+        citation_occurrences: dict[str, int] = {}
         for pair in item_sources:
             source = self.database.get_source(str(pair["source_id"]))
             kind = engagement_kind(str(source["source_id"]), str(pair["source_url"]), str(source["type"]))
@@ -377,9 +649,14 @@ class Workbench:
                 promoted = True
             if str(source["type"]) == "x":
                 has_x = True
+            source_id = str(source["source_id"])
+            citation_occurrences[source_id] = citation_occurrences.get(source_id, 0) + 1
             records.append(
                 {
-                    "source_id": str(source["source_id"]),
+                    "source_id": source_id,
+                    "citation_id": source_citation_id(
+                        source_id, citation_occurrences[source_id]
+                    ),
                     "name": str(source["name"]),
                     "source_url": str(pair["source_url"]),
                 }
@@ -392,12 +669,18 @@ class Workbench:
             probe_fetcher=self.image_fetcher,
         )
         assets = build_asset_bundle(images, item_id=item_id)
+        manuscript = article["body"]
+        source_body = article.get("caption") if platform == "xiaohongshu" else manuscript
         framed = frame_article_body(
-            article["body"], records, discussion=discussion, promoted=promoted
+            str(source_body),
+            records,
+            discussion=discussion,
+            promoted=promoted,
+            inline_sources=True,
         )
-        body = append_image_credits(
-            framed, selected_body_images(assets), cover_image(assets)
-        )
+        body = strip_image_credits(framed)
+        if platform == "xiaohongshu":
+            assets["manuscript"] = manuscript
         draft = Draft(
             draft_id=hashlib.sha256(
                 f"{event_id}:{platform}:{ARTICLE_PROMPT_VERSION}".encode()
@@ -417,7 +700,7 @@ class Workbench:
         outcome = self.database.upsert_draft(draft)
         if outcome != "unchanged":
             self.database.update_event_status(event_id, "DRAFTED")
-        return {
+        payload: dict[str, object] = {
             "event_id": event_id,
             "draft_id": draft.draft_id,
             "platform": platform,
@@ -426,8 +709,204 @@ class Workbench:
             "body": draft.body,
             "source_ids": list(source_ids),
             "assets": assets,
+            "prompt_style": prompt_style,
             "llm": self.llm_service.settings_payload(settings),
         }
+        if platform == "xiaohongshu":
+            payload.update(xhs_fields(draft.title, draft.body, assets, xhs_handle))
+        return payload
+
+    def _generate_fused_article(
+        self,
+        item_ids: list[str],
+        platform: str,
+        model: str | None = None,
+        provider: str | None = None,
+        effort: str | None = None,
+        style: str = "",
+        chosen_hooks: object = None,
+        prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
+        xhs_handle: str = "",
+    ) -> dict[str, object]:
+        preset_style = load_article_style_prompt(prompt_style)
+        prepared: list[dict[str, object]] = []
+        source_ids_set: set[str] = set()
+        items_by_id: dict[str, dict[str, object]] = {}
+        source_refs: list[dict[str, str]] = []
+        source_occurrences: dict[str, int] = {}
+        seen_source_refs: set[str] = set()
+        for item_id in item_ids:
+            item = dict(self.database.get_item(item_id))
+            pairs = self.database.get_item_sources(item_id)
+            item["source_ids"] = [str(pair["source_id"]) for pair in pairs]
+            item["source_urls"] = [str(pair.get("source_url") or "") for pair in pairs]
+            prepared.append(item)
+            items_by_id[item_id] = item
+            source_ids_set.update(str(pair["source_id"]) for pair in pairs)
+            for pair in pairs:
+                source_id = str(pair["source_id"])
+                source_url = str(pair.get("source_url") or "")
+                ref_key = f"{source_id}|{source_url}"
+                if ref_key in seen_source_refs:
+                    continue
+                seen_source_refs.add(ref_key)
+                source_occurrences[source_id] = source_occurrences.get(source_id, 0) + 1
+                source_refs.append(
+                    {
+                        "source_id": source_id,
+                        "citation_id": source_citation_id(
+                            source_id, source_occurrences[source_id]
+                        ),
+                        "source_url": source_url,
+                    }
+                )
+        fused = fuse_hotspot_items(prepared)
+        source_ids = tuple(sorted(source_ids_set | set(fused.get("source_ids") or [])))
+        fused_title = str(fused["title"])
+        fused_content = str(fused.get("content_text") or fused.get("summary") or "")
+        summary = _summary(fused_content) or fused_title
+        facts = FactList(
+            event=fused_title,
+            claims=(Claim(summary, source_ids, "medium"),),
+            unknowns=(),
+            conflicts=(),
+        )
+        stable_key = f"hotspot-item:{','.join(sorted(item_ids))}:{platform}"
+        event_id = self.database.create_event(
+            fused_title,
+            str(prepared[0].get("topic") or "unclassified"),
+            "HOTSPOT_ITEM",
+            stable_key,
+        )
+        workflow = ContentWorkflow(self.database)
+        validation = workflow.save_fact_list(event_id, facts)
+        if not validation.valid:
+            raise FactValidationError(",".join(validation.errors))
+        if self.llm_service is None:
+            raise LLMError("article_generation_failed")
+        settings = self.llm_service.resolve_settings(model, provider, effort)
+        notes = gather_background(
+            self.database,
+            fused_title,
+            fused_content,
+            item_id="",
+            page_url="",
+            fetcher=self.page_fetcher,
+        )
+        material = fused_content or notes.source_excerpt
+        hooks = sanitize_chosen_hooks(chosen_hooks)
+        background = notes.as_prompt()
+        background["source_refs"] = source_refs
+        if hooks:
+            background["chosen_hooks"] = hooks
+        article = self.llm_service.generate_article(
+            platform,
+            fused_title,
+            material,
+            source_ids,
+            model=settings.model,
+            provider=settings.provider,
+            effort=settings.effort,
+            style=style,
+            background=background,
+            preset_style=preset_style,
+        )
+        records: list[dict[str, str]] = []
+        discussion = False
+        promoted = False
+        best_base = "S4"
+        has_x = False
+        seen_urls: set[str] = set()
+        citation_occurrences: dict[str, int] = {}
+        images: list[dict[str, object]] = []
+        for item_id in item_ids:
+            item = items_by_id[item_id]
+            pairs = self.database.get_item_sources(item_id)
+            engagement = engagement_from_raw(item.get("raw_json"))
+            images.extend(
+                collect_article_images(
+                    item,
+                    pairs,
+                    page_fetcher=self.page_fetcher,
+                    probe_fetcher=self.image_fetcher,
+                )
+            )
+            for pair in pairs:
+                source = self.database.get_source(str(pair["source_id"]))
+                kind = engagement_kind(
+                    str(source["source_id"]), str(pair["source_url"]), str(source["type"])
+                )
+                base = str(source["tier"])
+                best_base = better_tier(best_base, base)
+                if effective_tier(base, engagement, kind) != base:
+                    promoted = True
+                if str(source["type"]) == "x":
+                    has_x = True
+                source_url = str(pair["source_url"])
+                record_key = f"{source['source_id']}|{source_url}"
+                if record_key in seen_urls:
+                    continue
+                seen_urls.add(record_key)
+                source_id = str(source["source_id"])
+                citation_occurrences[source_id] = citation_occurrences.get(source_id, 0) + 1
+                records.append(
+                    {
+                        "source_id": source_id,
+                        "citation_id": source_citation_id(
+                            source_id, citation_occurrences[source_id]
+                        ),
+                        "name": str(source["name"]),
+                        "source_url": source_url,
+                    }
+                )
+        discussion = best_base == "S4" or has_x
+        assets = build_asset_bundle(images, item_id=",".join(sorted(item_ids)))
+        manuscript = article["body"]
+        source_body = article.get("caption") if platform == "xiaohongshu" else manuscript
+        framed = frame_article_body(
+            str(source_body),
+            records,
+            discussion=discussion,
+            promoted=promoted,
+            inline_sources=True,
+        )
+        body = strip_image_credits(framed)
+        if platform == "xiaohongshu":
+            assets["manuscript"] = manuscript
+        draft = Draft(
+            draft_id=hashlib.sha256(
+                f"{event_id}:{platform}:{ARTICLE_PROMPT_VERSION}".encode()
+            ).hexdigest()[:24],
+            event_id=event_id,
+            platform=platform,
+            title=article["title"],
+            body=body,
+            tags=(),
+            source_ids=source_ids,
+            generator=(
+                f"{settings.provider}/{settings.model}:{settings.effort}:{ARTICLE_PROMPT_VERSION}"
+            ),
+            processing_version=ARTICLE_PROMPT_VERSION,
+            assets=assets,
+        )
+        outcome = self.database.upsert_draft(draft)
+        if outcome != "unchanged":
+            self.database.update_event_status(event_id, "DRAFTED")
+        payload: dict[str, object] = {
+            "event_id": event_id,
+            "draft_id": draft.draft_id,
+            "platform": platform,
+            "status": self.database.get_draft(draft.draft_id)["status"],
+            "title": draft.title,
+            "body": draft.body,
+            "source_ids": list(source_ids),
+            "assets": assets,
+            "prompt_style": prompt_style,
+            "llm": self.llm_service.settings_payload(settings),
+        }
+        if platform == "xiaohongshu":
+            payload.update(xhs_fields(draft.title, draft.body, assets, xhs_handle))
+        return payload
 
     def rescan_images(self, draft_id: str) -> dict[str, object]:
         draft = self.database.get_draft(draft_id)
@@ -447,7 +926,11 @@ class Workbench:
             page_fetcher=self.page_fetcher,
             probe_fetcher=self.image_fetcher,
         )
-        return build_asset_bundle(images, item_id=item_id)
+        bundle = build_asset_bundle(images, item_id=item_id)
+        manuscript = normalize_assets(draft["assets_json"]).get("manuscript")
+        if isinstance(manuscript, str) and manuscript.strip():
+            bundle["manuscript"] = manuscript
+        return bundle
 
 
 class WechatConfigurationRequired(PublicationError):
@@ -476,6 +959,7 @@ class WeChatPublisher:
         base_url: str = DEFAULT_WECHAT_BASE_URL,
         opener=None,
         image_fetcher=None,
+        poster_renderer=None,
     ) -> None:
         self.app_id = app_id
         self.app_secret = app_secret
@@ -484,6 +968,7 @@ class WeChatPublisher:
         self.base_url = base_url.rstrip("/")
         self.opener = opener
         self.image_fetcher = image_fetcher
+        self.poster_renderer = poster_renderer
 
     def _api(self, method: str, path: str, query: str = "", body: str | bytes | None = None) -> dict[str, object]:
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -513,7 +998,26 @@ class WeChatPublisher:
     def _draft_assets(self, draft: dict[str, object]) -> list[dict[str, object]]:
         return selected_body_images(self._asset_bundle(draft))
 
-    def _upload_thumb(self, access_token: str, image_bytes: bytes, filename: str) -> str:
+    def _selected_cover_assets(self, draft: dict[str, object]) -> list[dict[str, object]]:
+        bundle = self._asset_bundle(draft)
+        ordered: list[dict[str, object]] = []
+        seen: set[str] = set()
+        cover = cover_image(bundle)
+        if cover is not None:
+            key = str(cover.get("id") or cover.get("url") or "")
+            ordered.append(cover)
+            if key:
+                seen.add(key)
+        for image in selected_body_images(bundle):
+            key = str(image.get("id") or image.get("url") or "")
+            if key and key in seen:
+                continue
+            ordered.append(image)
+            if key:
+                seen.add(key)
+        return ordered
+
+    def _upload_permanent_image(self, access_token: str, image_bytes: bytes, filename: str) -> str:
         boundary = "----AutoPostingBoundary"
         header = (
             f"--{boundary}\r\n"
@@ -523,11 +1027,11 @@ class WeChatPublisher:
         footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
         payload = self._api(
             "POST",
-            "/cgi-bin/media/upload",
-            f"?access_token={access_token}&type=thumb",
+            "/cgi-bin/material/add_material",
+            f"?access_token={access_token}&type=image",
             header + image_bytes + footer,
         )
-        media_id = payload.get("media_id") or payload.get("thumb_media_id")
+        media_id = payload.get("media_id")
         if not isinstance(media_id, str) or not media_id:
             raise PublicationError("wechat_thumb_upload_failed")
         return media_id
@@ -552,8 +1056,9 @@ class WeChatPublisher:
         return url
 
     def _filled_content(self, draft: dict[str, object], access_token: str) -> str:
+        body = strip_image_credits(str(draft["body"]))
         paragraphs = "".join(
-            f"<p>{html.escape(line)}</p>" for line in str(draft["body"]).splitlines()
+            f"<p>{_article_line_html(line)}</p>" for line in body.splitlines()
         )
         figures: list[str] = []
         fetcher = self.image_fetcher or _download_image
@@ -563,13 +1068,51 @@ class WeChatPublisher:
                 try:
                     payload = fetcher(str(asset["url"]))
                     if isinstance(payload, (bytes, bytearray)) and payload:
-                        published = self._upload_image(
-                            access_token, bytes(payload), f"image-{index}.jpg"
+                        image_bytes, filename = _wechat_image_payload(
+                            bytes(payload), f"image-{index}"
                         )
+                        published = self._upload_image(access_token, image_bytes, filename)
                 except Exception:
                     published = None
             figures.append(figure_html(asset, published))
         return "".join(figures) + paragraphs
+
+    def _poster_bytes(self, title: str) -> bytes:
+        renderer = self.poster_renderer if self.poster_renderer is not None else render_title_poster
+        try:
+            payload = renderer(title)
+        except Exception:
+            return b""
+        if isinstance(payload, (bytes, bytearray)) and payload:
+            return bytes(payload)
+        return b""
+
+    def _upload_selected_cover(self, asset: dict[str, object], access_token: str) -> str:
+        fetcher = self.image_fetcher or _download_image
+        payload = fetcher(str(asset.get("url") or ""))
+        if not isinstance(payload, (bytes, bytearray)) or not payload:
+            return ""
+        image_bytes, filename = _wechat_image_payload(bytes(payload), "cover")
+        return self._upload_permanent_image(access_token, image_bytes, filename)
+
+    def _resolve_thumb_media_id(self, draft: dict[str, object], access_token: str) -> str:
+        selected = self._selected_cover_assets(draft)
+        if selected:
+            for asset in selected:
+                try:
+                    media_id = self._upload_selected_cover(asset, access_token)
+                except Exception:
+                    media_id = ""
+                if media_id:
+                    return media_id
+            return self.thumb_media_id
+        poster = self._poster_bytes(str(draft.get("title") or ""))
+        if poster:
+            try:
+                return self._upload_permanent_image(access_token, poster, "cover.png")
+            except Exception:
+                pass
+        return self.thumb_media_id
 
     def publish(self, draft: dict[str, object]) -> dict[str, object]:
         token = self._api(
@@ -586,19 +1129,10 @@ class WeChatPublisher:
         )
         access_token = str(token["access_token"])
         content = self._filled_content(draft, access_token)
-        thumb_media_id = self.thumb_media_id
-        cover = cover_image(self._asset_bundle(draft))
-        fetcher = self.image_fetcher or _download_image
-        if cover is not None and fetcher is not None:
-            try:
-                payload = fetcher(str(cover["url"]))
-                if isinstance(payload, (bytes, bytearray)) and payload:
-                    thumb_media_id = self._upload_thumb(
-                        access_token, bytes(payload), "cover.jpg"
-                    )
-            except Exception:
-                thumb_media_id = self.thumb_media_id
-        digest = " ".join(str(draft["body"]).split())[:120]
+        thumb_media_id = self._resolve_thumb_media_id(draft, access_token)
+        if not thumb_media_id:
+            raise PublicationError("wechat_cover_required")
+        digest = extract_wechat_digest(str(draft["body"]), str(draft.get("title") or ""))
         article = {
             "title": draft["title"],
             "author": self.author,
@@ -615,13 +1149,7 @@ class WeChatPublisher:
             json.dumps({"articles": [article]}, ensure_ascii=False),
         )
         media_id = str(draft_result["media_id"])
-        submit_result = self._api(
-            "POST",
-            "/cgi-bin/freepublish/submit",
-            f"?access_token={access_token}",
-            json.dumps({"media_id": media_id}),
-        )
         return {
-            "status": "SUBMITTED",
-            "reference": str(submit_result.get("publish_id", media_id)),
+            "status": "DRAFT_SAVED",
+            "reference": media_id,
         }

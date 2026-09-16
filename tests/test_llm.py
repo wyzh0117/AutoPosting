@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from autoposting.db import Database
+from autoposting.article_prompt import load_article_style_prompt
 from autoposting.llm import (
     ARTICLE_PROMPT_VERSION,
     HERMES_BINARY,
@@ -38,6 +39,14 @@ class FakeRunner:
         return types.SimpleNamespace(stdout=self.stdout, stderr="", returncode=self.returncode)
 
 
+def _keychain_find_stdout(secret: str) -> str:
+    """Match `security find-generic-password -w`: hex-encode non-ASCII bytes."""
+    blob = secret.encode("utf-8")
+    if all(32 <= byte <= 126 for byte in blob):
+        return secret + "\n"
+    return blob.hex() + "\n"
+
+
 class FakeSecurityRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
@@ -47,7 +56,7 @@ class FakeSecurityRunner:
         input_value = kwargs.get("input")
         self.calls.append((argv, input_value if isinstance(input_value, str) else None))
         if "find-generic-password" in argv:
-            return types.SimpleNamespace(returncode=0, stdout=self.secret + "\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout=_keychain_find_stdout(self.secret), stderr="")
         if "add-generic-password" in argv:
             self.secret = str(input_value or "").rstrip("\n")
         elif "delete-generic-password" in argv:
@@ -148,6 +157,32 @@ class HermesRunnerTests(unittest.TestCase):
         self.assertEqual("secret-key\n", runner.calls[0][1])
         self.assertEqual("-w", runner.calls[0][0][-1])
 
+    def test_keychain_store_roundtrips_non_ascii_secret(self) -> None:
+        runner = FakeSecurityRunner()
+        store = MacOSKeychainCredentialStore(runner=runner)
+        payload = json.dumps(
+            {
+                "app_id": "wx123",
+                "app_secret": "top-secret-value",
+                "author": "测试作者",
+                "thumb_media_id": "",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        store.set("account:wechat", payload)
+
+        self.assertEqual(payload, store.get("account:wechat"))
+
+    def test_keychain_store_keeps_printable_hex_secret(self) -> None:
+        runner = FakeSecurityRunner()
+        store = MacOSKeychainCredentialStore(runner=runner)
+
+        store.set("endpoint-1", "deadbeef")
+
+        self.assertEqual("deadbeef", store.get("endpoint-1"))
+
 
 class OpenAICompatibleRunnerTests(unittest.TestCase):
     def test_configured_endpoint_receives_key_model_and_prompt(self) -> None:
@@ -190,12 +225,193 @@ class OpenAICompatibleRunnerTests(unittest.TestCase):
 
         self.assertEqual("/v1/chat/completions", requests[0][0])
         self.assertEqual("Bearer test-api-key", requests[0][1])
-        self.assertEqual("AutoPosting/0.4.0", requests[0][2])
+        self.assertEqual("AutoPosting/1.2.9", requests[0][2])
         self.assertEqual("remote-model", requests[0][3]["model"])
         self.assertEqual("REAL PROMPT", requests[0][3]["messages"][0]["content"])
 
+    def test_list_content_parts_are_joined(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers["Content-Length"]))
+                payload = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": [
+                                        {"type": "text", "text": '{"ok": true}'},
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            runner = HermesRunner(
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="test-api-key",
+                model="remote-model",
+            )
+            self.assertEqual('{"ok": true}', runner.run("PROMPT"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_empty_content_falls_back_to_reasoning_content(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers["Content-Length"]))
+                payload = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "reasoning_content": '{"ok": true}',
+                                }
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            runner = HermesRunner(
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="test-api-key",
+                model="remote-model",
+            )
+            self.assertEqual('{"ok": true}', runner.run("PROMPT"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class SettingsTests(unittest.TestCase):
+    def test_qwen38_none_is_sent_explicitly_to_disable_default_reasoning(self) -> None:
+        settings = validate_llm_settings(
+            "qwen3.8-max",
+            "openai-compatible",
+            "none",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "sk-test",
+        )
+
+        body = HermesRunner._completion_body(
+            settings, [{"role": "user", "content": "write"}]
+        )
+
+        self.assertEqual("none", body["reasoning_effort"])
+        self.assertEqual(False, body["enable_thinking"])
+
+    def test_none_stays_omitted_for_other_compatible_endpoints(self) -> None:
+        settings = validate_llm_settings(
+            "remote-model",
+            "openai-compatible",
+            "none",
+            "https://api.example/v1",
+            "sk-test",
+        )
+
+        body = HermesRunner._completion_body(
+            settings, [{"role": "user", "content": "write"}]
+        )
+
+        self.assertNotIn("reasoning_effort", body)
+
+        lookalike = validate_llm_settings(
+            "qwen3.8-max",
+            "openai-compatible",
+            "none",
+            "https://notaliyuncs.com/v1",
+            "sk-test",
+        )
+        self.assertNotIn(
+            "reasoning_effort",
+            HermesRunner._completion_body(
+                lookalike, [{"role": "user", "content": "write"}]
+            ),
+        )
+
+    def test_deepseek_v4_none_disables_default_thinking(self) -> None:
+        settings = validate_llm_settings(
+            "deepseek-v4-flash",
+            "openai-compatible",
+            "none",
+            "https://api.deepseek.com/v1",
+            "sk-test",
+        )
+        body = HermesRunner._completion_body(
+            settings, [{"role": "user", "content": "write"}]
+        )
+        self.assertEqual({"type": "disabled"}, body["thinking"])
+        self.assertNotIn("reasoning_effort", body)
+
+        proxied = validate_llm_settings(
+            "deepseek-v4-pro",
+            "openai-compatible",
+            "none",
+            "https://geekspace.cloud/v1",
+            "sk-test",
+        )
+        self.assertEqual(
+            {"type": "disabled"},
+            HermesRunner._completion_body(
+                proxied, [{"role": "user", "content": "write"}]
+            )["thinking"],
+        )
+
+    def test_deepseek_v4_effort_enables_thinking(self) -> None:
+        settings = validate_llm_settings(
+            "deepseek-v4-flash",
+            "openai-compatible",
+            "high",
+            "https://api.deepseek.com/v1",
+            "sk-test",
+        )
+        body = HermesRunner._completion_body(
+            settings, [{"role": "user", "content": "write"}]
+        )
+        self.assertEqual({"type": "enabled"}, body["thinking"])
+        self.assertEqual("high", body["reasoning_effort"])
+
+    def test_configured_reasoning_effort_is_forwarded(self) -> None:
+        settings = validate_llm_settings(
+            "qwen3.8-max",
+            "openai-compatible",
+            "max",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "sk-test",
+        )
+
+        body = HermesRunner._completion_body(
+            settings, [{"role": "user", "content": "write"}]
+        )
+
+        self.assertEqual("max", body["reasoning_effort"])
+
     def test_deepseek_root_url_gains_v1(self) -> None:
         settings = validate_llm_settings(
             "deepseek-chat",
@@ -225,8 +441,15 @@ class ParserTests(unittest.TestCase):
         self.assertEqual({"a": 1}, parse_model_json('```json\n{"a": 1}\n```'))
         self.assertEqual({"a": 1}, parse_model_json('```\n{"a": 1}\n```'))
 
+    def test_extracts_json_object_after_preamble(self) -> None:
+        self.assertEqual({"a": 1}, parse_model_json('Sure, here is the result:\n{"a": 1}'))
+        self.assertEqual(
+            {"title": "中文标题"},
+            parse_model_json("<think>plan</think>\n{\"title\": \"中文标题\"}\n"),
+        )
+
     def test_rejects_garbage(self) -> None:
-        for garbage in ("", "not json", "Sure, here is the result: {", "text before {\"a\": 1}"):
+        for garbage in ("", "not json", "Sure, here is the result: {"):
             with self.assertRaises(LLMError) as raised:
                 parse_model_json(garbage)
             self.assertEqual("llm_invalid_output", str(raised.exception))
@@ -313,6 +536,30 @@ class TranslateBatchTests(unittest.TestCase):
         self.assertEqual("translated", results["id-1"]["status"])
         self.assertEqual("中文标题id-1", results["id-1"]["title_zh"])
 
+    def test_translation_cache_is_scoped_by_endpoint(self) -> None:
+        class EndpointRunner(HermesRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def run(self, prompt: str, **kwargs: object) -> str:
+                del prompt, kwargs
+                self.calls += 1
+                return json.dumps(_translations_payload())
+
+        first = EndpointRunner()
+        second = EndpointRunner()
+        service_a = LLMService(self.db, runner=first)
+        service_b = LLMService(self.db, runner=second)
+        service_a.configure("same-model", base_url="https://a.example/v1", api_key="a")
+        service_b.configure("same-model", base_url="https://b.example/v1", api_key="b")
+
+        service_a.translate_batch(_items())
+        service_b.translate_batch(_items())
+
+        self.assertEqual(1, first.calls)
+        self.assertEqual(1, second.calls)
+
     def test_runner_failure_degrades_to_original_without_raising(self) -> None:
         fake = FakeRunner(error=TimeoutError("hung"))
         service = LLMService(self.db, runner=fake)
@@ -326,7 +573,7 @@ class TranslateBatchTests(unittest.TestCase):
             self.assertIn("90 秒", results[item["item_id"]]["error_reason"])
             self.assertEqual("", results[item["item_id"]]["title_zh"])
 
-    def test_extra_or_missing_ids_invalidate_batch(self) -> None:
+    def test_extra_ids_are_ignored_without_failing_valid_items(self) -> None:
         payload = _translations_payload()
         payload["translations"].append(
             {"item_id": "id-999", "title_zh": "凭空多出的条目", "summary_zh": "不应存在"}
@@ -335,8 +582,23 @@ class TranslateBatchTests(unittest.TestCase):
 
         results = service.translate_batch(_items())
 
-        self.assertEqual("failed", results["id-1"]["status"])
-        self.assertEqual("translation_unavailable", results["id-1"]["error"])
+        self.assertEqual("translated", results["id-1"]["status"])
+        self.assertEqual("translated", results["id-2"]["status"])
+        self.assertNotIn("id-999", results)
+
+    def test_missing_id_fails_only_that_item(self) -> None:
+        payload = {
+            "translations": [
+                {"item_id": "id-1", "title_zh": "中文标题id-1", "summary_zh": "中文摘要id-1"},
+            ]
+        }
+        service = LLMService(self.db, runner=FakeRunner(stdout=json.dumps(payload)))
+
+        results = service.translate_batch(_items())
+
+        self.assertEqual("translated", results["id-1"]["status"])
+        self.assertEqual("failed", results["id-2"]["status"])
+        self.assertEqual("translation_unavailable", results["id-2"]["error"])
 
     def test_non_cjk_translation_invalidates_batch(self) -> None:
         payload = {
@@ -351,6 +613,60 @@ class TranslateBatchTests(unittest.TestCase):
 
         self.assertEqual("failed", results["id-1"]["status"])
         self.assertEqual("translation_unavailable", results["id-1"]["error"])
+
+    def test_one_invalid_item_does_not_drop_the_rest(self) -> None:
+        payload = {
+            "translations": [
+                {"item_id": "id-1", "title_zh": "中文标题id-1", "summary_zh": "中文摘要id-1"},
+                {"item_id": "id-2", "title_zh": "English title", "summary_zh": "English summary"},
+            ]
+        }
+        service = LLMService(self.db, runner=FakeRunner(stdout=json.dumps(payload)))
+
+        results = service.translate_batch(_items())
+
+        self.assertEqual("translated", results["id-1"]["status"])
+        self.assertEqual("中文标题id-1", results["id-1"]["title_zh"])
+        self.assertEqual("failed", results["id-2"]["status"])
+
+    def test_empty_summary_accepts_empty_summary_zh(self) -> None:
+        items = [{"item_id": "id-1", "title": "Gemini Omni 1.1 Flash", "summary": ""}]
+        payload = {
+            "translations": [
+                {"item_id": "id-1", "title_zh": "Gemini Omni 1.1 Flash 现已推出", "summary_zh": ""}
+            ]
+        }
+        service = LLMService(self.db, runner=FakeRunner(stdout=json.dumps(payload)))
+
+        results = service.translate_batch(items)
+
+        self.assertEqual("translated", results["id-1"]["status"])
+        self.assertEqual("Gemini Omni 1.1 Flash 现已推出", results["id-1"]["title_zh"])
+        self.assertEqual("", results["id-1"]["summary_zh"])
+
+    def test_stub_summary_keeps_cjk_title(self) -> None:
+        items = [
+            {
+                "item_id": "id-1",
+                "title": "Bild AI (YC W25) Is Hiring Product and AI Engineers",
+                "summary": "Comments",
+            }
+        ]
+        payload = {
+            "translations": [
+                {
+                    "item_id": "id-1",
+                    "title_zh": "Bild AI（YC W25）正在招聘产品和 AI 工程师",
+                    "summary_zh": "Comments",
+                }
+            ]
+        }
+        service = LLMService(self.db, runner=FakeRunner(stdout=json.dumps(payload)))
+
+        results = service.translate_batch(items)
+
+        self.assertEqual("translated", results["id-1"]["status"])
+        self.assertIn("工程师", results["id-1"]["title_zh"])
 
 
 class ArticleGenerationTests(unittest.TestCase):
@@ -370,6 +686,21 @@ class ArticleGenerationTests(unittest.TestCase):
             "来源与未知项：lab_blog, media_feed\nAIGC 声明：本文由 AI 辅助生成。"
         )
 
+    def _xhs_caption(self) -> str:
+        return (
+            "官方刚刚确认模型一已经发布。\n"
+            "- 博客公开了上线消息\n"
+            "- 目前仍缺具体时间表\n"
+            "来源 lab_blog media_feed\nAIGC"
+        )
+
+    def _xhs_payload(self, title: str = "模型一速览") -> dict[str, str]:
+        return {
+            "title": title,
+            "body": self._wechat_body(),
+            "caption": self._xhs_caption(),
+        }
+
     def test_wechat_article_prompt_and_validation(self) -> None:
         fake = FakeRunner(stdout=json.dumps({"title": "模型一正式发布", "body": self._wechat_body()}))
         service = LLMService(self.db, runner=fake)
@@ -383,9 +714,9 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertNotIn("不超过", prompt)
         self.assertIn("lab_blog", prompt)
         self.assertIn("不可信", prompt)
-        self.assertIn("某某称", prompt)
+        self.assertIn("不要把写作提纲暴露给读者", prompt)
         self.assertIn("大家在聊什么", prompt)
-        self.assertIn("前因与脉络", prompt)
+        self.assertIn("一般人容易看漏的角度", prompt)
         self.assertIn("普通人", prompt)
         self.assertIn("背景资料", prompt)
         cached = self.db.cache_get(
@@ -398,28 +729,54 @@ class ArticleGenerationTests(unittest.TestCase):
                     self.content
                     + "\n"
                     + json.dumps(sorted(self.source_ids), ensure_ascii=False)
-                    + "\n\n{}",
+                    + "\n\n"
+                    + load_article_style_prompt("AI专家")
+                    + "\n{}",
                 ),
             )
         )
         self.assertIsNotNone(cached)
 
     def test_xiaohongshu_article_prompt_constraints(self) -> None:
-        fake = FakeRunner(
-            stdout=json.dumps({"title": "模型一速览", "body": "钩子！\n要点一。\n要点二。\n#AI资讯\n来源 lab_blog media_feed\nAIGC"})
-        )
+        fake = FakeRunner(stdout=json.dumps(self._xhs_payload()))
         service = LLMService(self.db, runner=fake)
 
         result = service.generate_article("xiaohongshu", self.title, self.content, self.source_ids)
 
         self.assertEqual("模型一速览", result["title"])
+        self.assertEqual(self._wechat_body(), result["body"])
+        self.assertIn("导语：模型一发布了", result["caption"])
         self.assertEqual(1, len(fake.calls))
         self.assertNotIn("不超过", fake.calls[0][2])
+        self.assertIn("caption", fake.calls[0][2])
+        self.assertIn("- ", fake.calls[0][2])
+
+    def test_xiaohongshu_article_still_generates_without_caption(self) -> None:
+        service = LLMService(
+            self.db,
+            runner=FakeRunner(
+                stdout=json.dumps(
+                    {
+                        "title": "模型一速览",
+                        "body": "正文已经发生。lab_blog media_feed AIGC",
+                    }
+                )
+            ),
+        )
+        result = service.generate_article("xiaohongshu", self.title, self.content, self.source_ids)
+        self.assertEqual("模型一速览", result["title"])
+        self.assertIn("正文已经发生", result["caption"])
+        self.assertIn("lab_blog", result["caption"])
+        self.assertIn("AIGC", result["caption"])
 
     def test_xiaohongshu_article_accepts_title_over_20_characters(self) -> None:
         fake = FakeRunner(
             stdout=json.dumps(
-                {"title": "超" * 21, "body": "正文 lab_blog media_feed AIGC"}
+                {
+                    "title": "超" * 21,
+                    "body": "正文 lab_blog media_feed AIGC",
+                    "caption": self._xhs_caption(),
+                }
             )
         )
         service = LLMService(self.db, runner=fake)
@@ -445,6 +802,23 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertIn("像资深科技编辑一样克制", fake.calls[0][2])
         self.assertIn("使用轻松口语", fake.calls[1][2])
 
+    def test_preset_style_is_transmitted_and_scopes_cache(self) -> None:
+        fake = FakeRunner(stdout=json.dumps({"title": "模型一正式发布", "body": self._wechat_body()}))
+        service = LLMService(self.db, runner=fake)
+
+        first_style = load_article_style_prompt("AI专家")
+        second_style = load_article_style_prompt("经验分享")
+        service.generate_article(
+            "wechat", self.title, self.content, self.source_ids, preset_style=first_style
+        )
+        service.generate_article(
+            "wechat", self.title, self.content, self.source_ids, preset_style=second_style
+        )
+
+        self.assertEqual(2, len(fake.calls))
+        self.assertIn(f"写作风格要求：\n{first_style}", fake.calls[0][2])
+        self.assertIn(f"写作风格要求：\n{second_style}", fake.calls[1][2])
+
     def test_article_cache_hit_skips_runner(self) -> None:
         fake = FakeRunner(stdout=json.dumps({"title": "模型一正式发布", "body": self._wechat_body()}))
         service = LLMService(self.db, runner=fake)
@@ -462,6 +836,7 @@ class ArticleGenerationTests(unittest.TestCase):
         service.generate_article("wechat", self.title, self.content, self.source_ids)
 
         service.generate_article("wechat", self.title, self.content + " 更新", self.source_ids)
+        fake.stdout = json.dumps(self._xhs_payload())
         service.generate_article("xiaohongshu", self.title, self.content, self.source_ids)
 
         self.assertEqual(3, len(fake.calls))
@@ -496,6 +871,67 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertEqual(2, len(fake.calls))
         self.assertIn("another-model", fake.calls[1])
         self.assertIn("high", fake.calls[1])
+
+    def test_accepts_chinese_title_and_body_keys(self) -> None:
+        fake = FakeRunner(
+            stdout=json.dumps({"标题": "模型一正式发布", "正文": self._wechat_body()})
+        )
+        service = LLMService(self.db, runner=fake)
+
+        result = service.generate_article("wechat", self.title, self.content, self.source_ids)
+
+        self.assertEqual("模型一正式发布", result["title"])
+        self.assertIn("AIGC", result["body"])
+
+    def test_accepts_nested_article_object(self) -> None:
+        fake = FakeRunner(
+            stdout=json.dumps(
+                {"article": {"title": "模型一正式发布", "body": self._wechat_body()}}
+            )
+        )
+        service = LLMService(self.db, runner=fake)
+
+        result = service.generate_article("wechat", self.title, self.content, self.source_ids)
+
+        self.assertEqual("模型一正式发布", result["title"])
+        self.assertIn("lab_blog", result["body"])
+
+    def test_joins_list_body_paragraphs(self) -> None:
+        fake = FakeRunner(
+            stdout=json.dumps(
+                {
+                    "title": "模型一正式发布",
+                    "body": self._wechat_body().split("\n"),
+                }
+            )
+        )
+        service = LLMService(self.db, runner=fake)
+
+        result = service.generate_article("wechat", self.title, self.content, self.source_ids)
+
+        self.assertIn("AIGC", result["body"])
+        self.assertIn("lab_blog", result["body"])
+
+    def test_accepts_content_as_body_alias(self) -> None:
+        fake = FakeRunner(
+            stdout=json.dumps({"title": "模型一正式发布", "content": self._wechat_body()})
+        )
+        service = LLMService(self.db, runner=fake)
+
+        result = service.generate_article("wechat", self.title, self.content, self.source_ids)
+
+        self.assertEqual("模型一正式发布", result["title"])
+        self.assertIn("AIGC", result["body"])
+
+    def test_summary_is_not_treated_as_body(self) -> None:
+        fake = FakeRunner(
+            stdout=json.dumps({"title": "模型一正式发布", "summary": self._wechat_body()})
+        )
+        service = LLMService(self.db, runner=fake)
+        with self.assertRaises(LLMError) as raised:
+            service.generate_article("wechat", self.title, self.content, self.source_ids)
+        self.assertEqual("article_generation_failed", str(raised.exception))
+        self.assertIn("title 或 body", raised.exception.reason)
 
     def test_validation_failures_raise_stable_code(self) -> None:
         cases = [
@@ -554,6 +990,278 @@ class CjkTests(unittest.TestCase):
         self.assertTrue(_has_cjk("Model One 中文混合"))
         self.assertFalse(_has_cjk("Pure English title"))
         self.assertFalse(_has_cjk("12345 !!!"))
+
+
+class ImageGenerationRunnerTests(unittest.TestCase):
+    TINY_PNG = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
+        b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    def _serve(self, handler_cls) -> ThreadingHTTPServer:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server
+
+    def test_openai_images_generations_returns_png(self) -> None:
+        import base64
+
+        encoded = base64.b64encode(self.TINY_PNG).decode("ascii")
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                payload = json.dumps({"data": [{"b64_json": encoded}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        runner = HermesRunner(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="sk-test",
+            model="wan2.2-t2i-flash",
+        )
+        settings = runner.settings
+        png = runner.generate_image("cream paper", settings)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_dashscope_qwen_image_falls_back_to_multimodal_endpoint(self) -> None:
+        import base64
+
+        encoded = base64.b64encode(self.TINY_PNG).decode("ascii")
+        seen: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                seen.append(self.path)
+                if self.path.endswith("/images/generations"):
+                    payload = json.dumps(
+                        {"error": {"message": "model qwen-image-plus is not supported"}}
+                    ).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                payload = json.dumps(
+                    {
+                        "output": {
+                            "choices": [
+                                {"message": {"content": [{"image": f"data:image/png;base64,{encoded}"}]}}
+                            ]
+                        }
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        host = f"http://127.0.0.1:{server.server_port}"
+        runner = HermesRunner(
+            base_url=f"{host}/compatible-mode/v1",
+            api_key="sk-test",
+            model="qwen-image-plus",
+        )
+        png = runner.generate_image("cream paper", runner.settings)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertTrue(any(path.endswith("/images/generations") for path in seen))
+        self.assertTrue(any("multimodal-generation" in path for path in seen))
+
+    def test_image_http_error_surfaces_api_message(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                payload = json.dumps(
+                    {"error": {"message": "model qwen3.8-max is not an image model"}}
+                ).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        runner = HermesRunner(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="sk-test",
+            model="qwen3.8-max",
+        )
+        with self.assertRaises(LLMError) as raised:
+            runner.generate_image("cream paper", runner.settings)
+        self.assertEqual("llm_api_failed", raised.exception.code)
+        self.assertIn("not an image model", raised.exception.reason or "")
+
+    def test_image_requests_use_9x16_size(self) -> None:
+        import base64
+
+        encoded = base64.b64encode(self.TINY_PNG).decode("ascii")
+        sizes: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                size = str(body.get("size") or (body.get("parameters") or {}).get("size") or "")
+                sizes.append(size)
+                if size == "928*1664":
+                    payload = json.dumps({"data": [{"b64_json": encoded}]}).encode()
+                    self.send_response(200)
+                else:
+                    payload = json.dumps({"error": {"message": "size参数不合法"}}).encode()
+                    self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        runner = HermesRunner(
+            base_url=f"http://127.0.0.1:{server.server_port}/compatible-mode/v1",
+            api_key="sk-test",
+            model="any-user-model",
+        )
+        png = runner.generate_image("cream paper", runner.settings)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertTrue(sizes)
+        self.assertNotIn("768*1024", sizes)
+        self.assertNotIn("1104*1472", sizes)
+        self.assertIn("928*1664", sizes)
+
+    def test_retries_other_9x16_sizes_when_rejected(self) -> None:
+        import base64
+
+        encoded = base64.b64encode(self.TINY_PNG).decode("ascii")
+        sizes: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                size = str(body.get("size") or (body.get("parameters") or {}).get("size") or "")
+                sizes.append(size)
+                if size == "720*1280":
+                    payload = json.dumps({"data": [{"b64_json": encoded}]}).encode()
+                    self.send_response(200)
+                else:
+                    payload = json.dumps({"message": "size参数不合法"}).encode()
+                    self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        runner = HermesRunner(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="sk-test",
+            model="wan2.2-t2i-flash",
+        )
+        png = runner.generate_image("cream paper", runner.settings)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertTrue(all("*" in item and item.split("*")[0] and item.split("*")[1] for item in sizes if item))
+        for item in sizes:
+            if not item:
+                continue
+            width, height = (int(part) for part in item.split("*"))
+            self.assertAlmostEqual(width / height, 9 / 16, places=2)
+        self.assertIn("720*1280", sizes)
+
+    def test_chat_model_falls_back_to_chat_completions_image(self) -> None:
+        import base64
+
+        encoded = base64.b64encode(self.TINY_PNG).decode("ascii")
+        seen: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                seen.append(self.path)
+                if self.path.endswith("/images/generations"):
+                    payload = json.dumps(
+                        {"error": {"message": "HTTP 500: model is not an image model"}}
+                    ).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                payload = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/png;base64,{encoded}"
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = self._serve(Handler)
+        runner = HermesRunner(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="sk-test",
+            model="qwen3.8-max",
+        )
+        png = runner.generate_image("cream paper", runner.settings)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertTrue(any(path.endswith("/images/generations") for path in seen))
+        self.assertTrue(any(path.endswith("/chat/completions") for path in seen))
+
+    def test_configure_verified_image_saves_without_calling_generate(self) -> None:
+        class BoomRunner(HermesRunner):
+            def generate_image(self, *args: object, **kwargs: object) -> bytes:
+                raise AssertionError("saving an image model must not generate")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        service = LLMService(database=_db(tmp), runner=BoomRunner())
+        settings = service.configure_verified_image(
+            "qwen3.8-max",
+            "http://127.0.0.1:9/v1",
+            "sk-test",
+        )
+        self.assertEqual("qwen3.8-max", settings.model)
+        self.assertEqual("qwen3.8-max", service.settings.model)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .background import RELATED_SELECTION_LIMIT, article_page_text
 from .config import load_sources
 from .content import ContentWorkflow
 from .db import Database, model_endpoint_id
@@ -16,11 +17,23 @@ from .llm import (
     LLMError,
     LLMService,
     MacOSKeychainCredentialStore,
+    _has_cjk,
     validate_chat_messages,
 )
+from .github_weekly import (
+    XHS_TITLE,
+    build_xhs_copy,
+    fetch_weekly_ai_repos,
+    week_window_start,
+)
+from .image_gen import build_weekly_image_jobs
+from .skill_finder import find_skills, render_skill_package
+from .visual.tokens import parse_palette
+from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
 from .publishing import PublicationError, PublicationService
 from .scheduler import PublishScheduler, parse_run_at
+from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE
 from .workbench import (
     DEFAULT_WECHAT_BASE_URL,
     HOTSPOT_HOUR_MAX,
@@ -31,12 +44,25 @@ from .workbench import (
     Workbench,
     XIAOHONGSHU_CREATOR_URL,
     _download_image as download_image,
+    _summary,
+    xhs_fields,
 )
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "1.2.9"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
+ACCOUNT_STORE_IDS = {
+    "wechat": "account:wechat",
+    "x": "account:x",
+    "xiaohongshu": "account:xiaohongshu",
+}
+
+
+def _looks_english(text: str) -> bool:
+    cjk = sum("\u3400" <= char <= "\u9fff" for char in text)
+    latin = sum(char.isascii() and char.isalpha() for char in text)
+    return latin > cjk
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -68,6 +94,7 @@ INDEX_HTML = """<!doctype html>
   --t-mid: 280ms;
   --t-slow: 460ms;
   --hotspot-list-h: 29rem;
+  --favorites-drawer-w: 20rem;
   --font: "Avenir Next", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --display: "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", Georgia, serif;
 }
@@ -112,6 +139,161 @@ header h1.logo{
   color:var(--text-main); font-weight:500;
 }
 #config-btn:hover:not(:disabled){background:var(--bg-input); border-color:var(--accent); box-shadow:none;}
+#favorites-btn{
+  border-radius:99px; padding:.5rem 1.2rem;
+  border:1px solid var(--border); background:var(--bg-card);
+  color:var(--text-main); font-weight:500;
+}
+#favorites-btn:hover:not(:disabled){background:var(--bg-input); border-color:var(--accent); box-shadow:none;}
+#favorites-btn[aria-expanded="true"]{border-color:var(--accent); color:var(--accent);}
+#news-supplement-btn{
+  border-radius:99px; padding:.5rem 1.2rem;
+  border:1px solid var(--border); background:var(--bg-card);
+  color:var(--text-main); font-weight:500;
+}
+#news-supplement-btn:hover:not(:disabled){background:var(--bg-input); border-color:var(--accent); box-shadow:none;}
+#news-supplement-btn[aria-expanded="true"]{border-color:var(--accent); color:var(--accent);}
+#favorites-drawer,#news-supplement-drawer{
+  display:none; position:fixed; top:0; right:0; bottom:0;
+  width:var(--favorites-drawer-w); z-index:40;
+  background:linear-gradient(180deg, rgba(36, 33, 26, 0.98), rgba(22, 20, 16, 0.98));
+  border-left:1px solid var(--border);
+  flex-direction:column; padding:1rem 1rem 1.2rem;
+  overflow:hidden;
+}
+body.favorites-open #favorites-drawer{display:flex;}
+body.news-supplement-open #news-supplement-drawer{display:flex;}
+body.favorites-open header,
+body.favorites-open #app-nav,
+body.favorites-open main,
+body.favorites-open #wait-banner{
+  margin-right:var(--favorites-drawer-w);
+  width:calc(100% - var(--favorites-drawer-w));
+}
+body.news-supplement-open header,
+body.news-supplement-open #app-nav,
+body.news-supplement-open main,
+body.news-supplement-open #wait-banner{
+  margin-right:var(--favorites-drawer-w);
+  width:calc(100% - var(--favorites-drawer-w));
+}
+.favorites-drawer-head{
+  display:flex; align-items:center; gap:.75rem; margin-bottom:.85rem;
+}
+.favorites-drawer-head h2{margin:0; font-size:1rem; font-weight:600;}
+#favorites-close{
+  margin-left:auto; border-radius:99px; padding:.35rem .8rem;
+  border:1px solid var(--border); background:var(--bg-card); color:var(--text-main);
+}
+#favorites-list{
+  list-style:none; margin:0; padding:0; overflow-y:auto; min-height:0; flex:1;
+  display:flex; flex-direction:column; gap:.75rem;
+}
+#news-supplement-list{
+  list-style:none; margin:0; padding:0; overflow-y:auto; min-height:0; flex:1;
+  display:flex; flex-direction:column; gap:.75rem;
+}
+.news-supplement-item{
+  background:var(--bg-input); border:1px solid transparent;
+  border-radius:var(--radius-md); padding:.8rem .9rem;
+}
+.news-supplement-item.is-focus{border-color:var(--accent);}
+.news-supplement-item a{display:block; color:var(--accent); font-weight:600; line-height:1.4; word-break:break-word;}
+.news-supplement-item .news-summary{display:block; margin-top:.35rem; color:var(--text-muted); font-size:.78rem; line-height:1.45; word-break:break-word;}
+.news-supplement-item .news-meta{display:block; margin-top:.45rem; color:var(--text-muted); font-size:.7rem;}
+.fav-item{
+  position:relative; background:var(--bg-input); border:1px solid transparent;
+  border-radius:var(--radius-md); padding:.8rem 2.4rem .8rem .9rem;
+}
+.fav-item.is-picked, .hotspot-item.is-picked{
+  border-color:var(--accent);
+  background:linear-gradient(145deg, rgba(196, 164, 106, 0.16), rgba(196, 164, 106, 0.05));
+  box-shadow:inset 0 0 0 1px rgba(196, 164, 106, 0.35);
+}
+.fav-open-original{
+  display:inline-flex; margin-top:.15rem; height:auto; min-height:0;
+  padding:.2rem .6rem; font-size:.72rem; font-weight:600; line-height:1.2;
+  border-radius:99px;
+}
+.hotspot-row{position:relative;}
+.ht-star{
+  position:absolute; top:.45rem; right:.45rem; z-index:2;
+  width:1.8rem; height:1.8rem; padding:0; border:0; border-radius:999px;
+  background:transparent; color:var(--text-muted); font-size:1.05rem; line-height:1;
+  cursor:pointer;
+}
+.ht-star[aria-pressed="true"]{color:var(--accent);}
+
+#app-nav{
+  width:100%; max-width:1400px;
+  display:flex; justify-content:space-between; align-items:center;
+  gap:.75rem; flex-wrap:wrap;
+  margin:0 0 1rem;
+}
+#app-nav .platform-tabs[aria-label="候选栏"]{
+  width:auto; max-width:none; flex:1 1 32rem;
+}
+#app-nav .platform-tabs[aria-label="候选栏"] button.seg{
+  flex:1 1 0; font-size:.82rem; padding:.42rem .7rem;
+}
+#app-nav .platform-tabs[aria-label="平台选择"]{
+  margin-left:auto; flex:0 0 auto;
+}
+
+#wait-banner{
+  width:100%; max-width:1400px; position:relative; z-index:2;
+  display:flex; flex-direction:column; gap:.55rem;
+  margin:0 0 1rem; padding:0; border:none; background:transparent; box-shadow:none;
+  pointer-events:none;
+}
+#wait-banner[hidden]{display:none !important;}
+#wait-jobs{display:flex; flex-direction:column; gap:.55rem; pointer-events:none;}
+.wait-job{
+  display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; gap:.35rem .7rem; align-items:center;
+  padding:.85rem 1rem .8rem;
+  border-radius:var(--radius-md); border:1px solid var(--accent);
+  background:linear-gradient(180deg, #322a1c, #1f1b14);
+  box-shadow:0 16px 36px -12px rgba(0,0,0,.7), 0 0 0 4px var(--accent-glow);
+}
+.wait-job.is-done{border-color:var(--ok); box-shadow:0 0 0 4px rgba(111,158,122,.18);}
+.wait-job.is-error{border-color:var(--err); box-shadow:0 0 0 4px rgba(196,122,106,.18);}
+.wait-spinner{
+  width:1.55rem; height:1.55rem; border-radius:50%; flex:0 0 auto;
+  border:3px solid rgba(196,164,106,.22); border-top-color:var(--accent);
+  animation:waitSpin .7s linear infinite;
+}
+.wait-job.is-done .wait-spinner,.wait-job.is-error .wait-spinner{animation:none; border-color:currentColor;}
+@keyframes waitSpin{to{transform:rotate(360deg);}}
+.wait-title{margin:0; font-size:.95rem; font-weight:700; color:var(--text-main);}
+.wait-detail{margin:.12rem 0 0; font-size:.78rem; color:var(--text-muted); line-height:1.4;}
+.wait-time{margin:0; font-variant-numeric:tabular-nums; font-weight:700; color:var(--accent); white-space:nowrap;}
+.wait-stop{
+  pointer-events:auto;
+  height:32px; min-height:32px; padding:.2rem .85rem; border-radius:99px;
+  font-size:.78rem; font-weight:700; color:var(--err); border-color:rgba(196,122,106,.55);
+  background:rgba(196,122,106,.08);
+}
+.wait-stop:hover:not(:disabled){background:rgba(196,122,106,.18); border-color:var(--err);}
+.wait-job.is-done .wait-stop,.wait-job.is-error .wait-stop{display:none;}
+.wait-job:not(.is-done):not(.is-error){animation:waitJobPulse 1.8s ease-in-out infinite;}
+@keyframes waitJobPulse{
+  0%,100%{box-shadow:0 16px 36px -12px rgba(0,0,0,.7), 0 0 0 3px var(--accent-glow);}
+  50%{box-shadow:0 16px 36px -12px rgba(0,0,0,.7), 0 0 0 8px var(--accent-glow);}
+}
+@keyframes waitPulse{
+  0%,100%{box-shadow:0 0 0 0 var(--accent-glow);}
+  50%{box-shadow:0 0 0 7px var(--accent-glow);}
+}
+.gh-tile.is-running{border-color:var(--accent); animation:waitPulse 1.15s ease-in-out infinite;}
+.gh-tile.is-queued img{opacity:.28; filter:grayscale(.35);}
+.gh-tile.is-error{border-color:var(--err);}
+.gh-tile .gh-overlay{
+  position:absolute; left:0; right:0; bottom:0; z-index:1; margin:0;
+  background:rgba(12,11,8,.8); color:var(--accent); font-weight:700;
+  text-align:center; padding:.85rem .5rem;
+}
+.gh-tile.is-running .gh-overlay{color:#1a160f; background:rgba(196,164,106,.92);}
+.gh-tile.is-error .gh-overlay{color:#f3eee4; background:rgba(196,122,106,.92);}
 
 main{
   width:100%; max-width:1400px;
@@ -191,6 +373,12 @@ button.seg.active{
   padding:.25rem; border:1px solid rgba(243, 238, 228, 0.04);
 }
 .platform-tabs button{flex:0 1 auto;}
+.platform-tabs[aria-label="候选栏"]{width:100%; max-width:36rem;}
+.platform-tabs[aria-label="候选栏"] button.seg{
+  flex:1 1 0; font-size:.82rem; padding:.42rem .55rem; letter-spacing:0;
+}
+body.lane-github .panel-title{letter-spacing:0; font-weight:700;}
+body.lane-github .panel-header .row{width:100%;}
 .btn-magic{
   background:linear-gradient(135deg, var(--accent-gradient-2), var(--accent-gradient-1));
   color:#1a160f; border:1px solid var(--accent); font-weight:700;
@@ -200,7 +388,9 @@ button.seg.active{
 }
 .btn-magic:hover:not(:disabled){filter:brightness(1.08); transform:translateY(-1px);}
 
-#rank-tabs{margin:0 0 .65rem; align-self:flex-start;}
+.rank-toolbar{display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin:0 0 .65rem;}
+#rank-tabs{margin:0; align-self:flex-start;}
+#prompt-style-select{width:auto; min-width:8.5rem;}
 #hotspot-pane{flex:0 0 auto; min-height:0; height:auto; display:flex; flex-direction:column; min-width:0; overflow:hidden;}
 #hotspots-panel.sources-open #hotspot-pane{
   flex:0 0 auto; height:auto; min-height:0; overflow:hidden;
@@ -229,6 +419,41 @@ button.seg.active{
 .source-health .sh-meta{flex:0 1 42%; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .source-health .sh-dot{width:7px; height:7px; border-radius:50%; flex:0 0 auto;}
 .source-health .sh-dot.ok{background:var(--ok);}
+#picked-dock{
+  position:fixed; right:1.5rem; bottom:1.5rem; z-index:25;
+  display:flex; flex-direction:column; align-items:stretch;
+  gap:.35rem; min-width:0; max-width:18rem; max-height:40vh; overflow-y:auto;
+  padding:.65rem .75rem; pointer-events:auto;
+  border:1px solid var(--border); border-radius:var(--radius-md);
+  background:var(--bg-raised);
+  box-shadow:0 18px 40px -18px rgba(0, 0, 0, 0.72), inset 0 1px 0 rgba(243, 238, 228, 0.04);
+}
+#picked-dock[hidden]{display:none !important;}
+body.favorites-open #picked-dock{
+  right: calc(var(--favorites-drawer-w) + 1.25rem);
+}
+.picked-dock-label{
+  font-size:.72rem; color:var(--text-muted); font-weight:600;
+}
+.picked-dock-chip{
+  pointer-events:auto; max-width:100%; width:100%;
+  font:inherit; font-size:.82rem; font-weight:600; line-height:1.5;
+  color:var(--text-main); text-align:left; justify-content:flex-start; align-items:flex-start;
+  background:rgba(196, 164, 106, 0.12);
+  border:1px solid rgba(196, 164, 106, 0.35);
+  border-radius:var(--radius-sm); padding:.75rem .8rem; min-height:3.4rem;
+  cursor:pointer; display:flex;
+}
+.picked-dock-chip-label{
+  display:-webkit-box; width:100%; min-width:0; overflow:hidden;
+  -webkit-box-orient:vertical; -webkit-line-clamp:2;
+  text-overflow:ellipsis; white-space:normal; word-break:break-word;
+}
+#picked-dock.is-focus .picked-dock-chip{
+  pointer-events:none; cursor:default; max-width:100%;
+  color:var(--text-muted); background:transparent; border-color:transparent;
+  font-weight:500;
+}
 .source-health .sh-dot.error{background:var(--err);}
 .source-health .sh-dot.stale{background:var(--warn);}
 .source-health .sh-dot.never,.source-health .sh-dot.disabled{background:#5a564c;}
@@ -247,20 +472,18 @@ button.seg.active{
 #hotspot-list li:nth-child(4){animation-delay:160ms;}
 #hotspot-list li:nth-child(5){animation-delay:200ms;}
 #hotspot-list li:nth-child(n+6){animation-delay:240ms;}
-#hotspot-list::-webkit-scrollbar, .dialog-content::-webkit-scrollbar, .article-scroll::-webkit-scrollbar, #chat-output::-webkit-scrollbar, #image-picker-list::-webkit-scrollbar, #hook-list::-webkit-scrollbar{width:4px;}
-#hotspot-list::-webkit-scrollbar-thumb, .dialog-content::-webkit-scrollbar-thumb, .article-scroll::-webkit-scrollbar-thumb, #chat-output::-webkit-scrollbar-thumb, #image-picker-list::-webkit-scrollbar-thumb, #hook-list::-webkit-scrollbar-thumb{background:var(--accent-gradient-2); border-radius:4px;}
+#hotspot-list::-webkit-scrollbar, .dialog-content::-webkit-scrollbar, .article-scroll::-webkit-scrollbar, #image-picker-list::-webkit-scrollbar, #hook-list::-webkit-scrollbar, #news-supplement-list::-webkit-scrollbar{width:4px;}
+#hotspot-list::-webkit-scrollbar-thumb, .dialog-content::-webkit-scrollbar-thumb, .article-scroll::-webkit-scrollbar-thumb, #image-picker-list::-webkit-scrollbar-thumb, #hook-list::-webkit-scrollbar-thumb, #news-supplement-list::-webkit-scrollbar-thumb{background:var(--accent-gradient-2); border-radius:4px;}
 .hotspot-item{
   display:block; width:100%; text-align:left;
   background:var(--bg-input); border:1px solid transparent;
-  border-radius:var(--radius-md); padding:.8rem .9rem;
+  border-radius:var(--radius-md); padding:1rem 2.4rem 1rem .9rem;
   cursor:pointer; position:relative; word-break:break-word;
   transition:background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
 }
 .hotspot-item:hover:not(:disabled){border-color:rgba(196, 164, 106, 0.35); transform:translateY(-2px);}
 .hotspot-item.selected{
-  border-color:var(--accent);
-  background:linear-gradient(145deg, var(--bg-input), rgba(196, 164, 106, 0.08));
-  box-shadow:0 4px 20px var(--accent-glow);
+  background:var(--bg-input);
 }
 .hotspot-item.selected::before{
   content:''; position:absolute; left:-1px; top:20%; height:60%; width:3px;
@@ -273,7 +496,7 @@ button.seg.active{
   background:rgba(196, 164, 106, 0.08); border:1px solid rgba(196, 164, 106, 0.18);
   padding:.15rem .45rem; border-radius:4px; font-weight:600; margin:0 0 .4rem;
 }
-.ht-title{display:block; font-size:.95rem; font-weight:600; line-height:1.4; color:var(--text-main); margin-bottom:.35rem; word-break:break-word;}
+.ht-title{display:block; font-size:.95rem; font-weight:600; line-height:1.4; color:var(--text-main); margin-bottom:.35rem; word-break:break-word; cursor:pointer;}
 .ht-summary{
   display:block; font-size:.82rem; color:var(--text-muted); line-height:1.45; margin-bottom:.55rem;
   word-break:break-word; display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden;
@@ -320,7 +543,12 @@ button.seg.active{
 .article-scroll[hidden]{display:none;}
 .article-field{display:flex; flex-direction:column; gap:.5rem; margin:0; font-size:.85rem; font-weight:600; color:var(--text-muted);}
 .article-field input,.article-field textarea{margin:0; font-weight:400;}
-#article-body{flex:1 0 auto; min-height:260px; height:auto; overflow:hidden; resize:none; white-space:pre-wrap; word-break:break-word; line-height:1.8;}
+.article-field-head{display:flex; align-items:center; justify-content:space-between; gap:.75rem;}
+#related-search-btn{height:32px; min-height:32px; padding:0 .75rem; font-size:.76rem; white-space:nowrap;}
+#article-body{
+  flex:1 0 auto; min-height:260px; height:auto; overflow:hidden; resize:none;
+  overflow-anchor:none; white-space:pre-wrap; word-break:break-word; line-height:1.8;
+}
 textarea[name=style]{resize:vertical; max-height:50vh;}
 .article-meta{margin:0; font-size:.8rem;}
 #image-picker{
@@ -353,8 +581,14 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
 }
 .image-card .image-meta{min-width:0; font-size:.75rem; color:var(--text-muted);}
 .image-card .image-url{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
-.image-card .image-actions{display:flex; flex-wrap:wrap; gap:.35rem;}
+.image-card .image-actions{display:flex; flex-wrap:wrap; gap:.45rem; align-items:center;}
 .image-card .image-actions button{height:28px; min-height:28px; padding:0 .55rem; font-size:.72rem;}
+.image-check{
+  display:inline-flex; align-items:center; gap:.28rem;
+  font-size:.75rem; color:var(--text-muted); font-weight:600;
+  cursor:pointer; user-select:none; white-space:nowrap;
+}
+.image-check input{margin:0; accent-color:var(--accent); width:1rem; height:1rem;}
 .image-card.cover{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow);}
 .article-actions{
   display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap;
@@ -379,34 +613,6 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
   background:var(--bg-input); border:1px solid var(--border);
   border-radius:var(--radius-md); padding:1rem; margin-top:1rem;
 }
-.chat-section{
-  border-top:1px solid var(--border); margin-top:.75rem; padding-top:.75rem;
-  display:flex; flex-direction:column; gap:.75rem; flex:0 0 auto; min-height:0;
-}
-.chat-section.chat-active{flex:0 0 auto; overflow:visible;}
-.chat-row{display:flex; align-items:center; gap:.5rem; min-width:0;}
-.chat-row > .model-picker,.chat-row > input,.chat-row > button{height:40px; min-height:40px; padding-top:0; padding-bottom:0;}
-.chat-row .model-picker{flex:0 0 auto;}
-#chat-input{flex:1 1 auto; min-width:0;}
-#chat-send-btn{flex:0 0 auto; white-space:nowrap;}
-#chat-output{
-  display:flex; flex:0 0 auto; min-height:0; flex-direction:column; gap:.75rem;
-  overflow:visible; overscroll-behavior:contain;
-  background:rgba(0,0,0,0.25); border:1px solid var(--border);
-  border-radius:var(--radius-md); padding:1rem;
-}
-#chat-output[hidden]{display:none;}
-.chat-msg{display:flex; flex-direction:column; gap:.25rem;}
-.chat-msg-user{align-items:flex-end;}
-.chat-msg-assistant{align-items:flex-start;}
-.chat-role{font-size:.7rem; color:var(--text-muted); font-weight:600;}
-.chat-content{
-  background:transparent; border-top:1px solid var(--border); border-bottom:1px solid var(--border);
-  border-radius:0; padding:.6rem .9rem; font-size:.9rem;
-  white-space:pre-wrap; word-break:break-word; max-width:85%;
-}
-.chat-msg-error .chat-content{color:var(--err);}
-.chat-pending{color:var(--text-muted); font-size:.8rem; font-style:italic;}
 .muted{color:var(--text-muted); font-size:12px; word-break:break-all;}
 #package-path{overflow-wrap:anywhere; word-break:normal; background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:6px; padding:4px 6px;}
 [role=status]{color:var(--text-muted); font-size:.8rem;}
@@ -414,15 +620,10 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
 .status-error{color:var(--err);}
 .status-ok{color:var(--ok);}
 [role=alert]{color:var(--err); font-size:.8rem;}
-body.chat-expanded{min-height:100dvh; overflow-y:auto;}
-body.chat-expanded main{flex:1 0 auto;}
-body.chat-expanded .panel{height:auto; overflow:visible;}
-body.chat-expanded #article-view{flex:1 0 auto;}
-
 #config-dialog{
   background:var(--bg-card); color:var(--text-main);
   border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.5rem;
-  width:min(520px, calc(100% - 32px)); max-height:calc(100vh - 32px); overflow:hidden;
+  width:min(640px, calc(100% - 32px)); max-height:calc(100vh - 32px); overflow:hidden;
   box-shadow:0 25px 50px -12px rgba(0,0,0,0.8);
   animation:rise var(--t-mid) var(--ease);
 }
@@ -435,8 +636,38 @@ body.chat-expanded #article-view{flex:1 0 auto;}
 #config-dialog fieldset > .row{align-items:flex-end; flex-wrap:nowrap;}
 #config-dialog fieldset > .row > label{min-width:0;}
 #config-dialog fieldset > .row > button{flex:0 0 auto;}
-#endpoint-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.6rem;}
-.endpoint-card{background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); padding:.7rem .8rem;}
+.purpose-stack{display:flex; flex-direction:column; gap:1.15rem; margin:1.1rem 0 1.6rem;}
+.purpose-card{
+  background:var(--bg-input); border:1px solid var(--border);
+  border-radius:var(--radius-md); padding:1rem 1.05rem 1.15rem;
+  display:flex; flex-direction:column; gap:.85rem;
+}
+.purpose-card h3{margin:0; font-size:.95rem; color:var(--text-main);}
+.purpose-grid{display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.15fr); gap:.8rem 1rem; align-items:end;}
+.purpose-actions{display:flex; gap:.65rem; align-items:end; flex-wrap:wrap;}
+.purpose-actions button{height:40px; min-width:7rem; white-space:nowrap;}
+.model-role-row{
+  display:grid; grid-template-columns:minmax(0, 1fr) 7.5rem auto;
+  align-items:end; gap:.65rem; margin-top:.7rem;
+}
+.model-role-row.simple{grid-template-columns:minmax(0, 1fr) auto;}
+.model-role-row button{height:40px; min-width:7rem; white-space:nowrap;}
+.provider-section{margin-top:.4rem; display:flex; flex-direction:column; gap:.9rem;}
+#provider-list,#endpoint-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.85rem;}
+.provider-row,.endpoint-card{background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); padding:.95rem 1rem;}
+.provider-row{display:flex; flex-wrap:wrap; align-items:center; gap:.75rem 1rem;}
+.provider-row.active{border-color:var(--accent);}
+.provider-dot{width:.55rem; height:.55rem; border-radius:50%; flex:0 0 auto; background:var(--err);}
+.provider-dot.ok{background:var(--ok);}
+.provider-row-body{min-width:0; flex:1 1 auto; cursor:pointer;}
+.provider-row-title{font-size:.9rem; font-weight:600; word-break:break-all;}
+.provider-row-meta{font-size:.72rem; color:var(--text-muted); margin-top:.2rem;}
+.provider-tag{font-size:.68rem; border:1px solid var(--border); border-radius:99px; padding:.12rem .45rem; color:var(--text-muted); flex:0 0 auto;}
+.provider-expand{width:100%; display:flex; flex-wrap:wrap; gap:.75rem 1rem; align-items:end; padding-top:.35rem;}
+.provider-expand label{flex:1 1 14rem; min-width:0;}
+#provider-editor{background:var(--bg-raised); border:1px solid var(--border); border-radius:var(--radius-md); padding:1.1rem 1.15rem; display:flex; flex-direction:column; gap:1rem; margin-top:.15rem;}
+#provider-editor[hidden]{display:none;}
+.account-form[hidden],.account-delete[hidden]{display:none;}
 .endpoint-card .endpoint-url{word-break:break-all; font-size:.85rem; margin-bottom:.5rem;}
 #hours-custom{width:5.5rem;}
 #schedule-at{width:auto; max-width:13rem;}
@@ -451,6 +682,33 @@ body.chat-expanded #article-view{flex:1 0 auto;}
   animation:fade var(--t-mid) var(--ease);
 }
 #image-lightbox::backdrop{background:rgba(12, 11, 8, 0.72);}
+.original-dialog{
+  border:0; padding:0; width:min(980px, calc(100vw - 32px)); height:min(88vh, 900px);
+  max-width:none; max-height:none; background:var(--bg-card); color:var(--text-main);
+  border-radius:var(--radius-lg); box-shadow:0 25px 60px rgba(0,0,0,.72);
+}
+.original-dialog::backdrop{background:rgba(12, 11, 8, .72); backdrop-filter:blur(4px);}
+.original-page{height:100%; display:grid; grid-template-rows:auto auto minmax(0, 1fr);}
+.original-head{display:flex; width:100%; min-width:0; align-items:center; justify-content:space-between; gap:1rem; padding:1rem 1.4rem; border-bottom:1px solid var(--border);}
+.original-head h2{margin:0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:1.15rem;}
+.original-head-actions{display:flex; flex:0 0 auto; flex-wrap:nowrap; align-items:center; gap:.35rem;}
+#original-translate{
+  height:36px; width:max-content; flex:0 0 auto; padding:0 .65rem;
+  white-space:nowrap; border-color:transparent; background:transparent;
+  color:var(--accent); font-size:.82rem; font-weight:600;
+}
+#original-translate:hover:not(:disabled){background:var(--accent-glow); box-shadow:none;}
+#original-close{
+  width:36px; height:36px; flex:0 0 36px; padding:0; border-radius:50%; font-size:1.25rem;
+  color:var(--text-muted); line-height:1;
+}
+#original-sources{padding:0 1.4rem; flex-wrap:wrap;}
+#original-sources a{color:var(--accent); font-size:.8rem; word-break:break-all;}
+#original-scroll{overflow:auto; padding:1rem 1.4rem 2rem;}
+#original-note{margin:0 0 .8rem; font-size:.78rem; color:var(--text-muted);}
+.original-section h3{margin:.25rem 0 .75rem; font-size:.86rem; color:var(--text-muted);}
+#original-content,#original-translation{white-space:pre-wrap; line-height:1.75; word-break:break-word;}
+#original-translation-wrap{margin-top:1.6rem; padding-top:1.25rem; border-top:1px solid var(--border);}
 .lightbox-stage{
   position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;
   width:100%; height:100%; padding:1.25rem; box-sizing:border-box; gap:.75rem;
@@ -474,11 +732,161 @@ body.chat-expanded #article-view{flex:1 0 auto;}
   .article-scroll{max-height:none;}
   .article-actions{align-items:stretch;}
   .article-actions .model-picker,.article-actions input{width:100%; min-width:0; flex:1 1 100%;}
-  .chat-section.chat-active{flex:0 0 auto; overflow:visible;}
-  #chat-output{flex:0 0 auto; max-height:none;}
-  .chat-row{display:grid; grid-template-columns:minmax(0, 1fr) auto;}
-  .chat-row .model-picker{grid-column:1 / -1; width:100%;}
-  #chat-input{width:100%;}
+  .model-role-row,.model-role-row.simple{grid-template-columns:minmax(0, 1fr);}
+  .model-role-row button{width:100%;}
+}
+body.lane-github .rank-toolbar,
+body.lane-github #source-health-wrap,
+body.lane-github label[for="hours-select"],
+body.lane-github #hours-select,
+body.lane-github #hours-custom,
+body.lane-github #translate-btn,
+body.lane-github #hotspot-list,
+body.lane-github #article-panel .panel-header .platform-tabs,
+body.lane-github #prompt-style-select,
+body.lane-github #find-hooks-btn,
+body.lane-github #generate-btn,
+body.lane-github #article-empty,
+body.lane-github #article-view,
+body.lane-github #hook-list,
+body.lane-skills .rank-toolbar,
+body.lane-skills #source-health-wrap,
+body.lane-skills label[for="hours-select"],
+body.lane-skills #hours-select,
+body.lane-skills #hours-custom,
+body.lane-skills #collect-btn,
+body.lane-skills #translate-btn,
+body.lane-skills #hotspot-list,
+body.lane-skills #github-list,
+body.lane-skills #github-studio,
+body.lane-skills #prompt-style-select,
+body.lane-skills #find-hooks-btn,
+body.lane-skills #generate-btn,
+body.lane-skills #article-empty,
+body.lane-skills #article-view,
+body.lane-skills #hook-list{display:none !important;}
+body.lane-github #picked-dock, body.lane-skills #picked-dock { display:none !important; }
+#github-list,#github-studio,#skill-search-row,#skill-stage-chips,#skill-list,#skills-studio{display:none;}
+body.lane-github #github-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
+body.lane-github #github-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
+body.lane-skills #skill-search-row{display:flex; gap:.5rem; align-items:center; width:100%; margin:.35rem 0 .55rem;}
+body.lane-skills #skill-search-row input{
+  flex:1 1 auto; width:auto; min-width:0; height:40px;
+}
+body.lane-skills #skill-search-btn{
+  flex:0 0 auto; min-width:4.75rem; height:40px; padding:0 1.15rem;
+  white-space:nowrap; line-height:1; display:inline-flex;
+  align-items:center; justify-content:center;
+}
+body.lane-skills #skill-stage-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0 0 .55rem; padding:0; list-style:none;}
+body.lane-skills #skill-stage-chips li{
+  padding:.2rem .65rem; border-radius:99px; border:1px solid var(--border);
+  font-size:.72rem; color:var(--text-muted);
+}
+body.lane-skills #skill-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
+body.lane-skills #skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0; flex:1 1 auto;}
+body.lane-skills #skills-gallery{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem; min-height:12rem;}
+#skills-article{
+  flex:0 0 auto; min-height:6rem; padding:.85rem 1rem 1rem;
+  border:1px solid var(--border); border-radius:var(--radius-md);
+  background:rgba(0,0,0,0.22);
+}
+#skills-article.is-empty #skills-title,
+#skills-article.is-empty #skills-body{color:var(--text-muted);}
+#skills-article h3{margin:0 0 .4rem; font-family:var(--display); font-size:1.35rem;}
+#skills-body{white-space:pre-wrap; line-height:1.7; color:var(--text-main);}
+.gh-row{
+  display:grid; grid-template-columns:2rem 2.4rem minmax(0,1fr) auto; gap:.7rem;
+  align-items:center; padding:.7rem .8rem; border:1px solid var(--border);
+  border-radius:var(--radius-md); background:var(--bg-card);
+}
+.gh-row img{width:2.4rem; height:2.4rem; border-radius:10px; object-fit:cover; background:#111;}
+.gh-row strong{display:block; color:var(--text-main); font-size:.92rem;}
+.gh-row .gh-kind{color:var(--text-muted); font-size:.75rem; white-space:nowrap;}
+.gh-stars{display:flex; flex-direction:column; align-items:flex-end; gap:.25rem; min-width:4.8rem;}
+.gh-bar{width:4.6rem; height:5px; border-radius:99px; background:#2c2923; overflow:hidden;}
+.gh-bar > span{display:block; height:100%; background:var(--accent); border-radius:99px;}
+#github-render-controls{display:none; align-items:center; gap:.45rem; flex-wrap:wrap;}
+body.lane-github #github-render-controls,
+body.lane-skills #github-render-controls{display:flex;}
+body.lane-skills #github-render-btn{display:none;}
+.gh-swatch{display:flex; align-items:center; gap:.28rem; font-size:.72rem; color:var(--text-muted);}
+.gh-swatch input[type=color]{
+  width:1.85rem; height:1.85rem; padding:0; border:1px solid var(--border);
+  border-radius:6px; background:transparent; cursor:pointer;
+}
+.gh-toolbar{display:flex; gap:.65rem; flex-wrap:wrap;}
+.gh-gallery{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem;}
+.gh-tile{
+  position:relative; aspect-ratio:4/3; border-radius:0; overflow:hidden;
+  background:#141210; border:2px solid #2a261f; cursor:zoom-in;
+}
+.gh-tile.selected{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent);}
+.gh-tile img{width:100%; height:100%; object-fit:contain; display:block; background:#06155a;}
+.gh-tile.gh-cover{aspect-ratio:3/4;}
+.gh-tile.gh-poster{aspect-ratio:3/4;}
+.gh-tile.gh-cover,.gh-tile.gh-poster{
+  width:auto; padding:0; border-radius:0; background:#06155a; box-shadow:none;
+  display:block; color:#f4efe6;
+}
+.gh-tile .gh-pending{margin:0; padding:1rem; color:#9a9284; font-size:.78rem;}
+.gh-check{
+  position:absolute; top:.45rem; right:.45rem; z-index:2;
+  width:1.6rem; height:1.6rem; min-height:1.6rem; padding:0; border-radius:99px;
+  font-size:.75rem; line-height:1;
+}
+.gh-cover,.gh-poster{
+  width:min(100%, 18rem); border-radius:22px;
+  background:#141210; color:#f4efe6; padding:1.4rem 1.25rem 1.2rem;
+  box-shadow:0 18px 40px rgba(0,0,0,.28); border:1px solid #2a261f;
+  display:flex; flex-direction:column; gap:.7rem; overflow:hidden;
+}
+.gh-cover{aspect-ratio:3/4;}
+.gh-poster{aspect-ratio:3/4;}
+.gh-cover .gh-kicker{color:#d4a574; font-size:.78rem; letter-spacing:.16em; text-transform:uppercase;}
+.gh-cover h3{margin:0; font-size:2.4rem; line-height:.95; font-weight:700;}
+.gh-cover h4{margin:0; color:#d4a574; font-size:1.05rem; font-weight:500;}
+.gh-cover-list{display:flex; flex-direction:column; gap:.42rem; margin-top:.4rem;}
+.gh-cover-item{
+  display:grid; grid-template-columns:1.2rem 1.45rem minmax(0,1fr) auto; gap:.45rem;
+  align-items:center; font-size:.78rem;
+}
+.gh-cover-item img{width:1.45rem; height:1.45rem; border-radius:6px; object-fit:cover;}
+.gh-poster .gh-logo{width:3.4rem; height:3.4rem; border-radius:14px; object-fit:cover;}
+.gh-poster h3{margin:0; font-size:1.45rem;}
+.gh-poster .gh-summary{margin:0; color:#c9c1b4; font-size:.88rem; line-height:1.45;}
+.gh-block{background:#1c1916; border-radius:14px; padding:.7rem .8rem;}
+.gh-block span{display:block; color:#d4a574; font-size:.68rem; letter-spacing:.08em; margin-bottom:.25rem;}
+.gh-block p{margin:0; font-size:.82rem; line-height:1.4; color:#f4efe6;}
+.gh-posters{display:flex; gap:.9rem; overflow-x:auto; padding-bottom:.4rem;}
+#github-xhs-body{min-height:10rem;}
+#xhs-studio[hidden]{display:none !important;}
+#xhs-studio{display:flex; flex-direction:column; gap:.7rem;}
+.xhs-toolbar{display:flex; gap:.65rem; flex-wrap:wrap;}
+.xhs-cards{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem;}
+.xhs-paper{
+  aspect-ratio:9/16; border-radius:18px; overflow:hidden;
+  background:
+    radial-gradient(120% 70% at 12% 0%, rgba(255,255,255,.55), transparent 46%),
+    repeating-linear-gradient(180deg, rgba(92,68,38,.05) 0 1px, transparent 1px 8px),
+    linear-gradient(180deg, #f7f1e4 0%, #efe4d2 100%);
+  color:#3c342b; padding:.7rem .65rem .8rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.55), 0 10px 24px rgba(48,36,22,.12);
+  border:1px solid rgba(120,96,64,.16);
+  display:flex; flex-direction:column; gap:.45rem;
+}
+.xhs-head{display:flex; align-items:center; gap:.4rem;}
+.xhs-avatar{
+  width:1.35rem; height:1.35rem; border-radius:99px; flex:0 0 auto;
+  background:#d7c4a8; color:#5a4c3c; font-size:.7rem; font-weight:700;
+  display:flex; align-items:center; justify-content:center;
+}
+.xhs-id{font-size:.68rem; color:#6a5b4a; letter-spacing:.02em;}
+.xhs-paper h3{margin:0; font-size:1.02rem; line-height:1.25; font-weight:700; color:#2f291f;}
+.xhs-paper img{width:100%; flex:1 1 auto; min-height:0; object-fit:cover; border-radius:12px;}
+.xhs-lede,.xhs-copy{margin:0; font-size:.72rem; line-height:1.55; color:#4a4034; overflow:hidden;}
+@media (max-width: 900px){
+  .xhs-cards{grid-template-columns:repeat(2, minmax(0,1fr));}
 }
 @media (max-width: 360px){
   .article-actions .model-picker{font-size:.75rem; padding:.45rem .55rem;}
@@ -494,15 +902,47 @@ body.chat-expanded #article-view{flex:1 0 auto;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v0.4.0 · 本地服务</span>
+  <span id="service-status">v1.2.9 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
+  <button type="button" id="favorites-btn">收藏</button>
+  <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
 </header>
+<aside id="favorites-drawer" hidden>
+  <div class="favorites-drawer-head">
+    <h2>收藏</h2>
+    <button type="button" id="favorites-close">关闭</button>
+  </div>
+  <ul id="favorites-list" aria-label="收藏列表"></ul>
+</aside>
+<aside id="news-supplement-drawer" hidden>
+  <div class="favorites-drawer-head">
+    <h2>新闻补充</h2>
+    <button type="button" id="news-supplement-close">关闭</button>
+  </div>
+  <p id="news-supplement-status" role="status" aria-live="polite"></p>
+  <ul id="news-supplement-list" aria-label="新闻补充列表"></ul>
+</aside>
+<nav id="app-nav" aria-label="栏目与平台">
+  <div class="platform-tabs" role="tablist" aria-label="候选栏">
+    <button type="button" class="seg active" data-lane="hotspots" aria-selected="true">热点候选</button>
+    <button type="button" class="seg" data-lane="viewpoints" aria-selected="false">观点候选</button>
+    <button type="button" class="seg" data-lane="github" aria-selected="false">GitHub 周榜</button>
+    <button type="button" class="seg" data-lane="skills" aria-selected="false">Skill查找器</button>
+  </div>
+  <div class="platform-tabs" role="group" aria-label="平台选择">
+    <button type="button" id="seg-wechat" class="seg active" data-platform="wechat" aria-pressed="true">微信</button>
+    <button type="button" id="seg-xhs" class="seg" data-platform="xiaohongshu" aria-pressed="false">小红书</button>
+  </div>
+</nav>
+<aside id="wait-banner" hidden role="status" aria-live="assertive">
+  <div id="wait-jobs"></div>
+</aside>
 <main>
   <section class="panel" id="hotspots-panel" aria-labelledby="h-hotspots">
     <div class="panel-header">
       <div>
         <h2 id="h-hotspots" class="panel-title">热点候选</h2>
-        <p class="panel-sub">下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载</p>
+        <p id="hotspot-sub" class="panel-sub">下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载</p>
       </div>
       <div class="row">
         <label for="hours-select">时间范围</label>
@@ -517,15 +957,35 @@ body.chat-expanded #article-view{flex:1 0 auto;}
         </select>
         <input id="hours-custom" type="number" min="1" max="720" value="2" hidden aria-label="自定义小时数">
         <button type="button" id="collect-btn">刷新全部</button>
+        <span id="github-render-controls">
+          <button type="button" id="github-render-btn">生成图片</button>
+          <span class="platform-tabs" role="group" aria-label="配色">
+            <button type="button" class="seg active" id="gh-theme-dark" data-theme="dark">暗色</button>
+            <button type="button" class="seg" id="gh-theme-light" data-theme="light">浅色</button>
+          </span>
+          <label class="gh-swatch">主色<input id="gh-color-main" type="color" value="#06155A"></label>
+          <label class="gh-swatch">副色<input id="gh-color-secondary" type="color" value="#101F63"></label>
+          <label class="gh-swatch">强调色<input id="gh-color-accent" type="color" value="#F3F0E8"></label>
+        </span>
         <button type="button" id="translate-btn">翻译标题</button>
       </div>
     </div>
-    <div id="rank-tabs" class="platform-tabs" role="tablist" aria-label="排序方式">
-      <button type="button" class="seg active" data-rank="heat" aria-selected="true">热度优先</button>
-      <button type="button" class="seg" data-rank="time" aria-selected="false">时间优先</button>
+    <div class="rank-toolbar">
+      <div id="rank-tabs" class="platform-tabs" role="tablist" aria-label="排序方式">
+        <button type="button" class="seg active" data-rank="heat" aria-selected="true">热度优先</button>
+        <button type="button" class="seg" data-rank="time" aria-selected="false">时间优先</button>
+      </div>
+      <button type="button" id="open-original-btn" disabled>打开原文</button>
     </div>
     <div id="hotspot-pane">
+      <div id="skill-search-row">
+        <input id="skill-query" type="text" maxlength="200" aria-label="Skill 查找关键词">
+        <button type="button" id="skill-search-btn">查找</button>
+      </div>
+      <ul id="skill-stage-chips" aria-label="覆盖阶段"></ul>
       <ul id="hotspot-list"></ul>
+      <ul id="github-list"></ul>
+      <ul id="skill-list"></ul>
       <p id="hotspot-status" role="status" aria-live="polite"></p>
     </div>
     <div id="source-health-wrap">
@@ -537,11 +997,11 @@ body.chat-expanded #article-view{flex:1 0 auto;}
   <section class="panel" id="article-panel" aria-labelledby="h-article">
     <h2 id="h-article" class="sr-only">文章</h2>
     <div class="panel-header">
-      <div class="platform-tabs" role="group" aria-label="平台选择">
-        <button type="button" id="seg-wechat" class="seg active" data-platform="wechat" aria-pressed="true">微信</button>
-        <button type="button" id="seg-xhs" class="seg" data-platform="xiaohongshu" aria-pressed="false">小红书</button>
-      </div>
       <div class="row">
+      <select id="prompt-style-select" aria-label="生成风格" title="生成风格">
+        <option value="AI专家" selected>AI专家</option>
+        <option value="经验分享">经验分享</option>
+      </select>
       <button type="button" id="find-hooks-btn" disabled>找切口</button>
       <button type="button" id="generate-btn" class="btn-magic" disabled>生成文章</button>
       </div>
@@ -549,18 +1009,54 @@ body.chat-expanded #article-view{flex:1 0 auto;}
     <p id="article-status" role="status" aria-live="polite"></p>
     <ul id="hook-list" hidden></ul>
     <p id="article-empty">尚未生成文章</p>
+    <div id="github-studio">
+      <div class="gh-toolbar">
+        <button type="button" id="github-select-all" disabled>全选</button>
+        <button type="button" id="github-export-btn" disabled>导出选中图片</button>
+        <button type="button" id="github-copy-btn" disabled>复制小红书文案</button>
+      </div>
+      <div id="github-gallery" class="gh-gallery"></div>
+      <label class="article-field">小红书标题<input id="github-xhs-title" type="text" readonly value="本周值得关注的github ai项目前10"></label>
+      <label class="article-field">小红书正文<textarea id="github-xhs-body" rows="12"></textarea></label>
+      <canvas id="github-canvas" hidden></canvas>
+    </div>
+    <div id="skills-studio">
+      <div id="skills-article">
+        <h3 id="skills-title">介绍文</h3>
+        <div id="skills-body">查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。</div>
+      </div>
+      <div class="gh-toolbar">
+        <button type="button" id="skills-render-btn">生成图片</button>
+        <button type="button" id="skills-select-all" disabled>全选</button>
+        <button type="button" id="skills-export-btn" disabled>导出选中图片</button>
+      </div>
+      <div id="skills-gallery" class="gh-gallery"></div>
+    </div>
     <article id="article-view">
       <div id="article-scroll" class="article-scroll" hidden>
         <label class="article-field">标题<input id="article-title" type="text"></label>
         <div id="image-picker" hidden>
           <div class="image-picker-head">
-            <p class="panel-sub">原文配图。点击预览可看大图；封面和正文分开选；1–2 张也能用，多的全部列出由你挑。</p>
+            <p class="panel-sub">原文配图。点击预览可看大图；勾选封面和正文。默认只勾选封面，正文图需另行勾选。</p>
             <button type="button" id="image-rescan">重新扫描</button>
           </div>
           <div id="image-picker-list"></div>
           <p id="image-picker-status" role="status"></p>
         </div>
-        <label class="article-field">正文<textarea id="article-body" rows="14"></textarea></label>
+        <div id="xhs-studio" hidden>
+          <div class="xhs-toolbar">
+            <button type="button" id="xhs-export-btn" disabled>导出图片</button>
+          </div>
+          <div id="xhs-cards" class="xhs-cards"></div>
+          <canvas id="xhs-canvas" hidden></canvas>
+        </div>
+        <div class="article-field">
+          <div class="article-field-head">
+            <span>正文</span>
+            <button type="button" id="related-search-btn" disabled>相关检索</button>
+          </div>
+          <textarea id="article-body" rows="14"></textarea>
+        </div>
         <p id="article-sources" class="article-meta muted"></p>
         <p id="draft-id" class="muted"></p>
       </div>
@@ -570,9 +1066,9 @@ body.chat-expanded #article-view{flex:1 0 auto;}
           <select id="article-model" class="model-picker" aria-label="文章模型"></select>
         </div>
         <div class="row">
-          <input id="schedule-at" type="datetime-local" aria-label="定时发布时间">
-          <button type="button" id="schedule-btn" disabled>定时发布</button>
-          <button type="button" id="publish-btn" disabled class="primary">发布</button>
+          <input id="schedule-at" type="datetime-local" aria-label="定时到草稿时间">
+          <button type="button" id="schedule-btn" disabled>定时到草稿</button>
+          <button type="button" id="publish-btn" disabled class="primary">到草稿</button>
         </div>
       </div>
       <p id="publish-status" role="status" aria-live="polite"></p>
@@ -582,16 +1078,9 @@ body.chat-expanded #article-view{flex:1 0 auto;}
         <button type="button" id="creator-btn">打开官方创作中心</button>
       </div>
     </article>
-    <div class="chat-section" aria-label="对话">
-      <div class="chat-row">
-        <select id="chat-model" class="model-picker" aria-label="对话模型"></select>
-        <input id="chat-input" type="text" maxlength="20000" aria-label="对话消息">
-        <button type="button" id="chat-send-btn">发送</button>
-      </div>
-      <div id="chat-output" hidden aria-live="polite"></div>
-    </div>
   </section>
 </main>
+<aside id="picked-dock" hidden></aside>
 
 <dialog id="config-dialog" aria-labelledby="config-title">
   <form id="config-form" novalidate>
@@ -603,35 +1092,76 @@ body.chat-expanded #article-view{flex:1 0 auto;}
         <button type="button" class="seg" data-settings-page="accounts" role="tab" aria-selected="false">账号</button>
       </div>
       <fieldset class="settings-page" data-page="model">
-        <legend>添加模型接口</legend>
-        <p class="muted">和 Hermes 一样：填 OpenAI 兼容根地址和 API Key，连接后选模型。文章与对话可共用同一接口。</p>
-        <label>接口地址<input name="base_url" type="text" autocomplete="off"></label>
-        <label>API Key<input name="api_key" type="password" autocomplete="off"></label>
-        <div class="row">
-          <button type="button" id="endpoint-connect">连接并拉取模型</button>
+        <legend>模型</legend>
+        <p class="muted">文章、翻译、榜单、出图各自保存。先选提供方，再从下拉列表选模型。下方已保存的提供方可一键套到全部入口。</p>
+        <div class="purpose-stack">
+          <section class="purpose-card">
+            <h3>文章模型</h3>
+            <div class="purpose-grid">
+              <label>提供方<select name="article_provider"></select></label>
+              <label>模型<select name="model"></select></label>
+            </div>
+            <div class="purpose-actions">
+              <label>Effort<select name="effort">
+                <option value="none">none</option><option value="minimal">minimal</option>
+                <option value="low">low</option><option value="medium">medium</option>
+                <option value="high">high</option><option value="xhigh">xhigh</option>
+                <option value="max">max</option><option value="ultra">ultra</option>
+              </select></label>
+              <button type="button" id="endpoint-use-article">用于文章</button>
+            </div>
+          </section>
+          <section class="purpose-card">
+            <h3>翻译模型</h3>
+            <div class="purpose-grid">
+              <label>提供方<select name="translation_provider"></select></label>
+              <label>模型<select name="translation_model"></select></label>
+            </div>
+            <div class="purpose-actions">
+              <button type="button" id="endpoint-use-translation">用于翻译</button>
+            </div>
+          </section>
+          <section class="purpose-card">
+            <h3>榜单模型</h3>
+            <p class="muted">只改写周榜海报里的简介、能做什么、适合什么场景、如何实现。项目名、星标和封面模板不走模型。</p>
+            <div class="purpose-grid">
+              <label>提供方<select name="leaderboard_provider"></select></label>
+              <label>模型<select name="leaderboard_model"></select></label>
+            </div>
+            <div class="purpose-actions">
+              <button type="button" id="endpoint-use-leaderboard">用于榜单</button>
+            </div>
+          </section>
+          <section class="purpose-card">
+            <h3>出图模型</h3>
+            <p class="muted">选好后必须点「用于出图」保存。任意已接入模型都可以。周榜封面 3:4；项目卡与小红书纸卡仍为当前比例；图像模型默认仍 9:16。</p>
+            <div class="purpose-grid">
+              <label>提供方<select name="image_provider"></select></label>
+              <label>模型<select name="image_model"></select></label>
+            </div>
+            <div class="purpose-actions">
+              <button type="button" id="endpoint-use-image">用于出图</button>
+            </div>
+          </section>
         </div>
-        <div id="endpoint-assign" hidden>
-          <div class="row">
-            <label style="flex:1 1 180px">文章模型<select name="model"></select></label>
-            <label style="flex:0 1 120px">Effort<select name="effort">
-              <option value="none">none</option><option value="minimal">minimal</option>
-              <option value="low">low</option><option value="medium">medium</option>
-              <option value="high">high</option><option value="xhigh">xhigh</option>
-              <option value="max">max</option><option value="ultra">ultra</option>
-            </select></label>
-          </div>
-          <div class="row">
-            <label style="flex:1 1 180px">对话模型<select name="chat_model"></select></label>
-          </div>
-          <div class="row">
-            <button type="button" id="endpoint-use-article">用于文章</button>
-            <button type="button" id="endpoint-use-chat">用于对话</button>
+        <div class="provider-section">
+          <p class="muted">已保存提供方。点开后用下拉列表选模型，可一键配置全部入口。</p>
+          <ul id="provider-list"></ul>
+          <ul id="endpoint-list" hidden></ul>
+          <button type="button" id="provider-add">添加自定义提供方</button>
+          <div id="provider-editor" hidden>
+            <strong id="provider-editor-title">自定义提供方</strong>
+            <label>API Key<input name="api_key" type="password" autocomplete="off"></label>
+            <p id="api-key-hint" class="muted">已保存的密钥不会回显，留空表示保持原值。</p>
+            <label>接口地址<input name="base_url" type="text" autocomplete="off"></label>
+            <div class="purpose-actions">
+              <button type="button" id="endpoint-connect">获取可用模型</button>
+              <button type="button" id="provider-apply" class="primary">保存提供方</button>
+              <button type="button" id="provider-cancel">取消</button>
+              <button type="button" id="provider-remove">删除</button>
+            </div>
           </div>
         </div>
-      </fieldset>
-      <fieldset class="settings-page" data-page="model" id="model-endpoint-settings">
-        <legend>已保存接口</legend>
-        <ul id="endpoint-list"></ul>
         <p id="model-endpoint-status" role="status" aria-live="polite"></p>
       </fieldset>
       <fieldset class="settings-page" data-page="style" hidden>
@@ -649,19 +1179,30 @@ body.chat-expanded #article-view{flex:1 0 auto;}
         </div>
         <div id="settings-wechat" class="settings-panel">
           <p id="wechat-status" class="muted">微信公众号 API：未配置</p>
-          <label>App ID<input name="app_id" type="text"></label>
-          <label>App Secret<input name="app_secret" type="password"></label>
-          <label>Thumb Media ID<input name="thumb_media_id" type="text"></label>
-          <label>作者（可选）<input name="author" type="text"></label>
+          <div id="wechat-form" class="account-form">
+            <label>App ID<input name="app_id" type="text" autocomplete="off"></label>
+            <label>App Secret<input name="app_secret" type="password" autocomplete="off"></label>
+            <label>默认封面 Media ID（可选）<input name="thumb_media_id" type="text" autocomplete="off"></label>
+            <p class="muted">一般不用填。点「到草稿」时会把已选原文配图上传成封面；没有已选配图时才生成标题大字报；再没有才用这里的备用 ID。</p>
+            <label>作者（可选）<input name="author" type="text" autocomplete="off"></label>
+          </div>
+          <button type="button" id="wechat-delete" class="account-delete" hidden>删除配置</button>
         </div>
         <div id="settings-xiaohongshu" class="settings-panel" hidden>
-          <label>账号名称（可选）<input name="account_name" type="text"></label>
-          <label>官方创作中心<input name="creator_url" type="text"></label>
+          <p id="xhs-status" class="muted">小红书：未填写账号名称</p>
+          <div id="xhs-form" class="account-form">
+            <label>账号名称（可选）<input name="account_name" type="text" autocomplete="off"></label>
+            <label>官方创作中心<input name="creator_url" type="text" autocomplete="off"></label>
+          </div>
+          <button type="button" id="xhs-delete" class="account-delete" hidden>删除配置</button>
         </div>
         <div id="settings-x" class="settings-panel" hidden>
-          <p id="x-status" class="muted">X 官方读取令牌：未配置。只读 Bearer，留在进程内存，重启需重填。</p>
-          <label>Bearer Token<input name="x_bearer_token" type="password" autocomplete="off"></label>
-          <p class="muted">用于读取已启用的 X 账号时间线。不爬网页。S4 讨论号可直接开；S1/S2 仍要先人工确认身份。</p>
+          <p id="x-status" class="muted">X 官方读取令牌：未配置</p>
+          <div id="x-form" class="account-form">
+            <label>Bearer Token<input name="x_bearer_token" type="password" autocomplete="off"></label>
+            <p class="muted">用于读取已启用的 X 账号时间线。不爬网页。S4 讨论号可直接开；S1/S2 仍要先人工确认身份。</p>
+          </div>
+          <button type="button" id="x-delete" class="account-delete" hidden>删除配置</button>
         </div>
       </fieldset>
       <p id="config-error" role="alert"></p>
@@ -671,6 +1212,30 @@ body.chat-expanded #article-view{flex:1 0 auto;}
       <button type="button" id="config-cancel">关闭</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="original-dialog" class="original-dialog" aria-labelledby="original-title">
+  <div class="original-page">
+    <div class="original-head">
+      <h2 id="original-title">候选原文</h2>
+      <div class="original-head-actions">
+        <button type="button" id="original-translate">翻译文章</button>
+        <button type="button" id="original-close" aria-label="关闭" title="关闭">×</button>
+      </div>
+    </div>
+    <div id="original-sources" class="row"></div>
+    <div id="original-scroll" role="document">
+      <p id="original-note"></p>
+      <section class="original-section">
+        <h3>原文</h3>
+        <div id="original-content"></div>
+      </section>
+      <section id="original-translation-wrap" class="original-section" hidden>
+        <h3>中文翻译</h3>
+        <div id="original-translation"></div>
+      </section>
+    </div>
+  </div>
 </dialog>
 
 <dialog id="image-lightbox" aria-label="图片放大预览">
@@ -690,10 +1255,14 @@ body.chat-expanded #article-view{flex:1 0 auto;}
 var state = {
   hours: 4,
   rank: "heat",
+  lane: "hotspots",
+  newsStyle: "AI专家",
   rankings: {heat: [], time: []},
   sources: [],
   platform: "wechat",
   item: null,
+  pickedIds: {},
+  favoriteIds: {},
   draft: null,
   lightboxIndex: 0,
   creatorUrl: "",
@@ -707,9 +1276,26 @@ var state = {
     creatorUrl: "https://creator.xiaohongshu.com/publish/publish",
   },
   llm: {model: "", base_url: "", effort: "none", configured: false},
-  chat: {model: "", base_url: "", configured: false},
+  translation: {model: "", base_url: "", configured: false, enabled: false},
+  leaderboard: {model: "", base_url: "", configured: false, enabled: false},
+  image: {model: "", base_url: "", configured: false, enabled: false},
+  newsSupplements: [],
+  articleSessions: {},
+  articleLastKeys: {},
+  articleRequestGen: 0,
+  relatedSearchGen: 0,
+  githubWeekly: {repos: [], xhs_title: "本周值得关注的github ai项目前10", xhs_body: ""},
+  githubTheme: "dark",
+  skillsPackage: {query: "", title: "", theme: "", stages: [], skills: [], article: {title: "", body: ""}, images: []},
   modelEndpoints: [],
-  chatMessages: [],
+  platforms: {wechat: {configured: false}, xiaohongshu: {account_configured: false}, x: {configured: false}},
+  providerDraft: {open: false, mode: "add", endpointId: "", models: []},
+  originalGen: 0,
+  originalItemId: "",
+  originalTranslatable: false,
+  newsFocus: null,
+  hotspotGen: 0,
+  collectGen: 0,
 };
 
 function $(id) { return document.getElementById(id); }
@@ -722,11 +1308,24 @@ function el(tag, className, text) {
 }
 
 function busy(button, on) {
+  if (!button) { return; }
+  if (button._busyTimer) { clearInterval(button._busyTimer); button._busyTimer = null; }
   if (button.dataset.originalLabel === undefined) {
     button.dataset.originalLabel = button.textContent;
   }
   button.disabled = on;
-  button.textContent = on ? "处理中…" : button.dataset.originalLabel;
+  if (!on) {
+    button.textContent = button.dataset.originalLabel;
+    delete button.dataset.originalLabel;
+    return;
+  }
+  var started = Date.now();
+  function tick() {
+    var s = Math.max(0, Math.floor((Date.now() - started) / 1000));
+    button.textContent = "处理中…" + (s ? " " + s + "s" : "");
+  }
+  tick();
+  button._busyTimer = setInterval(tick, 1000);
 }
 
 function status(id, text, kind) {
@@ -735,18 +1334,207 @@ function status(id, text, kind) {
   node.className = kind ? "status-" + kind : "";
 }
 
+var WAIT_HINTS = {
+  collect: {title: "正在抓取订阅源", hint: "通常 10–30 秒，源越多越久"},
+  collect_one: {title: "正在刷新这一路订阅", hint: "通常几秒到十几秒"},
+  viewpoints: {title: "正在抓取 Reddit 热帖", hint: "通常 10–30 秒"},
+  translate: {title: "正在翻译标题", hint: "通常 5–20 秒，看条数和模型"},
+  github_fetch: {title: "正在抓取 GitHub 周榜", hint: "通常 5–20 秒；配了榜单模型会再改写简介"},
+  github_render: {title: "正在生成周榜图片", hint: "每张大约 8–25 秒；11 张大约 2–5 分钟", unit: "张"},
+  generate: {title: "正在生成文章", hint: "通常 15–90 秒，看模型和篇幅"},
+  hooks: {title: "正在找切口", hint: "通常 10–40 秒"},
+  related_search: {title: "正在检索相关新闻", hint: "通常几秒到几十秒"},
+  original: {title: "正在读取原文", hint: "通常几秒"},
+  original_tr: {title: "正在翻译原文", hint: "通常 10–40 秒"},
+  models: {title: "正在获取可用模型", hint: "通常几秒到十几秒"},
+  publish: {title: "正在写入草稿", hint: "通常 5–20 秒", unit: "步"},
+  schedule: {title: "正在预约发布", hint: "通常几秒"},
+  rescan: {title: "正在扫描配图", hint: "通常几秒到十几秒"},
+  export: {title: "正在导出图片", hint: "按张下载，通常几秒"},
+  save: {title: "正在保存", hint: "通常一两秒"},
+  assign: {title: "正在保存模型配置", hint: "通常一两秒"},
+  skill_search: {title: "正在查找 Skill", hint: "通常 20–60 秒；超时会先交已找到的结果"},
+  skill_render: {title: "正在生成技能包图片", hint: "封面大字报加项目卡，大约半分钟到几分钟", unit: "张"}
+};
+var waitJobs = {};
+var waitState = {timer: null};
+
+function formatElapsed(ms) {
+  var s = Math.max(0, Math.floor(ms / 1000));
+  var m = Math.floor(s / 60);
+  s = s % 60;
+  return m ? (m + " 分 " + s + " 秒") : (s + " 秒");
+}
+
+function abortController() {
+  if (typeof AbortController === "function") { return new AbortController(); }
+  return {signal: undefined, abort: function () {}};
+}
+
+function waitRunning(kind) {
+  return !!(waitJobs[kind] && waitJobs[kind].status === "running");
+}
+
+function waitCancelled(kind) {
+  return !!(waitJobs[kind] && waitJobs[kind].cancelled);
+}
+
+function waitSignal(kind) {
+  var job = waitJobs[kind];
+  return job && job.abort ? job.abort.signal : undefined;
+}
+
+function isWaitAbort(error, kind) {
+  if (waitCancelled(kind)) { return true; }
+  return !!(error && (error.name === "AbortError" || error.code === 20));
+}
+
+function resolveWaitJob(kind) {
+  if (kind && waitJobs[kind]) { return waitJobs[kind]; }
+  var running = [];
+  Object.keys(waitJobs).forEach(function (key) {
+    if (waitJobs[key].status === "running") { running.push(waitJobs[key]); }
+  });
+  return running.length === 1 ? running[0] : null;
+}
+
+function waitStart(kind, opts) {
+  opts = opts || {};
+  var spec = WAIT_HINTS[kind] || {title: "处理中", hint: "请稍候"};
+  if (waitRunning(kind)) { return waitJobs[kind]; }
+  waitJobs[kind] = {
+    kind: kind,
+    status: "running",
+    started: Date.now(),
+    current: opts.current || 0,
+    total: opts.total || 0,
+    step: opts.step || "",
+    unit: opts.unit || spec.unit || "步",
+    title: opts.title || spec.title,
+    hint: spec.hint,
+    cancelled: false,
+    abort: abortController()
+  };
+  paintWait();
+  if (!waitState.timer) { waitState.timer = setInterval(paintWait, 250); }
+  return waitJobs[kind];
+}
+
+function waitProgress(current, total, step, kind) {
+  var job = resolveWaitJob(kind);
+  if (!job || job.status !== "running") { return; }
+  job.current = current;
+  if (total) { job.total = total; }
+  job.step = step || "";
+  paintWait();
+}
+
+function waitDone(message, kind) {
+  var job = resolveWaitJob(kind);
+  if (!job) { return; }
+  job.status = "done";
+  job.title = message || "全部完成";
+  job.finished = Date.now();
+  paintWait();
+  scheduleWaitHide(job.kind);
+}
+
+function waitFail(message, kind) {
+  var job = resolveWaitJob(kind);
+  if (!job) { return; }
+  job.status = "error";
+  job.title = job.cancelled ? "已停止" : "没有完成";
+  job.hint = message || "请求失败";
+  job.finished = Date.now();
+  paintWait();
+  scheduleWaitHide(job.kind);
+}
+
+function waitStop(kind) {
+  var job = waitJobs[kind];
+  if (!job || job.status !== "running") { return; }
+  job.cancelled = true;
+  try { job.abort.abort(); } catch (err) {}
+  waitFail("已停止", kind);
+}
+
+function scheduleWaitHide(kind) {
+  window.setTimeout(function () {
+    var job = waitJobs[kind];
+    if (!job || job.status === "running") { return; }
+    delete waitJobs[kind];
+    paintWait();
+  }, 2400);
+}
+
+function paintWait() {
+  var banner = $("wait-banner");
+  var dock = $("wait-jobs");
+  if (!banner || !dock) { return; }
+  var kinds = Object.keys(waitJobs);
+  if (!kinds.length) {
+    banner.hidden = true;
+    if (waitState.timer) { clearInterval(waitState.timer); waitState.timer = null; }
+    return;
+  }
+  banner.hidden = false;
+  kinds.forEach(function (kind) {
+    var job = waitJobs[kind];
+    var card = dock.querySelector('[data-kind="' + kind + '"]');
+    if (!card) {
+      card = el("article", "wait-job");
+      card.setAttribute("data-kind", kind);
+      card.innerHTML = '<div class="wait-spinner" aria-hidden="true"></div>'
+        + '<div class="wait-copy"><p class="wait-title"></p><p class="wait-detail"></p></div>'
+        + '<p class="wait-time"></p>'
+        + '<button type="button" class="wait-stop">停止</button>';
+      card.querySelector(".wait-stop").addEventListener("click", function () { waitStop(kind); });
+      dock.appendChild(card);
+    }
+    card.className = "wait-job" + (job.status === "done" ? " is-done" : "") + (job.status === "error" ? " is-error" : "");
+    card.querySelector(".wait-title").textContent = job.title;
+    var detail = job.hint;
+    if (job.status === "running" && kind === "skill_search") {
+      var progress = (state.skillsPackage && state.skillsPackage.progress) || {};
+      if (progress.step_index || progress.label) {
+        detail = "第 " + (progress.step_index || 1) + "/" + (progress.step_total || 7) + " 步 · " + (progress.label || "查找中") + " · " + (progress.detail || job.hint);
+      } else {
+        detail = "查找中";
+      }
+    } else if (job.status === "running" && job.total) {
+      var current = Math.min(job.current, job.total);
+      detail = "第 " + current + " / " + job.total + " " + (job.unit || "步") + (job.step ? " · " + job.step : "") + " · " + job.hint;
+    } else if (job.status === "done") {
+      detail = "共用 " + formatElapsed((job.finished || Date.now()) - job.started);
+    }
+    card.querySelector(".wait-detail").textContent = detail;
+    card.querySelector(".wait-time").textContent = job.status === "done" ? "" : ("已用 " + formatElapsed(Date.now() - job.started));
+    card.querySelector(".wait-stop").hidden = job.status !== "running";
+  });
+  Array.prototype.slice.call(dock.children).forEach(function (card) {
+    if (!waitJobs[card.getAttribute("data-kind")]) { card.remove(); }
+  });
+}
+
 function formatTime(iso) {
   var date = new Date(iso);
   if (isNaN(date.getTime())) { return iso || ""; }
   return date.toLocaleString();
 }
 
-function api(path, payload) {
-  return fetch(path, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload || {}),
-  }).then(function (response) {
+function api(path, payload, opts) {
+  opts = opts || {};
+  var method = (opts.method || "POST").toUpperCase();
+  var init = {
+    method: method,
+    headers: {},
+    signal: opts.signal
+  };
+  if (method !== "GET") {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(payload || {});
+  }
+  return fetch(path, init).then(function (response) {
     return response.json().catch(function () { return {}; }).then(function (data) {
       if (!response.ok || data.ok === false) {
         var error = new Error(data.error_reason || data.error || ("HTTP " + response.status));
@@ -758,9 +1546,14 @@ function api(path, payload) {
       return data;
     });
   }).catch(function (error) {
+    if (error && error.name === "AbortError") { throw error; }
     if (error instanceof TypeError && !error.apiError) { throw new Error("网络错误"); }
     throw error;
   });
+}
+
+function waitApi(kind, path, payload) {
+  return api(path, payload, {signal: waitSignal(kind)});
 }
 
 function sourceStatusLabel(status) {
@@ -830,23 +1623,37 @@ function setRank(rank) {
 
 function renderHotspots(items) {
   var list = $("hotspot-list");
+  var selectedId = state.item ? state.item.item_id : "";
+  var selectedItem = null;
   list.textContent = "";
   if (!items.length) {
+    if (selectedId) { clearHotspotSelection(true); }
     var empty = el("li", "hotspot-empty");
     empty.appendChild(el("p", "ht-title", "当前时间范围内没有话题或新闻"));
     empty.appendChild(el("p", "ht-summary", "可以拉长上方时间范围，或点「刷新全部」去各订阅源重新抓取。底部「抓取成功 / 只刷这个」只表示订阅健康，不是新闻标题。"));
     list.appendChild(empty);
     scheduleFitHotspotList();
+    if (typeof renderPickedDock === "function") renderPickedDock();
     return;
   }
   items.forEach(function (item, index) {
     var button = el("button", "hotspot-item");
+    var selected = item.item_id === selectedId;
+    if (selected) { selectedItem = item; }
     button.type = "button";
     button.setAttribute("data-item-id", item.item_id);
-    button.setAttribute("aria-pressed", "false");
+    button.setAttribute("aria-pressed", String(selected));
+    button.classList.toggle("selected", selected);
+    button.classList.toggle("is-picked", !!state.pickedIds[item.item_id]);
     button.appendChild(el("span", "idx", (index + 1) + "."));
     button.appendChild(el("span", "ht-label", "原文"));
-    button.appendChild(el("span", "ht-title", item.title));
+    var title = el("span", "ht-title", item.title);
+    title.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      togglePicked(item.item_id);
+    });
+    button.appendChild(title);
     button.appendChild(el("span", "ht-summary", item.summary));
     var originalCjk = /[\u3400-\u9fff]/.test(String(item.title || ""));
     if (!originalCjk) {
@@ -855,7 +1662,7 @@ function renderHotspots(items) {
         button.appendChild(el("span", "ht-title", item.title_zh));
         button.appendChild(el("span", "ht-summary", item.summary_zh));
       } else {
-        var unavailable = (state.llm && state.llm.configured) ? "未翻译，可点上方「翻译标题」" : "未翻译（未配置模型）";
+        var unavailable = state.translation.enabled ? "未翻译，可点上方「翻译标题」" : "未翻译（未配置翻译模型）";
         if (item.translation_error_reason || item.translation_error_code) {
           unavailable += "（" + (item.translation_error_reason || item.translation_error_code);
           if (item.translation_error_reason && item.translation_error_code) {
@@ -882,10 +1689,23 @@ function renderHotspots(items) {
     button.appendChild(el("span", "ht-meta", meta));
     button.addEventListener("click", function () { selectHotspot(item, button); });
     var li = document.createElement("li");
+    li.className = "hotspot-row";
     li.appendChild(button);
+    li.appendChild(starButton(item));
     list.appendChild(li);
   });
+  if (selectedItem) {
+    state.item = selectedItem;
+  } else if (selectedId) {
+    var favorite = state.favoriteIds && state.favoriteIds[selectedId];
+    if (favorite) {
+      state.item = favorite;
+    } else {
+      clearHotspotSelection(true);
+    }
+  }
   scheduleFitHotspotList();
+  if (typeof renderPickedDock === "function") renderPickedDock();
 }
 
 function scheduleFitHotspotList() {
@@ -917,7 +1737,23 @@ function fitHotspotList() {
   }
 }
 
+function publishButtonLabel() {
+  return state.platform === "wechat" ? "到草稿" : "发布";
+}
+
+function scheduleButtonLabel() {
+  return state.platform === "wechat" ? "定时到草稿" : "定时发布";
+}
+
+function applyPublishLabels() {
+  $("publish-btn").dataset.originalLabel = publishButtonLabel();
+  $("publish-btn").textContent = publishButtonLabel();
+  $("schedule-btn").dataset.originalLabel = scheduleButtonLabel();
+  $("schedule-btn").textContent = scheduleButtonLabel();
+}
+
 function resetArticle() {
+  invalidateRelatedSearch();
   state.draft = null;
   state.creatorUrl = "";
   state.pendingPublish = false;
@@ -929,14 +1765,100 @@ function resetArticle() {
   $("image-picker-list").textContent = "";
   $("article-title").value = "";
   $("article-body").value = "";
-  $("publish-btn").dataset.originalLabel = "发布";
-  $("publish-btn").textContent = "发布";
+  $("xhs-studio").hidden = true;
+  $("xhs-cards").textContent = "";
+  $("xhs-export-btn").disabled = true;
+  applyPublishLabels();
   $("publish-btn").disabled = true;
   $("schedule-btn").disabled = true;
   $("manual-box").hidden = true;
   $("save-article-btn").disabled = true;
+  if ($("related-search-btn")) { $("related-search-btn").disabled = true; }
   status("article-status", "");
   status("publish-status", "");
+}
+
+function articleContextKey(lane, platform) {
+  return String(lane || "hotspots") + "|" + String(platform || "wechat");
+}
+
+function articleTargetIds() {
+  var picked = pickedIdList();
+  if (picked.length) { return picked; }
+  return state.item && state.item.item_id ? [String(state.item.item_id)] : [];
+}
+
+function articleSessionKey(lane, platform, ids) {
+  return articleContextKey(lane, platform) + "|" + (ids || []).slice().sort().join(",");
+}
+
+function currentArticleSessionKey() {
+  var context = articleContextKey(state.lane, state.platform);
+  return state.articleLastKeys[context] || articleSessionKey(state.lane, state.platform, articleTargetIds());
+}
+
+function rememberArticleSession(lane) {
+  if (lane !== "hotspots" && lane !== "viewpoints") { return ""; }
+  var ids = articleTargetIds();
+  var context = articleContextKey(lane, state.platform);
+  var key = ids.length ? articleSessionKey(lane, state.platform, ids) : (state.articleLastKeys[context] || "");
+  if (!key) { return ""; }
+  state.articleSessions[key] = {
+    item: state.item,
+    draft: state.draft,
+    title: $("article-title").value,
+    body: $("article-body").value,
+    articleDirty: state.articleDirty,
+    creatorUrl: state.creatorUrl,
+  };
+  state.articleLastKeys[context] = key;
+  return key;
+}
+
+function storeGeneratedArticle(key, data, item) {
+  state.articleSessions[key] = {
+    item: item || null,
+    draft: data,
+    title: data.title || "",
+    body: data.body || "",
+    articleDirty: false,
+    creatorUrl: "",
+  };
+  var separator = key.indexOf("|");
+  var context = separator >= 0 ? key.slice(0, key.lastIndexOf("|")) : key;
+  state.articleLastKeys[context] = key;
+}
+
+function restoreArticleSession(lane) {
+  if (lane !== "hotspots" && lane !== "viewpoints") { return false; }
+  var key = state.articleLastKeys[articleContextKey(lane, state.platform)] || "";
+  var session = key ? state.articleSessions[key] : null;
+  if (!session) {
+    resetArticle();
+    return false;
+  }
+  state.item = session.item || null;
+  state.draft = session.draft || null;
+  state.creatorUrl = session.creatorUrl || "";
+  state.articleDirty = !!session.articleDirty;
+  if (!state.draft) {
+    resetArticle();
+    $("find-hooks-btn").disabled = !state.item;
+    $("open-original-btn").disabled = !state.item;
+    syncGenerateEnabled();
+    return false;
+  }
+  renderArticle(state.draft);
+  $("article-title").value = session.title || "";
+  $("article-body").value = session.body || "";
+  state.articleDirty = !!session.articleDirty;
+  $("publish-btn").disabled = false;
+  $("schedule-btn").disabled = false;
+  $("find-hooks-btn").disabled = !state.item;
+  $("open-original-btn").disabled = !state.item;
+  syncGenerateEnabled();
+  syncRelatedSearchEnabled();
+  return true;
 }
 
 function normalizeBaseUrl(value) {
@@ -978,7 +1900,7 @@ function renderMainModelPicker(id, settings) {
   state.modelEndpoints.forEach(function (endpoint) {
     (endpoint.models || []).forEach(function (model) {
       hasModels = true;
-      var option = el("option", "", model + " · " + endpoint.base_url);
+      var option = el("option", "", model);
       option.value = modelChoice(endpoint.id, model);
       option.selected = option.value === currentValue;
       select.appendChild(option);
@@ -1000,73 +1922,191 @@ function renderModelPicker() {
   renderMainModelPicker("article-model", state.llm);
 }
 
-function renderChatModelPicker() {
-  renderMainModelPicker("chat-model", state.chat);
-}
-
-function renderSettingsModels(purpose, models, selected) {
-  var form = $("config-form");
-  var select = form.elements[purpose === "article" ? "model" : "chat_model"];
-  var values = (models || []).slice();
-  if (selected && values.indexOf(selected) < 0) { selected = values[0] || ""; }
+function fillSelect(select, items, selected, emptyLabel) {
   select.textContent = "";
-  if (!values.length) {
-    var empty = el("option", "", "先连接接口");
+  if (!items.length) {
+    var empty = el("option", "", emptyLabel || "未配置");
     empty.value = "";
     empty.disabled = true;
     empty.selected = true;
     select.appendChild(empty);
     return;
   }
-  values.forEach(function (model) {
-    var option = el("option", "", model);
-    option.value = model;
-    option.selected = model === selected;
+  items.forEach(function (item) {
+    var option = el("option", "", item.label);
+    option.value = item.value;
+    option.selected = item.value === selected;
     select.appendChild(option);
   });
 }
 
-function renderEndpointLists() {
-  var list = $("endpoint-list");
-  if (!list) { return; }
-  list.textContent = "";
-  if (!state.modelEndpoints.length) {
-    list.appendChild(el("li", "muted", "还没有保存的接口"));
-    return;
-  }
-  state.modelEndpoints.forEach(function (endpoint) {
-    var card = el("li", "endpoint-card");
-    card.appendChild(el("div", "endpoint-url", endpointLabel(endpoint)));
-    var row = el("div", "row");
-    var use = el("button", "", "选用");
-    use.type = "button";
-    use.addEventListener("click", function () { reuseEndpoint(endpoint.id); });
-    var del = el("button", "", "删除");
-    del.type = "button";
-    del.addEventListener("click", function () { deleteEndpoint(endpoint.id); });
-    row.appendChild(use);
-    row.appendChild(del);
-    card.appendChild(row);
-    list.appendChild(card);
+function providerOptions() {
+  return state.modelEndpoints.map(function (endpoint) {
+    return {value: endpoint.id, label: providerHost(endpoint)};
   });
 }
 
-function fillDiscoveredModels(models) {
-  var form = $("config-form");
-  renderSettingsModels("article", models, state.llm.model);
-  renderSettingsModels("chat", models, state.chat.model);
-  $("endpoint-assign").hidden = false;
+function modelOptions(endpoint) {
+  return ((endpoint && endpoint.models) || []).map(function (model) {
+    return {value: model, label: model};
+  });
 }
 
-function reuseEndpoint(endpointId) {
-  var endpoint = state.modelEndpoints.find(function (item) { return item.id === endpointId; });
-  if (!endpoint) { return; }
+function fillPurposePickers() {
   var form = $("config-form");
-  form.dataset.endpointId = endpoint.id;
-  form.base_url.value = endpoint.base_url;
+  if (!form) { return; }
+  var pairs = [
+    ["article", "article_provider", "model", state.llm],
+    ["translation", "translation_provider", "translation_model", state.translation],
+    ["leaderboard", "leaderboard_provider", "leaderboard_model", state.leaderboard],
+    ["image", "image_provider", "image_model", state.image],
+  ];
+  pairs.forEach(function (pair) {
+    var providerSelect = form.elements[pair[1]];
+    var modelSelect = form.elements[pair[2]];
+    var settings = pair[3];
+    var current = endpointForState(settings);
+    fillSelect(providerSelect, providerOptions(), current ? current.id : "", "先添加提供方");
+    fillSelect(
+      modelSelect,
+      modelOptions(current),
+      pair[0] === "translation" ? (state.translation.model || state.llm.model) : (settings.model || ""),
+      "先选择提供方"
+    );
+  });
+}
+
+function onPurposeProviderChange(purpose) {
+  var form = $("config-form");
+  var names = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider", image: "image_provider"};
+  var models = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
+  var endpoint = state.modelEndpoints.find(function (item) {
+    return item.id === form.elements[names[purpose]].value;
+  });
+  fillSelect(form.elements[models[purpose]], modelOptions(endpoint), "", "选择模型");
+}
+
+function renderSettingsModels(purpose, models, selected) {
+  var form = $("config-form");
+  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
+  var select = form.elements[names[purpose]];
+  fillSelect(
+    select,
+    (models || []).map(function (model) { return {value: model, label: model}; }),
+    selected,
+    "先选择提供方"
+  );
+}
+
+function providerHost(endpoint) {
+  try {
+    return new URL(endpoint.base_url).host || endpoint.base_url;
+  } catch (error) {
+    return endpoint.base_url;
+  }
+}
+
+function endpointPurposeTags(endpoint) {
+  var tags = [];
+  var article = endpointForState(state.llm);
+  var translation = endpointForState(state.translation);
+  if (article && article.id === endpoint.id) { tags.push("文章"); }
+  if (translation && translation.id === endpoint.id) { tags.push("翻译"); }
+  var leaderboard = endpointForState(state.leaderboard);
+  if (leaderboard && leaderboard.id === endpoint.id) { tags.push("榜单"); }
+  var imageEp = endpointForState(state.image);
+  if (imageEp && imageEp.id === endpoint.id) { tags.push("出图"); }
+  return tags;
+}
+
+function closeProviderEditor() {
+  state.providerDraft = {open: false, mode: "add", endpointId: "", models: []};
+  var form = $("config-form");
+  form.dataset.endpointId = "";
+  form.base_url.value = "";
   form.api_key.value = "";
-  fillDiscoveredModels(endpoint.models || []);
-  status("model-endpoint-status", "已选用，选模型后点用于文章或用于对话", "ok");
+  $("provider-editor").hidden = true;
+  renderEndpointLists();
+}
+
+function openProviderEditor(mode, endpoint) {
+  state.providerDraft = {
+    open: true,
+    mode: mode,
+    endpointId: endpoint ? endpoint.id : "",
+    models: endpoint ? (endpoint.models || []).slice() : [],
+  };
+  var form = $("config-form");
+  form.dataset.endpointId = state.providerDraft.endpointId;
+  form.base_url.value = endpoint ? endpoint.base_url : "";
+  form.api_key.value = "";
+  $("api-key-hint").textContent = endpoint && endpoint.credential_available
+    ? "已保存的密钥不会回显，留空表示保持原值。"
+    : "输入 API Key。";
+  $("provider-editor-title").textContent = endpoint ? ("编辑 " + providerHost(endpoint)) : "自定义提供方";
+  $("provider-remove").hidden = !endpoint;
+  $("provider-editor").hidden = false;
+  renderEndpointLists();
+}
+
+function renderEndpointLists() {
+  var list = $("provider-list");
+  if (!list) { return; }
+  list.textContent = "";
+  if (!state.modelEndpoints.length) {
+    list.appendChild(el("li", "muted", "还没有保存的接口。点下方添加自定义提供方。"));
+    return;
+  }
+  state.modelEndpoints.forEach(function (endpoint) {
+    var expanded = state.providerDraft.endpointId === endpoint.id && state.providerDraft.mode === "pick";
+    var row = el("li", "provider-row" + (expanded ? " active" : ""));
+    var dot = el("span", "provider-dot" + (endpoint.credential_available ? " ok" : ""));
+    dot.title = endpoint.credential_available ? "API Key 已保存" : "缺少 API Key";
+    row.appendChild(dot);
+    var body = el("div", "provider-row-body");
+    body.appendChild(el("div", "provider-row-title", providerHost(endpoint)));
+    var tags = endpointPurposeTags(endpoint);
+    body.appendChild(el("div", "provider-row-meta", endpoint.models.length + " 个模型" + (tags.length ? " · " + tags.join(" / ") : "")));
+    body.addEventListener("click", function () { toggleProviderPick(endpoint); });
+    row.appendChild(body);
+    row.appendChild(el("span", "provider-tag", "自定义"));
+    if (expanded) {
+      var expand = el("div", "provider-expand");
+      var label = document.createElement("label");
+      label.appendChild(document.createTextNode("模型"));
+      var select = document.createElement("select");
+      select.id = "bulk-model";
+      fillSelect(select, modelOptions(endpoint), "", "选择模型");
+      label.appendChild(select);
+      expand.appendChild(label);
+      var applyAll = el("button", "primary", "一键配置全部入口");
+      applyAll.type = "button";
+      applyAll.addEventListener("click", function (event) {
+        event.stopPropagation();
+        bulkAssignEndpoint(endpoint.id, select.value);
+      });
+      var edit = el("button", "", "编辑接口");
+      edit.type = "button";
+      edit.addEventListener("click", function (event) {
+        event.stopPropagation();
+        openProviderEditor("edit", endpoint);
+      });
+      expand.appendChild(applyAll);
+      expand.appendChild(edit);
+      row.appendChild(expand);
+    }
+    list.appendChild(row);
+  });
+}
+
+function toggleProviderPick(endpoint) {
+  if (state.providerDraft.mode === "pick" && state.providerDraft.endpointId === endpoint.id) {
+    closeProviderEditor();
+    return;
+  }
+  $("provider-editor").hidden = true;
+  state.providerDraft = {open: true, mode: "pick", endpointId: endpoint.id, models: endpoint.models || []};
+  renderEndpointLists();
 }
 
 function connectEndpoint() {
@@ -1080,40 +2120,108 @@ function connectEndpoint() {
     return;
   }
   busy(button, true);
-  status("config-error", "正在连接接口…");
-  var payload = {purpose: "article", base_url: baseUrl, api_key: apiKey};
+  waitStart("models");
+  status("config-error", "正在获取可用模型…");
+  var payload = {purpose: "article", base_url: baseUrl, api_key: apiKey, persist: true};
   if (endpointId && !apiKey) { payload.endpoint_id = endpointId; }
-  api("/api/models", payload).then(function (data) {
+  waitApi("models", "/api/models", payload).then(function (data) {
     applyModelResponse(data);
     form.dataset.endpointId = data.endpoint_id || endpointId || "";
-    fillDiscoveredModels(data.models || []);
-    status("config-error", "已拉取 " + (data.models || []).length + " 个模型，选好后点用于文章或用于对话", "ok");
+    state.providerDraft.endpointId = form.dataset.endpointId;
+    state.providerDraft.models = data.models || [];
+    $("provider-remove").hidden = false;
+    status("config-error", "已保存 " + (data.models || []).length + " 个模型到下拉列表", "ok");
+    waitDone("已获取模型列表", "models");
   }).catch(function (error) {
-    status("config-error", showApiError("连接失败：", error), "error");
+    if (isWaitAbort(error, "models")) { return; }
+    status("config-error", showApiError("获取失败：", error), "error");
+    waitFail(error.message || "获取失败", "models");
+  }).then(function () { busy(button, false); });
+}
+
+function applyProvider() {
+  var form = $("config-form");
+  var button = $("provider-apply");
+  var baseUrl = form.base_url.value.trim();
+  var apiKey = form.api_key.value;
+  var endpointId = form.dataset.endpointId || "";
+  if (!baseUrl && !endpointId) {
+    status("config-error", "请先填写接口地址", "error");
+    return;
+  }
+  busy(button, true);
+  waitStart("save");
+  var payload = {purpose: "article", base_url: baseUrl, api_key: apiKey, persist: true};
+  if (endpointId && !apiKey) { payload.endpoint_id = endpointId; }
+  if (state.providerDraft.models && state.providerDraft.models.length) {
+    payload.models = state.providerDraft.models;
+  }
+  waitApi("save", "/api/models", payload).then(function (data) {
+    applyModelResponse(data);
+    form.dataset.endpointId = data.endpoint_id || endpointId || "";
+    state.providerDraft.endpointId = form.dataset.endpointId;
+    $("provider-remove").hidden = false;
+    status("config-error", "提供方已保存", "ok");
+    waitDone("提供方已保存", "save");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "save")) { return; }
+    status("config-error", showApiError("保存失败：", error), "error");
+    waitFail(error.message || "保存失败", "save");
   }).then(function () { busy(button, false); });
 }
 
 function assignEndpoint(purpose) {
   var form = $("config-form");
-  var model = form.elements[purpose === "article" ? "model" : "chat_model"].value.trim();
-  var baseUrl = form.base_url.value.trim();
-  var apiKey = form.api_key.value;
-  var endpointId = form.dataset.endpointId || "";
-  if (!model) {
-    status("config-error", "请先连接并选择模型", "error");
+  var providers = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider", image: "image_provider"};
+  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
+  var paths = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model", image: "/api/image/model"};
+  var buttons = {article: "endpoint-use-article", translation: "endpoint-use-translation", leaderboard: "endpoint-use-leaderboard", image: "endpoint-use-image"};
+  var labels = {article: "文章", translation: "翻译", leaderboard: "榜单", image: "出图"};
+  var endpointId = form.elements[providers[purpose]].value.trim();
+  var model = form.elements[names[purpose]].value.trim();
+  if (!endpointId || !model) {
+    status("config-error", "请先选择提供方和模型", "error");
     return;
   }
-  var payload = {model: model, base_url: baseUrl, api_key: apiKey};
-  if (endpointId) { payload.endpoint_id = endpointId; }
+  var payload = {endpoint_id: endpointId, model: model};
   if (purpose === "article") { payload.effort = form.effort.value; }
-  var button = $(purpose === "article" ? "endpoint-use-article" : "endpoint-use-chat");
+  var button = $(buttons[purpose]);
   busy(button, true);
-  api(purpose === "article" ? "/api/model" : "/api/chat/model", payload).then(function (data) {
+  waitStart("assign");
+  waitApi("assign", paths[purpose], payload).then(function (data) {
     applyModelResponse(data);
-    status("config-error", purpose === "article" ? "已设为文章模型" : "已设为对话模型", "ok");
+    status("config-error", "已保存" + labels[purpose] + "模型", "ok");
+    waitDone("已保存" + labels[purpose] + "模型", "assign");
   }).catch(function (error) {
+    if (isWaitAbort(error, "assign")) { return; }
     status("config-error", showApiError("保存失败：", error), "error");
+    waitFail(error.message || "保存失败", "assign");
   }).then(function () { busy(button, false); });
+}
+
+function bulkAssignEndpoint(endpointId, model) {
+  if (!endpointId || !model) {
+    status("model-endpoint-status", "请先在下拉列表中选择模型", "error");
+    return;
+  }
+  var effort = $("config-form").effort.value || "none";
+  status("model-endpoint-status", "正在配置全部入口…");
+  waitStart("assign");
+  waitApi("assign", "/api/model", {endpoint_id: endpointId, model: model, effort: effort}).then(function (data) {
+    applyModelResponse(data);
+    return waitApi("assign", "/api/translation/model", {endpoint_id: endpointId, model: model});
+  }).then(function (data) {
+    applyModelResponse(data);
+    return waitApi("assign", "/api/leaderboard/model", {endpoint_id: endpointId, model: model});
+  }).then(function (data) {
+    applyModelResponse(data);
+    status("model-endpoint-status", "已将该模型配置到文章、翻译和榜单", "ok");
+    waitDone("已配置全部入口", "assign");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "assign")) { return; }
+    status("model-endpoint-status", showApiError("配置失败：", error), "error");
+    waitFail(error.message || "配置失败", "assign");
+  });
 }
 
 function deleteEndpoint(endpointId) {
@@ -1121,6 +2229,7 @@ function deleteEndpoint(endpointId) {
   if (!window.confirm("删除该接口及其 API Key？")) { return; }
   api("/api/model-endpoints/delete", {endpoint_id: endpointId}).then(function (data) {
     applyModelResponse(data);
+    closeProviderEditor();
     status("model-endpoint-status", "接口已删除", "ok");
   }).catch(function (error) {
     status("model-endpoint-status", showApiError("删除失败：", error), "error");
@@ -1134,16 +2243,18 @@ function selectedLLM() {
 function applyModelResponse(data) {
   if (data.model_endpoints) { state.modelEndpoints = data.model_endpoints; }
   if (data.llm) { state.llm = data.llm; }
-  if (data.chat_llm) { state.chat = data.chat_llm; }
+  if (data.translation_llm) { state.translation = data.translation_llm; }
+  if (data.leaderboard_llm) { state.leaderboard = data.leaderboard_llm; }
+  if (data.image_llm) { state.image = data.image_llm; }
   renderModelPicker();
-  renderChatModelPicker();
+  fillPurposePickers();
   renderEndpointLists();
 }
 
 function activateModel(purpose, endpointId, model) {
   var payload = {endpoint_id: endpointId, model: model};
-  var path = purpose === "article" ? "/api/model" : "/api/chat/model";
-  if (purpose === "article") { payload.effort = state.llm.effort || "none"; }
+  if (purpose === "article") { payload.effort = "none"; }
+  var path = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model", image: "/api/image/model"}[purpose];
   return api(path, payload).then(function (data) {
     applyModelResponse(data);
     status(purpose === "article" ? "article-status" : "model-endpoint-status", "模型已切换", "ok");
@@ -1165,7 +2276,6 @@ function changeMainModel(purpose, event) {
   activateModel(purpose, choice.endpointId, choice.model).catch(function (error) {
     status(purpose === "article" ? "article-status" : "model-endpoint-status", showApiError("切换失败：", error), "error");
     renderModelPicker();
-    renderChatModelPicker();
   }).then(function () { select.disabled = false; });
 }
 
@@ -1176,6 +2286,22 @@ function showApiError(prefix, error) {
 }
 
 function selectHotspot(item, button) {
+  if (state.item && item && state.item.item_id === item.item_id) {
+    var nodes = $("hotspot-list").querySelectorAll(".hotspot-item");
+    nodes.forEach(function (node) {
+      var active = node === button;
+      node.setAttribute("aria-pressed", String(active));
+      node.classList.toggle("selected", active);
+    });
+    $("find-hooks-btn").disabled = false;
+    $("open-original-btn").disabled = false;
+    syncGenerateEnabled();
+    if (typeof renderPickedDock === "function") renderPickedDock();
+    return;
+  }
+  state.newsFocus = null;
+  state.articleLastKeys[articleContextKey(state.lane, state.platform)] = "";
+  state.articleRequestGen += 1;
   state.item = item;
   resetArticle();
   clearHooks();
@@ -1185,8 +2311,388 @@ function selectHotspot(item, button) {
     node.setAttribute("aria-pressed", String(active));
     node.classList.toggle("selected", active);
   });
-  $("generate-btn").disabled = false;
   $("find-hooks-btn").disabled = false;
+  $("open-original-btn").disabled = false;
+  syncGenerateEnabled();
+  if (typeof renderPickedDock === "function") renderPickedDock();
+}
+
+function clearHotspotSelection(keepArticle) {
+  state.item = null;
+  state.newsFocus = null;
+  if (!keepArticle) {
+    state.articleRequestGen += 1;
+    resetArticle();
+  }
+  clearHooks();
+  closeOriginal();
+  $("find-hooks-btn").disabled = true;
+  $("open-original-btn").disabled = true;
+  var list = $("hotspot-list");
+  if (list) {
+    list.querySelectorAll(".hotspot-item").forEach(function (node) {
+      node.setAttribute("aria-pressed", "false");
+      node.classList.remove("selected");
+    });
+  }
+  syncGenerateEnabled();
+  if (typeof renderPickedDock === "function") renderPickedDock();
+}
+
+function pickedIdList() {
+  return Object.keys(state.pickedIds || {}).filter(function (id) {
+    return state.pickedIds[id];
+  }).sort();
+}
+
+function syncGenerateEnabled() {
+  var button = $("generate-btn");
+  if (!button) { return; }
+  button.disabled = !(state.item || pickedIdList().length);
+}
+
+function togglePicked(itemId) {
+  if (!itemId) { return; }
+  if (state.pickedIds[itemId]) {
+    delete state.pickedIds[itemId];
+  } else {
+    state.pickedIds[itemId] = true;
+  }
+  syncPickedHighlights();
+  syncGenerateEnabled();
+  if (typeof renderPickedDock === "function") renderPickedDock();
+}
+
+function renderPickedDock() {
+  var dock = $("picked-dock");
+  if (!dock) { return; }
+  var ids = pickedIdList();
+  dock.textContent = "";
+  dock.classList.remove("is-focus");
+  if (state.newsFocus) {
+    dock.hidden = false;
+    dock.classList.add("is-focus");
+    dock.appendChild(el("span", "picked-dock-label", "焦点"));
+    var newsFocusChip = el("span", "picked-dock-chip");
+    newsFocusChip.appendChild(el("span", "picked-dock-chip-label", state.newsFocus.title || ""));
+    dock.appendChild(newsFocusChip);
+  }
+  if (ids.length) {
+    dock.hidden = false;
+    dock.appendChild(el("span", "picked-dock-label", "已选 " + ids.length));
+    ids.forEach(function (id) {
+      var title = id;
+      var fav = state.favoriteIds[id];
+      if (fav && fav.title) {
+        title = fav.title;
+      } else {
+        var lists = [(state.rankings || {}).heat || [], (state.rankings || {}).time || []];
+        var found = false;
+        lists.forEach(function (items) {
+          if (found) { return; }
+          items.forEach(function (item) {
+            if (!found && item && item.item_id === id) {
+              title = item.title || id;
+              found = true;
+            }
+          });
+        });
+      }
+      var chip = el("button", "picked-dock-chip");
+      chip.type = "button";
+      chip.setAttribute("data-item-id", id);
+      chip.appendChild(el("span", "picked-dock-chip-label", title));
+      chip.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        togglePicked(id);
+      });
+      dock.appendChild(chip);
+    });
+    return;
+  }
+  if (state.newsFocus) {
+    return;
+  }
+  if (state.item) {
+    dock.hidden = false;
+    dock.classList.add("is-focus");
+    dock.appendChild(el("span", "picked-dock-label", "焦点"));
+    var focusChip = el("span", "picked-dock-chip");
+    focusChip.appendChild(el("span", "picked-dock-chip-label", state.item.title || ""));
+    dock.appendChild(focusChip);
+    return;
+  }
+  dock.hidden = true;
+}
+
+function syncPickedHighlights() {
+  document.querySelectorAll("#hotspot-list .hotspot-item, #favorites-list .fav-item").forEach(function (node) {
+    var id = node.getAttribute("data-item-id");
+    node.classList.toggle("is-picked", !!state.pickedIds[id]);
+  });
+}
+
+function starButton(item) {
+  var favorited = !!state.favoriteIds[item.item_id];
+  var star = el("button", "ht-star", favorited ? "★" : "☆");
+  star.type = "button";
+  star.setAttribute("aria-label", "收藏");
+  star.setAttribute("aria-pressed", String(favorited));
+  star.addEventListener("click", function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleFavorite(item);
+  });
+  return star;
+}
+
+function toggleFavorite(item) {
+  if (!item || !item.item_id) { return; }
+  var favorited = !!state.favoriteIds[item.item_id];
+  api("/api/favorites", {item_id: item.item_id}, {method: favorited ? "DELETE" : "POST"}).then(function () {
+    return loadFavorites();
+  }).catch(function (error) {
+    status("hotspot-status", showApiError("收藏失败：", error), "error");
+  });
+}
+
+function loadFavorites() {
+  return fetch("/api/favorites").then(function (response) { return response.json(); }).then(function (data) {
+    var nextFavorites = {};
+    (data.items || []).forEach(function (item) {
+      if (item && item.item_id) { nextFavorites[item.item_id] = item; }
+    });
+    state.favoriteIds = nextFavorites;
+    renderFavorites();
+    syncStars();
+    return data;
+  });
+}
+
+function renderFavorites() {
+  var list = $("favorites-list");
+  if (!list) { return; }
+  list.textContent = "";
+  var items = Object.keys(state.favoriteIds).map(function (id) { return state.favoriteIds[id]; });
+  items.sort(function (a, b) {
+    return String(b.favorited_at || "").localeCompare(String(a.favorited_at || ""));
+  });
+  items.forEach(function (item) {
+    var li = el("li", "fav-item");
+    li.setAttribute("data-item-id", item.item_id);
+    li.classList.toggle("is-picked", !!state.pickedIds[item.item_id]);
+    var title = el("span", "ht-title", item.title || "");
+    title.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      togglePicked(item.item_id);
+    });
+    var openBtn = el("button", "fav-open-original", "打开原文");
+    openBtn.type = "button";
+    openBtn.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      openOriginal(item);
+    });
+    li.appendChild(starButton(item));
+    li.appendChild(title);
+    li.appendChild(el("span", "ht-summary", item.summary || ""));
+    li.appendChild(openBtn);
+    list.appendChild(li);
+  });
+  if (typeof renderPickedDock === "function") renderPickedDock();
+}
+
+function focusNewsSupplement(item) {
+  if (!item || typeof item !== "object") { return; }
+  var title = String(item.title || item.name || item.url || item.link || "相关新闻").trim();
+  if (!title) { return; }
+  state.newsFocus = {title: title, url: String(item.url || item.link || "").trim()};
+  renderNewsSupplements();
+  renderPickedDock();
+}
+
+function selectedArticleContext() {
+  var body = $("article-body");
+  if (!state.draft || !body) { return null; }
+  var start = Number(body.selectionStart);
+  var end = Number(body.selectionEnd);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) { return null; }
+  var text = body.value || "";
+  var selected = text.slice(start, end).trim();
+  if (!selected) { return null; }
+  var paragraphs = [];
+  var cursor = 0;
+  var separator = /\\r?\\n[ \\t]*\\r?\\n/g;
+  var match;
+  while ((match = separator.exec(text))) {
+    paragraphs.push({start: cursor, end: match.index});
+    cursor = match.index + match[0].length;
+  }
+  paragraphs.push({start: cursor, end: text.length});
+  var first = paragraphs.findIndex(function (paragraph) {
+    return start < paragraph.end && end > paragraph.start;
+  });
+  var lastPosition = Math.max(start, end - 1);
+  var last = paragraphs.findIndex(function (paragraph) {
+    return lastPosition >= paragraph.start && lastPosition < paragraph.end;
+  });
+  if (first < 0) { first = 0; }
+  if (last < first) { last = first; }
+  var contextStart = paragraphs[Math.max(0, first - 1)].start;
+  var contextEnd = paragraphs[Math.min(paragraphs.length - 1, last + 1)].end;
+  return {
+    body: text,
+    selected_text: selected,
+    selection_start: start,
+    selection_end: end,
+    context: text.slice(contextStart, contextEnd),
+  };
+}
+
+function syncRelatedSearchEnabled() {
+  var button = $("related-search-btn");
+  if (!button) { return; }
+  button.disabled = !selectedArticleContext();
+}
+
+function renderNewsSupplements() {
+  var list = $("news-supplement-list");
+  if (!list) { return; }
+  list.textContent = "";
+  var items = Array.isArray(state.newsSupplements) ? state.newsSupplements : [];
+  if (!items.length) {
+    list.appendChild(el("li", "muted", "暂无相关新闻"));
+    return;
+  }
+  items.forEach(function (item) {
+    if (!item || typeof item !== "object") { return; }
+    var row = el("li", "news-supplement-item");
+    var title = String(item.title || item.name || item.url || item.link || "相关新闻");
+    var url = String(item.url || item.link || item.source_url || "").trim();
+    var isFocus = state.newsFocus && state.newsFocus.url === url && state.newsFocus.title === title;
+    row.classList.toggle("is-focus", !!isFocus);
+    if (/^https?:\/\//i.test(url)) {
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = title;
+      if (isFocus) { link.setAttribute("aria-current", "true"); }
+      link.addEventListener("click", function () { focusNewsSupplement(item); });
+      row.appendChild(link);
+    } else {
+      var newsTitle = el("span", "news-title", title);
+      newsTitle.tabIndex = 0;
+      newsTitle.setAttribute("role", "button");
+      if (isFocus) { newsTitle.setAttribute("aria-current", "true"); }
+      newsTitle.addEventListener("click", function () { focusNewsSupplement(item); });
+      newsTitle.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          focusNewsSupplement(item);
+        }
+      });
+      row.appendChild(newsTitle);
+    }
+    var summary = String(item.snippet || item.summary || item.description || "").trim();
+    if (summary) { row.appendChild(el("span", "news-summary", summary)); }
+    var meta = [item.source || item.source_id || "", item.published_at || item.published || ""]
+      .map(function (value) { return String(value || "").trim(); })
+      .filter(Boolean);
+    if (meta.length) { row.appendChild(el("span", "news-meta", meta.join(" · "))); }
+    list.appendChild(row);
+  });
+}
+
+function invalidateRelatedSearch() {
+  state.relatedSearchGen += 1;
+  if (waitRunning("related_search")) { waitStop("related_search"); }
+  state.newsSupplements = [];
+  state.newsFocus = null;
+  renderNewsSupplements();
+  renderPickedDock();
+}
+
+function toggleNewsSupplementDrawer(open) {
+  var next = open === undefined ? !document.body.classList.contains("news-supplement-open") : !!open;
+  if (next) { toggleFavoritesDrawer(false); }
+  document.body.classList.toggle("news-supplement-open", next);
+  var drawer = $("news-supplement-drawer");
+  var button = $("news-supplement-btn");
+  if (drawer) { drawer.hidden = !next; }
+  if (button) { button.setAttribute("aria-expanded", String(next)); }
+  if (next) { renderNewsSupplements(); }
+}
+
+function relatedSearch() {
+  var selection = selectedArticleContext();
+  if (!selection) {
+    syncRelatedSearchEnabled();
+    status("article-status", "请先选中正文中的关键词或句子", "error");
+    return;
+  }
+  if (!state.draft || waitRunning("related_search")) { return; }
+  var requestDraftId = state.draft.draft_id;
+  var requestSessionKey = currentArticleSessionKey();
+  var gen = ++state.relatedSearchGen;
+  var button = $("related-search-btn");
+  state.newsSupplements = [];
+  renderNewsSupplements();
+  toggleNewsSupplementDrawer(true);
+  status("news-supplement-status", state.articleDirty ? "正在保存修改并检索相关新闻…" : "正在检索相关新闻…");
+  busy(button, true);
+  waitStart("related_search");
+  var save = state.articleDirty ? persistArticle("related_search") : Promise.resolve(state.draft);
+  save.then(function () {
+    if (waitCancelled("related_search") || gen !== state.relatedSearchGen) { return null; }
+    if (!state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return null; }
+    var body = $("article-body");
+    body.focus();
+    body.setSelectionRange(selection.selection_start, selection.selection_end);
+    var currentSelection = selectedArticleContext() || selection;
+    return waitApi("related_search", "/api/related-search", Object.assign({
+      draft_id: state.draft.draft_id,
+    }, currentSelection));
+  }).then(function (data) {
+    if (!data || waitCancelled("related_search") || gen !== state.relatedSearchGen) { return; }
+    if (!state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
+    state.newsSupplements = Array.isArray(data.items) ? data.items : [];
+    renderNewsSupplements();
+    status("news-supplement-status", state.newsSupplements.length ? "找到 " + state.newsSupplements.length + " 条相关新闻" : "未找到相关新闻", state.newsSupplements.length ? "ok" : "");
+    waitDone(state.newsSupplements.length ? "相关新闻已找到" : "未找到相关新闻", "related_search");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "related_search")) { return; }
+    if (gen !== state.relatedSearchGen || !state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
+    status("news-supplement-status", showApiError("相关检索失败：", error), "error");
+    waitFail(error.message || "相关检索失败", "related_search");
+  }).then(function () {
+    if (gen === state.relatedSearchGen) { busy(button, false); }
+  });
+}
+
+function syncStars() {
+  document.querySelectorAll("#hotspot-list .hotspot-row").forEach(function (row) {
+    var card = row.querySelector(".hotspot-item");
+    var star = row.querySelector(".ht-star");
+    if (!card || !star) { return; }
+    var favorited = !!state.favoriteIds[card.getAttribute("data-item-id")];
+    star.textContent = favorited ? "★" : "☆";
+    star.setAttribute("aria-pressed", String(favorited));
+  });
+}
+
+function toggleFavoritesDrawer(open) {
+  var next = open === undefined ? !document.body.classList.contains("favorites-open") : !!open;
+  if (next) { toggleNewsSupplementDrawer(false); }
+  document.body.classList.toggle("favorites-open", next);
+  var drawer = $("favorites-drawer");
+  var button = $("favorites-btn");
+  if (drawer) { drawer.hidden = !next; }
+  if (button) { button.setAttribute("aria-expanded", String(next)); }
+  renderPickedDock();
+  if (next) { loadFavorites(); }
 }
 
 function rankedCount(data) {
@@ -1212,14 +2718,18 @@ function applyHotspots(data, extraStatus) {
   status("hotspot-status", text, shown ? "ok" : "");
 }
 
-function loadHotspots(translate) {
-  var url = "/api/hotspots?hours=" + encodeURIComponent(currentHours());
+function loadHotspots(translate, signal) {
+  var gen = ++state.hotspotGen;
+  var url = "/api/hotspots?hours=" + encodeURIComponent(currentHours())
+    + "&lane=" + encodeURIComponent(state.lane || "hotspots");
   if (translate) { url += "&translate=1"; }
-  return fetch(url).then(function (response) {
+  return fetch(url, signal ? {signal: signal} : {}).then(function (response) {
     return response.json().catch(function () { return {}; }).then(function (data) {
       if (!response.ok || data.ok === false) {
         throw new Error(data.error_reason || data.error || ("HTTP " + response.status));
       }
+      if (gen !== state.hotspotGen) { return null; }
+      data.hotspotGen = gen;
       applyHotspots(data);
       return data;
     });
@@ -1227,6 +2737,7 @@ function loadHotspots(translate) {
 }
 
 function widenIfEmpty(data, previousHours) {
+  if (!data) { return Promise.resolve(null); }
   if (rankedCount(data) > 0) { return Promise.resolve(data); }
   var wider = nextWiderHours(previousHours || currentHours());
   if (!wider) { return Promise.resolve(data); }
@@ -1237,6 +2748,7 @@ function widenIfEmpty(data, previousHours) {
   }
   state.hours = wider;
   return loadHotspots().then(function (next) {
+    if (!next || next.hotspotGen !== state.hotspotGen) { return next; }
     applyHotspots(next, " · 近 " + (previousHours || 4) + " 小时没有候选，已改看 " + wider + " 小时");
     return next;
   });
@@ -1244,48 +2756,83 @@ function widenIfEmpty(data, previousHours) {
 
 function translateTitles() {
   var button = $("translate-btn");
+  if (!state.translation.enabled) {
+    status("hotspot-status", "请先在设置中选择“用于翻译”的模型", "error");
+    return;
+  }
+  if (waitRunning("translate")) { return; }
   if (button) { busy(button, true); }
+  waitStart("translate");
   status("hotspot-status", "正在翻译当前列表标题…");
-  loadHotspots(true).then(function (data) {
+  loadHotspots(true, waitSignal("translate")).then(function (data) {
+    if (waitCancelled("translate")) { return; }
     var shown = rankedCount(data || {});
-    status("hotspot-status", shown ? "共 " + shown + " 条候选 · 已尝试翻译标题" : "暂无候选", shown ? "ok" : "");
+    if (state.lane !== "github") {
+      status("hotspot-status", shown ? "共 " + shown + " 条候选 · 已尝试翻译标题" : "暂无候选", shown ? "ok" : "");
+    }
+    waitDone(shown ? "标题翻译完成" : "没有可翻译的标题", "translate");
   }).catch(function (error) {
+    if (isWaitAbort(error, "translate")) { return; }
     status("hotspot-status", "翻译失败：" + error.message, "error");
+    waitFail(error.message || "翻译失败", "translate");
   }).then(function () {
     if (button) { busy(button, false); }
   });
 }
 
 function collect(sourceId) {
-  var button = sourceId
-    ? document.querySelector('[data-source-id="' + sourceId + '"]')
-    : $("collect-btn");
-  if (button) { busy(button, true); }
-  var hours = currentHours();
-  status("hotspot-status", sourceId ? "正在刷新该源，已有候选会留在上面…" : "正在从各订阅源抓取，已有候选会留在上面…");
-  if (!$("hotspot-list").querySelector(".hotspot-item")) {
-    loadHotspots();
+  if ((state.lane || "hotspots") === "github") {
+    refreshGithubWeekly();
+    return;
   }
-  var payload = {hours: hours, force: true};
+  if (waitRunning("collect")) { return; }
+  var lane = state.lane || "hotspots";
+  var requestGen = ++state.collectGen;
+  var hours = currentHours();
+  if (sourceId) {
+    waitStart("collect", {title: "正在刷新这一路订阅"});
+  } else if (lane === "viewpoints") {
+    waitStart("collect", {title: "正在抓取 Reddit 热帖"});
+  } else {
+    waitStart("collect");
+  }
+  status("hotspot-status", sourceId ? "正在刷新该源，已有候选会留在上面…" : (lane === "viewpoints" ? "正在从 Reddit 抓取当前热帖，已有候选会留在上面…" : "正在从各订阅源抓取，已有候选会留在上面…"));
+  var payload = {hours: hours, force: true, lane: lane};
   if (sourceId) { payload.source_id = sourceId; }
-  api("/api/collect", payload).then(function (data) {
+  waitApi("collect", "/api/collect", payload).then(function (data) {
+    if (waitCancelled("collect")) { return; }
+    if (requestGen !== state.collectGen) {
+      waitDone("已切换栏目", "collect");
+      return;
+    }
     var inserted = data.collection && data.collection.inserted ? data.collection.inserted : 0;
     var failed = data.collection && data.collection.failed ? data.collection.failed : 0;
     var extra = "";
     if (inserted) { extra += " · 新入库 " + inserted + " 条"; }
     if (failed) { extra += " · " + failed + " 个源失败"; }
-    applyHotspots(data, extra);
-    if (!rankedCount(data)) {
-      return widenIfEmpty(data, hours).then(function () {
-        if (failed) { $("hotspot-status").className = "status-error"; }
-      });
+    var doneText = inserted ? ("抓取完成 · 新入库 " + inserted + " 条") : "抓取完成";
+    if (state.lane === lane) {
+      applyHotspots(data, extra);
+      if (!rankedCount(data)) {
+        return widenIfEmpty(data, hours).then(function (next) {
+          if (next && failed && state.lane === lane) {
+            $("hotspot-status").className = "status-error";
+          }
+          waitDone(doneText, "collect");
+        });
+      }
+      if (failed) { $("hotspot-status").className = "status-error"; }
     }
-    if (failed) { $("hotspot-status").className = "status-error"; }
+    waitDone(doneText, "collect");
   }).catch(function (error) {
+    if (isWaitAbort(error, "collect")) { return; }
+    if (requestGen !== state.collectGen) {
+      waitDone("已切换栏目", "collect");
+      return;
+    }
     status("hotspot-status", "抓取失败：" + error.message, "error");
-    loadHotspots();
-  }).then(function () {
-    if (button) { busy(button, false); }
+    waitFail(error.message || "抓取失败", "collect");
+    if (state.lane === lane) { loadHotspots(); }
   });
 }
 
@@ -1323,6 +2870,7 @@ function persistImages() {
     $("article-body").value = data.body || $("article-body").value;
     state.draft.assets = data.assets;
     renderImagePicker(data.assets);
+    renderXhsStudio(data);
     status("image-picker-status", "配图选择已保存", "ok");
     return data;
   });
@@ -1340,17 +2888,24 @@ function changeImageSelection(mutator) {
 
 function rescanImages() {
   if (!state.draft) { return; }
+  if (waitRunning("rescan")) { return; }
   var button = $("image-rescan");
   busy(button, true);
+  waitStart("rescan");
   status("image-picker-status", "正在从原文扫描配图…");
-  api("/api/articles/images/rescan", {draft_id: state.draft.draft_id}).then(function (data) {
+  waitApi("rescan", "/api/articles/images/rescan", {draft_id: state.draft.draft_id}).then(function (data) {
+    if (waitCancelled("rescan")) { return; }
     state.draft = Object.assign({}, state.draft, data);
     $("article-body").value = data.body || $("article-body").value;
     renderImagePicker(data.assets);
+    renderXhsStudio(data);
     var count = (data.assets && data.assets.candidates) ? data.assets.candidates.length : 0;
     status("image-picker-status", count ? "已扫描到 " + count + " 张原图" : "原文里没有可用配图", count ? "ok" : "error");
+    waitDone(count ? ("已扫描到 " + count + " 张原图") : "原文里没有可用配图", "rescan");
   }).catch(function (error) {
+    if (isWaitAbort(error, "rescan")) { return; }
     status("image-picker-status", showApiError("扫描失败：", error), "error");
+    waitFail(error.message || "扫描失败", "rescan");
   }).then(function () { busy(button, false); });
 }
 
@@ -1389,24 +2944,33 @@ function renderImagePicker(raw) {
     meta.appendChild(el("div", "image-url", image.url));
     card.appendChild(meta);
     var actions = el("div", "image-actions");
-    var coverBtn = el("button", "", image.id === assets.cover_id ? "封面" : "设为封面");
-    coverBtn.type = "button";
-    coverBtn.addEventListener("click", function () {
-      changeImageSelection(function (next) { next.cover_id = image.id; });
+    var coverLabel = el("label", "image-check");
+    coverLabel.innerHTML = '<input type="checkbox" class="cover-check">封面';
+    var coverBox = coverLabel.querySelector("input");
+    coverBox.checked = image.id === assets.cover_id;
+    coverBox.addEventListener("change", function () {
+      var on = coverBox.checked;
+      changeImageSelection(function (next) {
+        next.cover_id = on ? image.id : (next.cover_id === image.id ? "" : next.cover_id);
+      });
     });
     var bodyOn = assets.body_ids.indexOf(image.id) >= 0;
-    var bodyBtn = el("button", "", bodyOn ? "移出正文" : "加入正文");
-    bodyBtn.type = "button";
-    bodyBtn.addEventListener("click", function () {
+    var bodyLabel = el("label", "image-check");
+    bodyLabel.innerHTML = '<input type="checkbox" class="body-check">正文';
+    var bodyBox = bodyLabel.querySelector("input");
+    bodyBox.checked = bodyOn;
+    bodyBox.addEventListener("change", function () {
+      var on = bodyBox.checked;
       changeImageSelection(function (next) {
         var ids = next.body_ids.slice();
         var pos = ids.indexOf(image.id);
-        if (pos >= 0) { ids.splice(pos, 1); } else { ids.push(image.id); }
+        if (on && pos < 0) { ids.push(image.id); }
+        if (!on && pos >= 0) { ids.splice(pos, 1); }
         next.body_ids = ids;
       });
     });
-    actions.appendChild(coverBtn);
-    actions.appendChild(bodyBtn);
+    actions.appendChild(coverLabel);
+    actions.appendChild(bodyLabel);
     if (bodyOn) {
       var up = el("button", "", "上移");
       up.type = "button";
@@ -1439,6 +3003,9 @@ function renderImagePicker(raw) {
 }
 
 function proxiedImage(url) {
+  if (!url) { return ""; }
+  if (url.charAt(0) === "/" && url.charAt(1) !== "/") { return url; }
+  if (url.indexOf("/api/generated/") === 0) { return url; }
   return "/api/image-proxy?url=" + encodeURIComponent(url);
 }
 
@@ -1475,12 +3042,34 @@ function closeImageLightbox() {
   if (preview) { preview.removeAttribute("src"); }
 }
 
+var articleInputAnchor = null;
+
+function captureArticleInputAnchor() {
+  var body = $("article-body");
+  if (!body || body.closest("[hidden]")) { return; }
+  articleInputAnchor = {
+    pageY: window.scrollY,
+  };
+}
+
 function fitArticleBody() {
   var body = $("article-body");
   if (!body || body.closest("[hidden]")) { return; }
+  var anchor = articleInputAnchor;
+  articleInputAnchor = null;
+  var pageY = anchor ? anchor.pageY : window.scrollY;
   body.style.height = "auto";
   var next = Math.max(260, body.scrollHeight + 2);
   body.style.height = next + "px";
+  var stableY = pageY;
+  window.scrollTo(0, stableY);
+  window.requestAnimationFrame(function () {
+    if (document.activeElement !== body) { return; }
+    window.scrollTo(0, stableY);
+    window.setTimeout(function () {
+      if (document.activeElement === body) { window.scrollTo(0, stableY); }
+    }, 50);
+  });
 }
 
 function renderArticle(data) {
@@ -1491,11 +3080,47 @@ function renderArticle(data) {
 
   $("article-sources").textContent = "来源：" + (data.source_ids || []).join(", ");
   renderImagePicker(data.assets);
+  renderXhsStudio(data);
   $("draft-id").textContent = "draft_id: " + data.draft_id;
   $("article-status").textContent = "";
   $("save-article-btn").disabled = false;
   state.articleDirty = false;
   fitArticleBody();
+  syncRelatedSearchEnabled();
+}
+
+function renderXhsStudio(data) {
+  var studio = $("xhs-studio");
+  var cards = (data && data.cards) || [];
+  var show = state.platform === "xiaohongshu" && cards.length;
+  studio.hidden = !show;
+  $("xhs-export-btn").disabled = !show;
+  var root = $("xhs-cards");
+  root.textContent = "";
+  if (!show) { return; }
+  cards.forEach(function (card) {
+    var node = el("div", "xhs-paper xhs-" + (card.kind || "page"));
+    var head = el("div", "xhs-head");
+    var handle = card.handle || "@小红书号";
+    var avatar = el("div", "xhs-avatar", handle.replace(/^@/, "").slice(0, 1) || "A");
+    head.appendChild(avatar);
+    head.appendChild(el("span", "xhs-id", handle));
+    node.appendChild(head);
+    if (card.kind === "cover") {
+      node.appendChild(el("h3", "", card.title || ""));
+      if (card.image_url) {
+        var image = document.createElement("img");
+        image.alt = card.title || "封面";
+        image.src = proxiedImage(card.image_url);
+        node.appendChild(image);
+      } else if (card.lede) {
+        node.appendChild(el("p", "xhs-lede", card.lede));
+      }
+    } else {
+      node.appendChild(el("p", "xhs-copy", card.text || ""));
+    }
+    root.appendChild(node);
+  });
 }
 
 state.hooks = [];
@@ -1579,20 +3204,124 @@ function findHooks() {
   var gen = ++state.findHooksGen;
   var button = $("find-hooks-btn");
   busy(button, true);
-  api("/api/hooks/find", {item_id: itemId}).then(function (data) {
+  waitStart("hooks");
+  status("article-status", "正在找切口…");
+  waitApi("hooks", "/api/hooks/find", {item_id: itemId}).then(function (data) {
+    if (waitCancelled("hooks")) { return; }
     if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
     renderHooks(data.hooks || []);
     status("article-status", (data.hooks && data.hooks.length) ? "" : (data.message || "未发现可用切口"), (data.hooks && data.hooks.length) ? "" : "error");
+    waitDone((data.hooks && data.hooks.length) ? ("找到 " + data.hooks.length + " 个切口") : "未发现可用切口", "hooks");
   }).catch(function (error) {
+    if (isWaitAbort(error, "hooks")) { return; }
     if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
     status("article-status", showApiError("找切口失败：", error), "error");
+    waitFail(error.message || "找切口失败", "hooks");
   }).then(function () {
     if (gen === state.findHooksGen) { busy(button, false); }
   });
 }
 
+function closeOriginal() {
+  state.originalGen += 1;
+  state.originalItemId = "";
+  state.originalTranslatable = false;
+  if ($("original-dialog").open) { $("original-dialog").close(); }
+  busy($("open-original-btn"), false);
+  $("open-original-btn").disabled = !state.item;
+}
+
+function openOriginal(item) {
+  item = item || state.item;
+  if (!item || !item.item_id) { return; }
+  var itemId = item.item_id;
+  var gen = ++state.originalGen;
+  var button = $("open-original-btn");
+  var fromFocus = !!(state.item && state.item.item_id === itemId);
+  state.originalItemId = itemId;
+  state.originalTranslatable = false;
+  $("original-title").textContent = item.title_zh || item.title || "候选原文";
+  $("original-sources").textContent = "";
+  $("original-note").textContent = "";
+  $("original-content").textContent = "正在读取已收录的原文内容…";
+  $("original-translation").textContent = "";
+  $("original-translation-wrap").hidden = true;
+  $("original-translate").hidden = false;
+  $("original-translate").disabled = true;
+  $("original-translate").textContent = "翻译文章";
+  delete $("original-translate").dataset.originalLabel;
+  if (!$("original-dialog").open) { $("original-dialog").showModal(); }
+  if (fromFocus) { busy(button, true); }
+  waitStart("original");
+  waitApi("original", "/api/original", {item_id: itemId}).then(function (data) {
+    if (waitCancelled("original")) { return; }
+    if (gen !== state.originalGen) { return; }
+    $("original-title").textContent = data.title || "候选原文";
+    $("original-content").textContent = data.content || "该候选没有可显示的正文内容。";
+    $("original-note").textContent = data.content_note || "";
+    state.originalTranslatable = !!data.translatable;
+    $("original-translate").hidden = !state.originalTranslatable;
+    $("original-translate").disabled = !state.originalTranslatable;
+    (data.sources || []).forEach(function (source) {
+      var link = el("a", "", source.source_id || "打开原站");
+      link.href = source.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = source.url;
+      $("original-sources").appendChild(link);
+    });
+    waitDone("原文已打开", "original");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "original")) { return; }
+    if (gen === state.originalGen) {
+      $("original-content").textContent = showApiError("读取原文失败：", error);
+      waitFail(error.message || "读取原文失败", "original");
+    }
+  }).then(function () {
+    if (gen === state.originalGen && fromFocus) { busy(button, false); }
+  });
+}
+
+function translateOriginal() {
+  if (!state.originalItemId || !state.originalTranslatable) { return; }
+  var itemId = state.originalItemId;
+  var gen = state.originalGen;
+  var button = $("original-translate");
+  var output = $("original-translation");
+  $("original-translation-wrap").hidden = false;
+  if (!state.translation.enabled) {
+    output.textContent = "请先在设置中选择“用于翻译”的模型。";
+    return;
+  }
+  output.textContent = "正在翻译…";
+  busy(button, true);
+  waitStart("original_tr");
+  waitApi("original_tr", "/api/original/translate", {item_id: itemId}).then(function (data) {
+    if (waitCancelled("original_tr")) { return; }
+    if (gen !== state.originalGen || itemId !== state.originalItemId) { return; }
+    output.textContent = data.translation || "翻译结果为空。";
+    button.dataset.originalLabel = "已翻译";
+    waitDone("原文翻译完成", "original_tr");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "original_tr")) { return; }
+    if (gen === state.originalGen) {
+      output.textContent = showApiError("翻译失败：", error);
+      waitFail(error.message || "翻译失败", "original_tr");
+    }
+  }).then(function () {
+    if (gen === state.originalGen) { busy(button, false); }
+  });
+}
+
 function generate() {
-  if (!state.item) { return; }
+  var picked = pickedIdList();
+  if (!state.item && !picked.length) { return; }
+  var requestLane = state.lane;
+  var requestPlatform = state.platform;
+  var requestItem = state.item;
+  var requestIds = picked.length ? picked.slice() : [state.item.item_id];
+  var requestKey = articleSessionKey(requestLane, requestPlatform, requestIds);
+  var requestGen = ++state.articleRequestGen;
   var button = $("generate-btn");
   var llm = selectedLLM();
   if (!llm.model) {
@@ -1600,35 +3329,51 @@ function generate() {
     return;
   }
   var payload = {
-    item_id: state.item.item_id,
     platform: state.platform,
     model: llm.model,
     effort: llm.effort,
+    prompt_style: $("prompt-style-select").value,
   };
+  if (picked.length >= 1) {
+    payload.item_ids = picked;
+  } else {
+    payload.item_id = state.item.item_id;
+  }
   var chosen = selectedHookCards();
   if (chosen.length > 0) {
     payload.chosen_hooks = chosen;
   }
+  if (waitRunning("generate")) { return; }
   busy(button, true);
-  api("/api/articles", payload).then(function (data) {
+  waitStart("generate");
+  status("article-status", "正在生成文章…");
+  waitApi("generate", "/api/articles", payload).then(function (data) {
+    if (waitCancelled("generate") || requestGen !== state.articleRequestGen) { return; }
+    storeGeneratedArticle(requestKey, data, requestItem);
+    if (state.lane !== requestLane || state.platform !== requestPlatform) { return; }
     state.draft = data;
     renderArticle(data);
+    applyPublishLabels();
     $("publish-btn").disabled = false;
     $("schedule-btn").disabled = false;
+    waitDone("文章已生成", "generate");
+    status("article-status", "文章已生成", "ok");
   }).catch(function (error) {
+    if (isWaitAbort(error, "generate")) { return; }
     status("article-status", showApiError("生成失败：", error), "error");
+    waitFail(error.message || "生成失败", "generate");
   }).then(function () {
     busy(button, false);
   });
 }
 
-function persistArticle() {
+function persistArticle(kind) {
   if (!state.draft) { return Promise.resolve(); }
   return api("/api/articles/edit", {
     draft_id: state.draft.draft_id,
     title: $("article-title").value,
     body: $("article-body").value,
-  }).then(function (data) {
+  }, kind ? {signal: waitSignal(kind)} : {}).then(function (data) {
     state.draft = Object.assign({}, state.draft, data);
     renderArticle(state.draft);
     return data;
@@ -1639,69 +3384,36 @@ function saveArticle() {
   if (!state.draft) { return; }
   var button = $("save-article-btn");
   busy(button, true);
-  persistArticle().then(function () {
+  waitStart("save");
+  persistArticle("save").then(function () {
+    if (waitCancelled("save")) { return; }
     $("publish-btn").disabled = false;
     $("schedule-btn").disabled = false;
     status("article-status", "修改已保存，需重新审批", "ok");
+    waitDone("修改已保存", "save");
   }).catch(function (error) {
+    if (isWaitAbort(error, "save")) { return; }
     status("article-status", showApiError("保存失败：", error), "error");
+    waitFail(error.message || "保存失败", "save");
   }).then(function () {
     busy(button, false);
   });
 }
 
 function setPlatform(platform) {
+  if (state.platform !== platform) {
+    state.articleLastKeys[articleContextKey(state.lane, state.platform)] = "";
+    state.articleRequestGen += 1;
+    state.collectGen += 1;
+  }
   state.platform = platform;
+  document.body.classList.toggle("platform-xhs", platform === "xiaohongshu");
   resetArticle();
   var nodes = document.querySelectorAll("button[data-platform]");
   nodes.forEach(function (node) {
     var active = node.dataset.platform === platform;
     node.setAttribute("aria-pressed", String(active));
     node.classList.toggle("active", active);
-  });
-}
-
-function appendChatMessage(role, text) {
-  var output = $("chat-output");
-  var wrap = el("div", "chat-msg chat-msg-" + role);
-  var labels = {user: "我", assistant: "助手", error: "错误"};
-  wrap.appendChild(el("span", "chat-role", labels[role] || role));
-  wrap.appendChild(el("div", "chat-content", text));
-  output.appendChild(wrap);
-  output.scrollTop = output.scrollHeight;
-}
-
-function sendChat() {
-  var input = $("chat-input");
-  var button = $("chat-send-btn");
-  if (button.disabled) { return; }
-  var text = input.value.trim();
-  if (!text) { return; }
-  var output = $("chat-output");
-  output.hidden = false;
-  document.body.classList.add("chat-expanded");
-  output.parentElement.classList.add("chat-active");
-  appendChatMessage("user", text);
-  input.value = "";
-  var messages = state.chatMessages.slice(-48).concat([{role: "user", content: text}]);
-  if (!state.chat.configured) {
-    appendChatMessage("error", "请先在设置中配置对话模型接口");
-    return;
-  }
-  var pending = el("p", "chat-pending", "思考中…");
-  output.appendChild(pending);
-  output.scrollTop = output.scrollHeight;
-  busy(button, true);
-  api("/api/chat", {messages: messages}).then(function (data) {
-    var reply = (data.message && data.message.content) || "";
-    appendChatMessage("assistant", reply);
-    state.chatMessages = messages.concat([{role: "assistant", content: reply}]);
-  }).catch(function (error) {
-    appendChatMessage("error", showApiError("对话失败：", error));
-  }).then(function () {
-    pending.remove();
-    busy(button, false);
-    input.focus();
   });
 }
 
@@ -1729,22 +3441,56 @@ function setSettingsPage(page) {
   });
 }
 
+function renderAccountPanels() {
+  var wechatOn = !!(state.platforms.wechat && state.platforms.wechat.configured);
+  $("wechat-form").hidden = wechatOn;
+  $("wechat-delete").hidden = !wechatOn;
+  status("wechat-status", wechatOn ? "微信公众号 API：已配置" : "微信公众号 API：未配置", wechatOn ? "ok" : "");
+  var xhsOn = !!(state.platforms.xiaohongshu && state.platforms.xiaohongshu.account_configured);
+  $("xhs-form").hidden = xhsOn;
+  $("xhs-delete").hidden = !xhsOn;
+  status("xhs-status", xhsOn ? "小红书：已配置" : "小红书：未填写账号名称", xhsOn ? "ok" : "");
+  var xOn = !!(state.platforms.x && state.platforms.x.configured);
+  $("x-form").hidden = xOn;
+  $("x-delete").hidden = !xOn;
+  status("x-status", xOn ? "X 官方读取令牌：已配置" : "X 官方读取令牌：未配置", xOn ? "ok" : "");
+}
+
+function deleteAccount(platform) {
+  if (!window.confirm("删除该账号配置？删除后需重新填写。")) { return; }
+  api("/api/config/delete", {platform: platform}).then(function (data) {
+    if (platform === "wechat") { state.platforms.wechat = {configured: false}; }
+    if (platform === "x") { state.platforms.x = {configured: false}; }
+    if (platform === "xiaohongshu") {
+      state.xiaohongshu.accountName = "";
+      state.xiaohongshu.creatorUrl = "https://creator.xiaohongshu.com/publish/publish";
+    }
+    renderAccountPanels();
+    status("config-error", "已删除配置", "ok");
+  }).catch(function (error) {
+    status("config-error", showApiError("删除失败：", error), "error");
+  });
+}
+
 function openSettings(pendingPublish) {
   state.pendingPublish = pendingPublish;
   var form = $("config-form");
   form.effort.value = state.llm.effort || "none";
-  form.base_url.value = state.llm.base_url || "";
+  form.base_url.value = "";
   form.api_key.value = "";
-  form.dataset.endpointId = (endpointForState(state.llm) || {}).id || "";
+  form.dataset.endpointId = "";
   form.elements.style.value = state.style;
-  form.account_name.value = state.xiaohongshu.accountName;
-  form.creator_url.value = state.xiaohongshu.creatorUrl;
-  renderEndpointLists();
-  var articleEndpoint = endpointForState(state.llm);
-  var models = articleEndpoint ? articleEndpoint.models : [];
-  renderSettingsModels("article", models, state.llm.model);
-  renderSettingsModels("chat", models, state.chat.model);
-  $("endpoint-assign").hidden = !models.length;
+  form.app_id.value = "";
+  form.app_secret.value = "";
+  form.thumb_media_id.value = "";
+  form.author.value = "";
+  form.account_name.value = "";
+  form.creator_url.value = "";
+  form.x_bearer_token.value = "";
+  closeProviderEditor();
+  fillPurposePickers();
+  if (!state.modelEndpoints.length) { openProviderEditor("add", null); }
+  renderAccountPanels();
   if (pendingPublish) { setSettingsPlatform("wechat"); }
   setSettingsPage(pendingPublish ? "accounts" : state.settingsPage);
   $("config-error").textContent = "";
@@ -1768,27 +3514,35 @@ function schedulePublish() {
   }
   var button = $("schedule-btn");
   busy(button, true);
-  (state.articleDirty ? persistArticle() : Promise.resolve()).then(function () {
+  waitStart("schedule");
+  (state.articleDirty ? persistArticle("schedule") : Promise.resolve()).then(function () {
     return persistImages();
   }).then(function () {
+    if (waitCancelled("schedule")) { return; }
     draft = state.draft;
-    return api("/api/approve", {draft_id: draft.draft_id, reviewer: "web-user"});
+    return waitApi("schedule", "/api/approve", {draft_id: draft.draft_id, reviewer: "web-user"});
   }).then(function () {
-    return api("/api/schedule", {
+    if (waitCancelled("schedule")) { return; }
+    return waitApi("schedule", "/api/schedule", {
       draft_id: draft.draft_id,
       platform: state.platform,
       live: true,
       run_at: when,
     });
   }).then(function (result) {
+    if (waitCancelled("schedule") || !result) { return; }
     status("publish-status", "已预约 " + (result.run_at || when), "ok");
+    waitDone("已预约发布", "schedule");
   }).catch(function (error) {
+    if (isWaitAbort(error, "schedule")) { return; }
     if (error.code === "wechat_configuration_required") {
       status("publish-status", "请先配置微信", "error");
+      waitFail("请先配置微信", "schedule");
       openSettings(true);
       return;
     }
     status("publish-status", showApiError("定时失败：", error), "error");
+    waitFail(error.message || "定时失败", "schedule");
   }).then(function () { busy(button, false); });
 }
 
@@ -1799,33 +3553,44 @@ function publish() {
   var completed = false;
   busy(button, true);
   $("manual-box").hidden = true;
+  waitStart("publish", {current: 1, total: 3, step: "保存文章"});
   status("publish-status", "保存文章…");
-  (state.articleDirty ? persistArticle() : Promise.resolve()).then(function () {
+  (state.articleDirty ? persistArticle("publish") : Promise.resolve()).then(function () {
     return persistImages();
   }).then(function () {
+    if (waitCancelled("publish")) { return; }
     draft = state.draft;
+    waitProgress(2, 3, "提交审批", "publish");
     status("publish-status", "提交审批…");
-    return api("/api/approve", {draft_id: draft.draft_id, reviewer: "web-user"});
+    return waitApi("publish", "/api/approve", {draft_id: draft.draft_id, reviewer: "web-user"});
   }).then(function () {
-    status("publish-status", "已审批，正在发布…");
-    return api("/api/publish", {draft_id: draft.draft_id, platform: state.platform, live: true});
+    if (waitCancelled("publish")) { return; }
+    waitProgress(3, 3, state.platform === "wechat" ? "写入草稿箱" : "发布", "publish");
+    status("publish-status", state.platform === "wechat" ? "已审批，正在写入草稿箱…" : "已审批，正在发布…");
+    return waitApi("publish", "/api/publish", {draft_id: draft.draft_id, platform: state.platform, live: true});
   }).then(function (result) {
+    if (waitCancelled("publish") || !result) { return; }
     if (result.manual_required) {
       state.creatorUrl = result.creator_url || "";
       $("package-path").textContent = result.package_path || "";
       $("manual-box").hidden = false;
       status("publish-status", "发布包已生成", "ok");
+      waitDone("发布包已生成", "publish");
     } else {
-      status("publish-status", "已提交发布：" + (result.reference || result.status), "ok");
+      status("publish-status", "已写入公众号草稿箱：" + (result.reference || result.status), "ok");
+      waitDone("已写入公众号草稿箱", "publish");
     }
     completed = true;
-    button.dataset.originalLabel = result.manual_required ? "已生成发布包" : "已提交";
+    button.dataset.originalLabel = result.manual_required ? "已生成发布包" : "已到草稿";
   }).catch(function (error) {
+    if (isWaitAbort(error, "publish")) { return; }
     if (error.code === "wechat_configuration_required") {
       status("publish-status", "请先配置微信", "error");
+      waitFail("请先配置微信", "publish");
       openSettings(true);
     } else {
-      status("publish-status", "发布失败：" + error.message, "error");
+      status("publish-status", (state.platform === "wechat" ? "写入草稿失败：" : "发布失败：") + error.message, "error");
+      waitFail(error.message || "发布失败", "publish");
     }
   }).then(function () {
     busy(button, false);
@@ -1862,9 +3627,882 @@ $("source-health-toggle").addEventListener("click", function () {
 document.querySelectorAll("[data-rank]").forEach(function (tab) {
   tab.addEventListener("click", function () { setRank(tab.dataset.rank); });
 });
+function githubIcon(url) {
+  return "/api/image-proxy?url=" + encodeURIComponent(url || "");
+}
+function renderGithubWeekly(payload) {
+  state.githubWeekly = payload || state.githubWeekly;
+  var visual = state.githubWeekly.visual || {};
+  if (visual.theme) { setGithubTheme(visual.theme); }
+  var savedPalette = visual.palette || {};
+  if (savedPalette.main && $("gh-color-main")) { $("gh-color-main").value = savedPalette.main; }
+  if (savedPalette.secondary && $("gh-color-secondary")) { $("gh-color-secondary").value = savedPalette.secondary; }
+  if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
+  var repos = state.githubWeekly.repos || [];
+  var list = $("github-list");
+  list.textContent = "";
+  repos.forEach(function (repo) {
+    var row = el("li", "gh-row");
+    row.appendChild(el("span", "muted", String(repo.rank)));
+    var img = document.createElement("img");
+    img.src = githubIcon(repo.icon_url);
+    img.alt = repo.name;
+    row.appendChild(img);
+    var meta = document.createElement("div");
+    meta.appendChild(el("strong", "", repo.name));
+    meta.appendChild(el("span", "gh-kind", (repo.kind || repo.language || "AI 工具") + (repo.fresh ? " · 本周新建" : " · 本周涨星")));
+    row.appendChild(meta);
+    var stars = el("div", "gh-stars");
+    var bar = el("div", "gh-bar");
+    var fill = document.createElement("span");
+    fill.style.width = Math.max(8, Math.round((repo.star_share || 0) * 100)) + "%";
+    bar.appendChild(fill);
+    stars.appendChild(bar);
+    stars.appendChild(el("span", "", repo.stars_label || String(repo.stars || 0)));
+    row.appendChild(stars);
+    list.appendChild(row);
+  });
+  renderGithubGallery();
+  $("github-xhs-title").value = state.githubWeekly.xhs_title || "本周值得关注的github ai项目前10";
+  $("github-xhs-body").value = state.githubWeekly.xhs_body || "";
+  var images = githubImages();
+  $("github-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
+  $("github-copy-btn").disabled = !repos.length;
+  $("github-select-all").disabled = !images.length;
+}
+function githubFreshUrl(url) {
+  if (!url) { return ""; }
+  var stamp = state.githubImageBust;
+  if (!stamp) { return url; }
+  return url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + stamp;
+}
+function githubImages() {
+  return (state.githubWeekly && state.githubWeekly.images) || [];
+}
+function renderGithubGallery() {
+  var gallery = $("github-gallery");
+  gallery.textContent = "";
+  githubImages().forEach(function (image, index) {
+    var extras = "";
+    if (image.busy) { extras += " is-running"; }
+    else if (image.queued) { extras += " is-queued"; }
+    if (image.error) { extras += " is-error"; }
+    if (image.selected !== false) { extras += " selected"; }
+    var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
+    var tile = el("div", "gh-tile" + kindClass + extras);
+    tile.dataset.imageId = image.id;
+    var check = document.createElement("button");
+    check.type = "button";
+    check.className = "gh-check";
+    check.textContent = image.selected === false ? "" : "✓";
+    check.addEventListener("click", function (event) {
+      event.stopPropagation();
+      toggleGithubImage(image.id);
+    });
+    tile.appendChild(check);
+    if (image.url) {
+      var img = document.createElement("img");
+      img.alt = image.title || image.id;
+      img.src = githubFreshUrl(image.url);
+      img.addEventListener("click", function () { openGithubLightbox(index); });
+      tile.appendChild(img);
+    }
+    if (image.busy) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
+    } else if (image.queued) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
+    } else if (image.error) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
+    } else if (!image.url) {
+      tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
+    }
+    gallery.appendChild(tile);
+  });
+}
+function toggleGithubImage(imageId) {
+  githubImages().forEach(function (image) {
+    if (image.id === imageId) {
+      image.selected = image.selected === false;
+    }
+  });
+  renderGithubWeekly(state.githubWeekly);
+}
+function selectAllGithubImages() {
+  var images = githubImages();
+  var allOn = images.length && images.every(function (image) { return image.selected !== false; });
+  images.forEach(function (image) { image.selected = !allOn; });
+  renderGithubWeekly(state.githubWeekly);
+}
+function openGithubLightbox(index) {
+  var images = githubImages().filter(function (image) { return image.url; });
+  if (!images.length) { return; }
+  state.draft = state.draft || {assets: {candidates: []}};
+  state.draft.assets = {
+    schema: "article-assets-v2",
+    candidates: images.map(function (image) {
+      return {id: image.id, url: image.url, source_id: "github-weekly", source_url: image.url};
+    }),
+    cover_id: "",
+    body_ids: [],
+  };
+  var start = 0;
+  images.forEach(function (image, pos) {
+    if (githubImages()[index] && image.id === githubImages()[index].id) { start = pos; }
+  });
+  openImageLightbox(start);
+}
+function loadGithubWeekly() {
+  status("hotspot-status", "正在读取周榜…");
+  return fetch("/api/github-weekly").then(function (response) { return response.json(); }).then(function (data) {
+    renderGithubWeekly(data);
+    var count = (data.repos || []).length;
+    status("hotspot-status", count ? "已显示 " + count + " 个仓库，可再点抓取周榜刷新" : "还没有周榜。点「抓取周榜」拉取本周新建的 AI 仓库，不够再用本周涨星补齐。", count ? "ok" : "");
+    return data;
+  }).catch(function (error) {
+    status("hotspot-status", "读取周榜失败：" + error.message, "error");
+  });
+}
+function refreshGithubWeekly() {
+  if (waitRunning("github_fetch")) { return; }
+  waitStart("github_fetch");
+  status("hotspot-status", "正在按星标抓取本周 GitHub AI 项目…");
+  waitApi("github_fetch", "/api/github-weekly", {}).then(function (data) {
+    if (waitCancelled("github_fetch")) { return; }
+    renderGithubWeekly(data);
+    var count = (data.repos || []).length;
+    var extra = data.model_used ? " · 榜单模型已改写简介" : " · 未配置榜单模型，简介用仓库描述";
+    if (state.lane === "github") {
+      status("hotspot-status", (count ? "已抓取 " + count + " 个仓库" : "没有抓到仓库") + extra + "。选配色后点「生成图片」。", count ? "ok" : "error");
+    }
+    waitDone(count ? ("已抓取 " + count + " 个仓库") : "没有抓到仓库", "github_fetch");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "github_fetch")) { return; }
+    status("hotspot-status", "抓取周榜失败：" + error.message, "error");
+    waitFail(error.message || "抓取周榜失败", "github_fetch");
+  });
+}
+function githubThemeDefaults(theme) {
+  return theme === "light"
+    ? {main: "#F3EFE4", secondary: "#FFFCF6", accent: "#5C4FD6"}
+    : {main: "#06155A", secondary: "#101F63", accent: "#F3F0E8"};
+}
+function visualPalette() {
+  return {
+    main: $("gh-color-main").value,
+    secondary: $("gh-color-secondary").value,
+    accent: $("gh-color-accent").value
+  };
+}
+function setGithubTheme(theme) {
+  state.githubTheme = theme === "light" ? "light" : "dark";
+  if ($("gh-theme-dark")) { $("gh-theme-dark").classList.toggle("active", state.githubTheme === "dark"); }
+  if ($("gh-theme-light")) { $("gh-theme-light").classList.toggle("active", state.githubTheme === "light"); }
+  var defaults = githubThemeDefaults(state.githubTheme);
+  if ($("gh-color-main")) { $("gh-color-main").value = defaults.main; }
+  if ($("gh-color-secondary")) { $("gh-color-secondary").value = defaults.secondary; }
+  if ($("gh-color-accent")) { $("gh-color-accent").value = defaults.accent; }
+}
+function renderGithubWeeklyImages() {
+  var button = $("github-render-btn");
+  if (!(state.githubWeekly.repos || []).length) {
+    status("hotspot-status", "请先点「抓取周榜」，再生成图片", "error");
+    return;
+  }
+  var images = githubImages();
+  if (!images.length) {
+    status("hotspot-status", "没有可生成的图片任务", "error");
+    return;
+  }
+  if (waitRunning("github_render")) { return; }
+  if (button) { busy(button, true); }
+  var palette = visualPalette();
+  var theme = state.githubTheme || "dark";
+  var total = images.length;
+  var index = 0;
+  var failed = 0;
+  state.githubImageBust = Date.now();
+  images.forEach(function (image) {
+    image.queued = true;
+    image.busy = false;
+    image.error = "";
+  });
+  renderGithubGallery();
+  waitStart("github_render", {current: 0, total: total, step: "准备开始"});
+  status("hotspot-status", "开始生成 1 / " + total + " 张周榜图…");
+  function finishRender() {
+    images.forEach(function (image) { image.queued = false; image.busy = false; });
+    renderGithubGallery();
+    if (button) { busy(button, false); }
+    $("github-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
+  }
+  function next() {
+    if (waitCancelled("github_render")) {
+      finishRender();
+      return;
+    }
+    if (index >= total) {
+      var done = total - failed;
+      if (failed && !done) {
+        waitFail("全部 " + total + " 张都没有生成", "github_render");
+        status("hotspot-status", "出图失败：全部 " + total + " 张都没有生成", "error");
+      } else {
+        waitDone(failed ? ("已生成 " + done + " / " + total + " 张，失败 " + failed + " 张") : ("已全部生成 " + done + " 张"), "github_render");
+        status("hotspot-status", failed ? ("已生成 " + done + " 张，失败 " + failed + " 张") : ("已全部生成 " + done + " 张周榜图，勾选后可导出"), failed ? "error" : "ok");
+      }
+      finishRender();
+      return;
+    }
+    var job = images[index];
+    job.queued = false;
+    job.busy = true;
+    job.error = "";
+    waitProgress(index + 1, total, job.title || job.id, "github_render");
+    if (state.lane === "github") {
+      status("hotspot-status", "正在生成第 " + (index + 1) + " / " + total + " 张 · " + (job.title || job.id));
+    }
+    renderGithubGallery();
+    // 逐张调用 /api/github-weekly/image；全量 /api/github-weekly/render 仍给脚本用
+    waitApi("github_render", "/api/github-weekly/image", {id: job.id, theme: theme, palette: palette}).then(function (data) {
+      if (waitCancelled("github_render")) {
+        job.busy = false;
+        finishRender();
+        return;
+      }
+      Object.assign(job, data, {busy: false, queued: false, error: ""});
+      index += 1;
+      next();
+    }).catch(function (error) {
+      if (isWaitAbort(error, "github_render")) {
+        job.busy = false;
+        finishRender();
+        return;
+      }
+      job.busy = false;
+      job.queued = false;
+      job.error = error.reason || error.message || "失败";
+      failed += 1;
+      index += 1;
+      next();
+    });
+  }
+  next();
+}
+function copyGithubXhs() {
+  var text = ($("github-xhs-title").value || "") + "\\n\\n" + ($("github-xhs-body").value || "");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () {
+      status("hotspot-status", "小红书文案已复制", "ok");
+    }).catch(function () {
+      $("github-xhs-body").select();
+      status("hotspot-status", "请手动复制文案", "");
+    });
+  } else {
+    $("github-xhs-body").select();
+  }
+}
+function loadGithubImage(url) {
+  return new Promise(function (resolve) {
+    if (!url) { resolve(null); return; }
+    var image = new Image();
+    image.crossOrigin = "anonymous";
+    image.onload = function () { resolve(image); };
+    image.onerror = function () { resolve(null); };
+    image.src = githubIcon(url);
+  });
+}
+function roundedRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function drawGithubCover(ctx, repos, icons) {
+  ctx.fillStyle = "#141210";
+  ctx.fillRect(0, 0, 1080, 1920);
+  ctx.fillStyle = "#d4a574";
+  ctx.font = "600 22px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText("WEEKLY", 72, 110);
+  ctx.fillStyle = "#f4efe6";
+  ctx.font = "700 96px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText("GitHub", 72, 230);
+  ctx.fillStyle = "#d4a574";
+  ctx.font = "500 36px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText("本周爆火ai工具", 72, 292);
+  repos.forEach(function (repo, index) {
+    var y = 360 + index * 148;
+    ctx.fillStyle = "#9a9284";
+    ctx.font = "600 24px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(String(repo.rank).padStart(2, "0"), 72, y + 38);
+    var icon = icons[index];
+    if (icon) {
+      ctx.save();
+      roundedRect(ctx, 128, y, 56, 56, 14);
+      ctx.clip();
+      ctx.drawImage(icon, 128, y, 56, 56);
+      ctx.restore();
+    }
+    ctx.fillStyle = "#f4efe6";
+    ctx.font = "650 30px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(repo.name, 204, y + 28);
+    ctx.fillStyle = "#9a9284";
+    ctx.font = "500 20px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(repo.kind || "", 204, y + 56);
+    ctx.fillStyle = "#2c2923";
+    roundedRect(ctx, 760, y + 28, 180, 8, 4);
+    ctx.fill();
+    ctx.fillStyle = "#c4a46a";
+    roundedRect(ctx, 760, y + 28, Math.max(16, 180 * (repo.star_share || 0)), 8, 4);
+    ctx.fill();
+    ctx.fillStyle = "#f4efe6";
+    ctx.font = "600 24px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(repo.stars_label || "", 960, y + 38);
+  });
+}
+function drawGithubPoster(ctx, repo, icon) {
+  ctx.fillStyle = "#141210";
+  ctx.fillRect(0, 0, 1080, 1920);
+  ctx.fillStyle = "#d4a574";
+  ctx.font = "600 22px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText("NO." + String(repo.rank).padStart(2, "0"), 72, 110);
+  if (icon) {
+    ctx.save();
+    roundedRect(ctx, 72, 150, 120, 120, 28);
+    ctx.clip();
+    ctx.drawImage(icon, 72, 150, 120, 120);
+    ctx.restore();
+  }
+  ctx.fillStyle = "#f4efe6";
+  ctx.font = "700 64px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText(repo.name, 220, 230);
+  ctx.fillStyle = "#9a9284";
+  ctx.font = "500 24px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText((repo.kind || "") + "  ·  " + (repo.stars_label || ""), 220, 272);
+  wrapText(ctx, repo.summary || repo.description || "", 72, 360, 936, 42, "#c9c1b4", "500 28px ui-sans-serif, system-ui, sans-serif");
+  var blocks = [
+    ["做什么", repo.does],
+    ["适合什么场景", repo.scene],
+    ["如何实现", repo.how]
+  ];
+  blocks.forEach(function (block, index) {
+    var y = 620 + index * 380;
+    ctx.fillStyle = "#1c1916";
+    roundedRect(ctx, 72, y, 936, 340, 28);
+    ctx.fill();
+    ctx.fillStyle = "#d4a574";
+    ctx.font = "600 22px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(block[0], 108, y + 52);
+    wrapText(ctx, block[1] || "", 108, y + 108, 864, 44, "#f4efe6", "500 30px ui-sans-serif, system-ui, sans-serif");
+  });
+}
+function wrapText(ctx, text, x, y, maxWidth, lineHeight, color, font) {
+  ctx.fillStyle = color;
+  ctx.font = font;
+  var line = "";
+  String(text || "").split("").forEach(function (ch) {
+    var next = line + ch;
+    if (ctx.measureText(next).width > maxWidth && line) {
+      ctx.fillText(line, x, y);
+      line = ch;
+      y += lineHeight;
+    } else {
+      line = next;
+    }
+  });
+  if (line) { ctx.fillText(line, x, y); }
+}
+function downloadCanvas(canvas, filename) {
+  var link = document.createElement("a");
+  link.href = canvas.toDataURL("image/png");
+  link.download = filename;
+  link.click();
+}
+function exportGithubImages() {
+  var selected = githubImages().filter(function (image) { return image.selected !== false && image.url; });
+  if (!selected.length) { return; }
+  if (waitRunning("export")) { return; }
+  var button = $("github-export-btn");
+  if (button) { busy(button, true); }
+  waitStart("export", {current: 0, total: selected.length, unit: "张", step: "准备导出"});
+  var chain = Promise.resolve();
+  selected.forEach(function (image, index) {
+    chain = chain.then(function () {
+      if (waitCancelled("export")) { return; }
+      waitProgress(index + 1, selected.length, image.title || image.id, "export");
+      return fetch(image.url, {signal: waitSignal("export")}).then(function (response) { return response.blob(); }).then(function (blob) {
+        var link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = (image.file || (image.id + ".png"));
+        window.setTimeout(function () { link.click(); }, index * 220);
+      });
+    });
+  });
+  chain.then(function () {
+    if (waitCancelled("export")) { return; }
+    status("hotspot-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
+    waitDone("已导出 " + selected.length + " 张", "export");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "export")) { return; }
+    status("hotspot-status", "导出失败：" + error.message, "error");
+    waitFail(error.message || "导出失败", "export");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function skillImages() {
+  return (state.skillsPackage && state.skillsPackage.images) || [];
+}
+function renderSkillPackage(payload) {
+  state.skillsPackage = payload || state.skillsPackage || {};
+  var pack = state.skillsPackage;
+  var visual = pack.visual || {};
+  if (visual.theme) { setGithubTheme(visual.theme); }
+  var savedPalette = visual.palette || {};
+  if (savedPalette.main && $("gh-color-main")) { $("gh-color-main").value = savedPalette.main; }
+  if (savedPalette.secondary && $("gh-color-secondary")) { $("gh-color-secondary").value = savedPalette.secondary; }
+  if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
+  var stages = (pack.stages || []).filter(function (stage) { return stage && !stage.gap; });
+  var skills = (pack.skills || []).filter(function (skill) { return skill && !skill.gap; });
+  pack.stages = stages;
+  pack.skills = skills;
+  var chips = $("skill-stage-chips");
+  chips.textContent = "";
+  stages.forEach(function (stage) {
+    chips.appendChild(el("li", "", stage.name || stage.id));
+  });
+  var list = $("skill-list");
+  list.textContent = "";
+  skills.forEach(function (skill) {
+    var row = el("li", "gh-row");
+    row.appendChild(el("span", "muted", skill.stage_name || skill.stage_id || ""));
+    var meta = document.createElement("div");
+    meta.appendChild(el("strong", "", skill.name || skill.source_id || ""));
+    meta.appendChild(el("span", "gh-kind", (skill.source || "GitHub") + (skill.source_id ? " · " + skill.source_id : "")));
+    row.appendChild(meta);
+    var stars = el("div", "gh-stars");
+    stars.appendChild(el("span", "", String(skill.stars || 0)));
+    row.appendChild(stars);
+    list.appendChild(row);
+  });
+  var articleTitle = (pack.article && pack.article.title) || pack.title || "";
+  var articleBody = (pack.article && pack.article.body) || "";
+  $("skills-title").textContent = articleTitle || "介绍文";
+  $("skills-body").textContent = articleBody || "查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。";
+  $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
+  renderSkillsGallery();
+  var images = skillImages();
+  $("skills-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
+  $("skills-select-all").disabled = !images.length;
+  $("skills-render-btn").disabled = !pack.title && !skills.length;
+  if (waitRunning("skill_search")) { paintWait(); }
+}
+function queuedSkillImages(pack) {
+  var tiles = [{id: "cover", kind: "cover", title: (pack && pack.title) || "Skill 查找结果", queued: true, selected: true, url: "", file: "cover.png"}];
+  ((pack && pack.skills) || []).forEach(function (skill, index) {
+    var rank = index + 1;
+    var name = skill.name || skill.source_id || ("skill-" + rank);
+    tiles.push({
+      id: (rank < 10 ? "0" : "") + rank + "-" + name,
+      kind: "poster",
+      title: name,
+      queued: true,
+      selected: true,
+      url: "",
+      file: ""
+    });
+  });
+  return tiles;
+}
+function renderSkillsGallery() {
+  var gallery = $("skills-gallery");
+  gallery.textContent = "";
+  var pack = state.skillsPackage || {};
+  var images = skillImages();
+  if (!images.length && (pack.skills || []).length) {
+    images = queuedSkillImages(pack);
+  }
+  if (!images.length) {
+    gallery.appendChild(el("p", "gh-pending", "查找完成后会自动出图。封面是主题大字报，项目卡按收录 skill 生成。"));
+    return;
+  }
+  images.forEach(function (image, index) {
+    var extras = "";
+    if (image.busy) { extras += " is-running"; }
+    else if (image.queued) { extras += " is-queued"; }
+    if (image.error) { extras += " is-error"; }
+    if (image.selected !== false) { extras += " selected"; }
+    var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
+    var tile = el("div", "gh-tile" + kindClass + extras);
+    tile.dataset.imageId = image.id;
+    var check = document.createElement("button");
+    check.type = "button";
+    check.className = "gh-check";
+    check.textContent = image.selected === false ? "" : "✓";
+    check.addEventListener("click", function (event) {
+      event.stopPropagation();
+      toggleSkillImage(image.id);
+    });
+    tile.appendChild(check);
+    if (image.url) {
+      var img = document.createElement("img");
+      img.alt = image.title || image.id;
+      img.src = githubFreshUrl(image.url);
+      img.addEventListener("click", function () { openSkillsLightbox(index); });
+      tile.appendChild(img);
+    }
+    if (image.busy) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
+    } else if (image.queued) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
+    } else if (image.error) {
+      tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
+    } else if (!image.url) {
+      tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
+    }
+    gallery.appendChild(tile);
+  });
+}
+function toggleSkillImage(imageId) {
+  skillImages().forEach(function (image) {
+    if (image.id === imageId) {
+      image.selected = image.selected === false;
+    }
+  });
+  renderSkillPackage(state.skillsPackage);
+}
+function selectAllSkillImages() {
+  var images = skillImages();
+  var allOn = images.length && images.every(function (image) { return image.selected !== false; });
+  images.forEach(function (image) { image.selected = !allOn; });
+  renderSkillPackage(state.skillsPackage);
+}
+function openSkillsLightbox(index) {
+  var images = skillImages().filter(function (image) { return image.url; });
+  if (!images.length) { return; }
+  state.draft = state.draft || {assets: {candidates: []}};
+  state.draft.assets = {
+    schema: "article-assets-v2",
+    candidates: images.map(function (image) {
+      return {id: image.id, url: image.url, source_id: "skills", source_url: image.url};
+    }),
+    cover_id: "",
+    body_ids: [],
+  };
+  var start = 0;
+  images.forEach(function (image, pos) {
+    if (skillImages()[index] && image.id === skillImages()[index].id) { start = pos; }
+  });
+  openImageLightbox(start);
+}
+function loadSkills() {
+  status("hotspot-status", "正在读取技能包…");
+  return fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
+    renderSkillPackage(data);
+    var count = (data.skills || []).length;
+    status("hotspot-status", count ? "已显示 " + count + " 个 skill，可再输入关键词查找" : "输入关键词或需求，点「查找」。", count ? "ok" : "");
+    return data;
+  }).catch(function (error) {
+    status("hotspot-status", "读取技能包失败：" + error.message, "error");
+  });
+}
+function abortSkillSearch(query) {
+  return api("/api/skills/search", {query: query || "", abort: true}).catch(function () { return null; });
+}
+function skillArticleReady(data) {
+  return !!(data && data.article && String(data.article.body || "").trim());
+}
+function pollSkillSnapshot() {
+  if (waitCancelled("skill_search")) {
+    return abortSkillSearch(($("skill-query").value || "").trim());
+  }
+  return fetch("/api/skills", {signal: waitSignal("skill_search")}).then(function (response) { return response.json(); }).then(function (data) {
+    renderSkillPackage(data);
+    var phase = data.phase || "";
+    if (phase === "skills_ready") { renderSkillImages(); }
+    if (phase === "error") {
+      var error = new Error(data.error_reason || data.error || "查找失败");
+      throw error;
+    }
+    if (skillArticleReady(data)) {
+      return data;
+    }
+    if (phase === "understanding" || phase === "chain" || phase === "decompose" || phase === "keywords" || phase === "search" || phase === "group" || phase === "compose" || phase === "searching" || phase === "skills_ready" || phase === "rendering" || phase === "done" || !phase) {
+      return new Promise(function (resolve, reject) {
+        window.setTimeout(function () { pollSkillSnapshot().then(resolve, reject); }, 350);
+      });
+    }
+    return data;
+  });
+}
+function searchSkills() {
+  var query = ($("skill-query").value || "").trim();
+  if (!query) {
+    status("hotspot-status", "请先输入关键词或需求", "error");
+    return;
+  }
+  if (waitRunning("skill_search")) { return; }
+  var button = $("skill-search-btn");
+  if (button) { busy(button, true); }
+  waitStart("skill_search");
+  status("hotspot-status", "正在按覆盖地图查找 skill…");
+  waitApi("skill_search", "/api/skills/search", {query: query}).then(function (data) {
+    if (waitCancelled("skill_search")) { return abortSkillSearch(query); }
+    renderSkillPackage(data);
+    var phase = data.phase || "";
+    if (phase === "skills_ready") { renderSkillImages(); }
+    if (phase === "searching" || !phase || !skillArticleReady(data)) {
+      return pollSkillSnapshot();
+    }
+    return data;
+  }).then(function (data) {
+    if (!data || waitCancelled("skill_search")) { return; }
+    renderSkillPackage(data);
+    var count = (data.skills || []).length;
+    var phase = data.phase || "";
+    if (phase === "skills_ready") { renderSkillImages(); }
+    status("hotspot-status", count ? "已收录 " + count + " 个 skill" : "没有找到合格 skill", count ? "ok" : "error");
+    waitDone(count ? ("已收录 " + count + " 个 skill") : "没有找到合格 skill", "skill_search");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "skill_search")) {
+      abortSkillSearch(query);
+      return;
+    }
+    status("hotspot-status", "查找失败：" + (error.reason || error.message), "error");
+    waitFail(error.message || "查找失败", "skill_search");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function renderSkillImages() {
+  var pack = state.skillsPackage || {};
+  if (!(pack.skills || []).length && !pack.title) {
+    status("hotspot-status", "请先查找 skill，再生成图片", "error");
+    return;
+  }
+  if (waitRunning("skill_render")) { return; }
+  var button = $("skills-render-btn");
+  if (button) { busy(button, true); }
+  if (!(pack.images || []).length) {
+    pack.images = queuedSkillImages(pack);
+    renderSkillsGallery();
+  }
+  waitStart("skill_render");
+  status("hotspot-status", "正在生成技能包封面和项目卡…");
+  var poll = window.setInterval(function () {
+    if (waitCancelled("skill_render")) { return; }
+    fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
+      if (data && (data.images || []).length) { renderSkillPackage(data); }
+    }).catch(function () {});
+  }, 400);
+  waitApi("skill_render", "/api/skills/render", {
+    theme: state.githubTheme || "dark",
+    palette: visualPalette()
+  }).then(function (data) {
+    if (waitCancelled("skill_render")) { return; }
+    renderSkillPackage(data);
+    var images = skillImages().filter(function (image) { return image.url; });
+    status("hotspot-status", images.length ? "已生成 " + images.length + " 张，勾选后可导出" : "没有生成图片", images.length ? "ok" : "error");
+    waitDone(images.length ? ("已生成 " + images.length + " 张") : "没有生成图片", "skill_render");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "skill_render")) { return; }
+    status("hotspot-status", "出图失败：" + (error.reason || error.message), "error");
+    waitFail(error.message || "出图失败", "skill_render");
+  }).then(function () {
+    window.clearInterval(poll);
+    if (button) { busy(button, false); }
+  });
+}
+function exportSkillImages() {
+  var selected = skillImages().filter(function (image) { return image.selected !== false && image.url; });
+  if (!selected.length) { return; }
+  if (waitRunning("export")) { return; }
+  var button = $("skills-export-btn");
+  if (button) { busy(button, true); }
+  waitStart("export", {current: 0, total: selected.length, unit: "张", step: "准备导出"});
+  var chain = Promise.resolve();
+  selected.forEach(function (image, index) {
+    chain = chain.then(function () {
+      if (waitCancelled("export")) { return; }
+      waitProgress(index + 1, selected.length, image.title || image.id, "export");
+      return fetch(image.url, {signal: waitSignal("export")}).then(function (response) { return response.blob(); }).then(function (blob) {
+        var link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = (image.file || (image.id + ".png"));
+        window.setTimeout(function () { link.click(); }, index * 220);
+      });
+    });
+  });
+  chain.then(function () {
+    if (waitCancelled("export")) { return; }
+    status("hotspot-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
+    waitDone("已导出 " + selected.length + " 张", "export");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "export")) { return; }
+    status("hotspot-status", "导出失败：" + error.message, "error");
+    waitFail(error.message || "导出失败", "export");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function fillPaper(ctx) {
+  var gradient = ctx.createLinearGradient(0, 0, 0, 1920);
+  gradient.addColorStop(0, "#f7f1e4");
+  gradient.addColorStop(1, "#efe4d2");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 1080, 1920);
+  ctx.fillStyle = "rgba(92,68,38,0.05)";
+  var y;
+  for (y = 48; y < 1920; y += 8) {
+    ctx.fillRect(0, y, 1080, 1);
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.28)";
+  ctx.fillRect(0, 0, 1080, 80);
+}
+function drawXhsCard(ctx, card) {
+  if (card.kind === "cover" && !card.image_url) {
+    ctx.fillStyle = "#3d2b1f";
+    ctx.fillRect(0, 0, 1080, 1920);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 12;
+    ctx.strokeRect(48, 48, 984, 1824);
+    wrapText(ctx, card.title || "", 96, 420, 888, 96, "#ffffff", '700 72px "Songti SC", "STSong", serif');
+    if (card.lede) {
+      wrapText(ctx, card.lede, 96, 1100, 888, 52, "#ffffff", "500 36px ui-sans-serif, system-ui, sans-serif");
+    }
+    return Promise.resolve();
+  }
+  fillPaper(ctx);
+  var handle = card.handle || "@小红书号";
+  ctx.fillStyle = "#d7c4a8";
+  ctx.beginPath();
+  ctx.arc(96, 88, 28, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#5a4c3c";
+  ctx.font = "700 22px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText(handle.replace(/^@/, "").slice(0, 1) || "A", 88, 96);
+  ctx.fillStyle = "#6a5b4a";
+  ctx.font = "500 28px ui-sans-serif, system-ui, sans-serif";
+  ctx.fillText(handle, 140, 98);
+  if (card.kind === "cover") {
+    ctx.fillStyle = "#2f291f";
+    ctx.font = "700 64px ui-sans-serif, system-ui, sans-serif";
+    wrapText(ctx, card.title || "", 72, 220, 936, 78, "#2f291f", "700 64px ui-sans-serif, system-ui, sans-serif");
+    if (card.lede) {
+      wrapText(ctx, card.lede, 72, 520, 936, 52, "#4a4034", "500 36px ui-sans-serif, system-ui, sans-serif");
+    }
+    return Promise.resolve();
+  }
+  wrapText(ctx, card.text || "", 72, 200, 936, 52, "#3c342b", "500 36px ui-sans-serif, system-ui, sans-serif");
+  return Promise.resolve();
+}
+function exportXhsImages() {
+  var cards = (state.draft && state.draft.cards) || [];
+  if (!cards.length) { return; }
+  var canvas = $("xhs-canvas");
+  canvas.width = 1080;
+  canvas.height = 1920;
+  var ctx = canvas.getContext("2d");
+  var button = $("xhs-export-btn");
+  if (button) { busy(button, true); }
+  waitStart("export", {current: 0, total: cards.length, unit: "张", step: "准备导出"});
+  var cover = cards[0] && cards[0].image_url ? loadGithubImage(cards[0].image_url) : Promise.resolve(null);
+  cover.then(function (coverImage) {
+    var chain = Promise.resolve();
+    cards.forEach(function (card, index) {
+      chain = chain.then(function () {
+        if (waitCancelled("export")) { return; }
+        waitProgress(index + 1, cards.length, card.kind || ("第 " + (index + 1) + " 张"), "export");
+        return new Promise(function (resolve) {
+          window.setTimeout(function () {
+            drawXhsCard(ctx, card);
+            if (card.kind === "cover" && coverImage) {
+              var width = 936;
+              var height = 1100;
+              ctx.save();
+              roundedRect(ctx, 72, 520, width, height, 28);
+              ctx.clip();
+              ctx.drawImage(coverImage, 72, 520, width, height);
+              ctx.restore();
+            }
+            downloadCanvas(canvas, "xhs-" + String(index + 1).padStart(2, "0") + ".png");
+            resolve();
+          }, 220);
+        });
+      });
+    });
+    return chain;
+  }).then(function () {
+    if (waitCancelled("export")) { return; }
+    status("article-status", "已导出 " + cards.length + " 张小红书图片", "ok");
+    waitDone("已导出 " + cards.length + " 张", "export");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "export")) { return; }
+    status("article-status", "导出失败：" + error.message, "error");
+    waitFail(error.message || "导出失败", "export");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function setLane(lane) {
+  if (lane !== "hotspots" && lane !== "viewpoints" && lane !== "github" && lane !== "skills") { return; }
+  if (state.lane === lane) { return; }
+  state.collectGen += 1;
+  invalidateRelatedSearch();
+  rememberArticleSession(state.lane);
+  var select = $("prompt-style-select");
+  if (state.lane === "hotspots" && select && select.value !== "经验分享") {
+    state.newsStyle = select.value;
+  }
+  state.lane = lane;
+  document.body.classList.toggle("lane-github", lane === "github");
+  document.body.classList.toggle("lane-skills", lane === "skills");
+  document.querySelectorAll("[data-lane]").forEach(function (tab) {
+    var on = tab.dataset.lane === lane;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
+  $("collect-btn").textContent = lane === "github" ? "抓取周榜" : "刷新全部";
+  delete $("collect-btn").dataset.originalLabel;
+  $("h-hotspots").textContent = lane === "github" ? "GitHub AI 项目周榜" : (lane === "viewpoints" ? "观点候选" : (lane === "skills" ? "Skill查找器" : "热点候选"));
+  $("hotspot-sub").textContent = lane === "github"
+    ? "优先本周新建的 AI 仓库，不够再用本周涨星补齐。先抓取周榜，再选浅色/暗色和三色盘后点生成图片。"
+    : (lane === "viewpoints"
+    ? "下面是 Reddit 上正在热的 AI 使用/经验帖。热度看分数和评论数；这是社区说法，不是官方新闻。"
+    : (lane === "skills"
+    ? "输入关键词或需求，按覆盖地图全网找 skill，打包成总览文和周榜式图片。封面是主题大字报。"
+    : "下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载"));
+  $("source-health-wrap").hidden = lane !== "hotspots";
+  if (select) {
+    select.value = lane === "viewpoints" ? "经验分享" : (state.newsStyle || "AI专家");
+  }
+  if (lane === "github") {
+    clearHotspotSelection(true);
+    loadGithubWeekly();
+    return;
+  }
+  if (lane === "skills") {
+    clearHotspotSelection(true);
+    loadSkills();
+    return;
+  }
+  clearHotspotSelection(true);
+  restoreArticleSession(lane);
+  loadHotspots().then(function (data) {
+    return widenIfEmpty(data || {}, currentHours());
+  });
+}
+document.querySelectorAll("[data-lane]").forEach(function (tab) {
+  tab.addEventListener("click", function () { setLane(tab.dataset.lane); });
+});
 $("seg-wechat").addEventListener("click", function () { setPlatform("wechat"); });
 $("seg-xhs").addEventListener("click", function () { setPlatform("xiaohongshu"); });
 $("find-hooks-btn").addEventListener("click", findHooks);
+$("open-original-btn").addEventListener("click", function () { openOriginal(); });
+$("original-translate").addEventListener("click", translateOriginal);
+$("original-close").addEventListener("click", closeOriginal);
+$("original-dialog").addEventListener("cancel", closeOriginal);
 $("generate-btn").addEventListener("click", generate);
 $("save-article-btn").addEventListener("click", saveArticle);
 $("image-rescan").addEventListener("click", rescanImages);
@@ -1884,8 +4522,17 @@ document.addEventListener("keydown", function (event) {
   if (event.key === "ArrowRight") { event.preventDefault(); stepImageLightbox(1); }
 });
 ["article-title", "article-body"].forEach(function (id) {
+  if (id === "article-body") {
+    $(id).addEventListener("beforeinput", captureArticleInputAnchor);
+    $(id).addEventListener("keydown", function (event) {
+      if (event.key.length === 1 || event.key === "Backspace" || event.key === "Delete" || event.key === "Enter") {
+        captureArticleInputAnchor();
+      }
+    });
+  }
   $(id).addEventListener("input", function () {
     if (id === "article-body") { fitArticleBody(); }
+    if (id === "article-body") { syncRelatedSearchEnabled(); }
     if (!state.draft) { return; }
     state.articleDirty = true;
     $("publish-btn").disabled = false;
@@ -1893,12 +4540,10 @@ document.addEventListener("keydown", function (event) {
     status("article-status", "有未保存的修改");
   });
 });
+$("article-body").addEventListener("select", syncRelatedSearchEnabled);
+$("article-body").addEventListener("mouseup", syncRelatedSearchEnabled);
+$("article-body").addEventListener("keyup", syncRelatedSearchEnabled);
 $("article-model").addEventListener("change", function (event) { changeMainModel("article", event); });
-$("chat-model").addEventListener("change", function (event) { changeMainModel("chat", event); });
-$("chat-send-btn").addEventListener("click", sendChat);
-$("chat-input").addEventListener("keydown", function (event) {
-  if (event.key === "Enter") { event.preventDefault(); sendChat(); }
-});
 $("publish-btn").addEventListener("click", publish);
 $("schedule-btn").addEventListener("click", schedulePublish);
 $("creator-btn").addEventListener("click", function () {
@@ -1907,9 +4552,46 @@ $("creator-btn").addEventListener("click", function () {
 $("config-btn").addEventListener("click", function () {
   openSettings(false);
 });
+$("favorites-btn").addEventListener("click", function () { toggleFavoritesDrawer(); });
+$("favorites-close").addEventListener("click", function () { toggleFavoritesDrawer(false); });
+$("news-supplement-btn").addEventListener("click", function () { toggleNewsSupplementDrawer(); });
+$("news-supplement-close").addEventListener("click", function () { toggleNewsSupplementDrawer(false); });
+$("related-search-btn").addEventListener("click", relatedSearch);
 $("endpoint-connect").addEventListener("click", connectEndpoint);
 $("endpoint-use-article").addEventListener("click", function () { assignEndpoint("article"); });
-$("endpoint-use-chat").addEventListener("click", function () { assignEndpoint("chat"); });
+$("endpoint-use-translation").addEventListener("click", function () { assignEndpoint("translation"); });
+$("endpoint-use-leaderboard").addEventListener("click", function () { assignEndpoint("leaderboard"); });
+$("endpoint-use-image").addEventListener("click", function () { assignEndpoint("image"); });
+$("provider-add").addEventListener("click", function () { openProviderEditor("add", null); });
+$("provider-apply").addEventListener("click", applyProvider);
+$("provider-cancel").addEventListener("click", closeProviderEditor);
+$("provider-remove").addEventListener("click", function () {
+  deleteEndpoint($("config-form").dataset.endpointId || "");
+});
+$("config-form").elements.article_provider.addEventListener("change", function () { onPurposeProviderChange("article"); });
+$("config-form").elements.translation_provider.addEventListener("change", function () { onPurposeProviderChange("translation"); });
+$("config-form").elements.leaderboard_provider.addEventListener("change", function () { onPurposeProviderChange("leaderboard"); });
+$("config-form").elements.image_provider.addEventListener("change", function () { onPurposeProviderChange("image"); });
+$("github-export-btn").addEventListener("click", exportGithubImages);
+$("github-select-all").addEventListener("click", selectAllGithubImages);
+$("github-render-btn").addEventListener("click", renderGithubWeeklyImages);
+$("skill-search-btn").addEventListener("click", searchSkills);
+$("skill-query").addEventListener("keydown", function (event) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    searchSkills();
+  }
+});
+$("skills-render-btn").addEventListener("click", renderSkillImages);
+$("skills-select-all").addEventListener("click", selectAllSkillImages);
+$("skills-export-btn").addEventListener("click", exportSkillImages);
+$("gh-theme-dark").addEventListener("click", function () { setGithubTheme("dark"); });
+$("gh-theme-light").addEventListener("click", function () { setGithubTheme("light"); });
+$("xhs-export-btn").addEventListener("click", exportXhsImages);
+$("github-copy-btn").addEventListener("click", copyGithubXhs);
+$("wechat-delete").addEventListener("click", function () { deleteAccount("wechat"); });
+$("xhs-delete").addEventListener("click", function () { deleteAccount("xiaohongshu"); });
+$("x-delete").addEventListener("click", function () { deleteAccount("x"); });
 $("config-cancel").addEventListener("click", function () {
   state.pendingPublish = false;
   $("config-dialog").close();
@@ -1938,6 +4620,7 @@ $("config-form").addEventListener("submit", function (event) {
   var button = $("config-save");
   var resumePublish = state.pendingPublish;
   busy(button, true);
+  waitStart("save");
   var accountPayload = null;
   if (state.settingsPlatform === "wechat" && (form.app_id.value || form.app_secret.value || form.thumb_media_id.value)) {
     accountPayload = {
@@ -1959,24 +4642,40 @@ $("config-form").addEventListener("submit", function (event) {
       bearer_token: form.x_bearer_token.value,
     };
   }
-  api("/api/style", {style: form.elements.style.value}).then(function (data) {
+  waitApi("save", "/api/style", {style: form.elements.style.value}).then(function (data) {
     state.style = data.style;
-    return accountPayload ? api("/api/config", accountPayload) : data;
+    return accountPayload ? waitApi("save", "/api/config", accountPayload) : data;
   }).then(function () {
     if (state.settingsPlatform === "xiaohongshu" && accountPayload) {
       state.xiaohongshu.accountName = accountPayload.account_name;
       state.xiaohongshu.creatorUrl = accountPayload.creator_url;
     }
-    state.pendingPublish = false;
-    form.reset();
-    $("config-dialog").close();
     if (state.settingsPlatform === "wechat" && accountPayload) {
-      status("wechat-status", "微信公众号 API：已配置", "ok");
+      state.platforms.wechat = {configured: true};
     }
+    if (state.settingsPlatform === "x" && accountPayload) {
+      state.platforms.x = {configured: true};
+    }
+    form.app_id.value = "";
+    form.app_secret.value = "";
+    form.thumb_media_id.value = "";
+    form.author.value = "";
+    form.account_name.value = "";
+    form.creator_url.value = "";
+    form.x_bearer_token.value = "";
+    renderAccountPanels();
+    state.pendingPublish = false;
+    status("config-error", accountPayload ? "账号已保存" : "写作风格已保存", "ok");
     status("publish-status", "");
-    if (resumePublish) { publish(); }
+    waitDone(accountPayload ? "账号已保存" : "写作风格已保存", "save");
+    if (resumePublish) {
+      $("config-dialog").close();
+      publish();
+    }
   }).catch(function (error) {
+    if (isWaitAbort(error, "save")) { return; }
     status("config-error", showApiError("保存失败：", error), "error");
+    waitFail(error.message || "保存失败", "save");
   }).then(function () {
     busy(button, false);
   });
@@ -1988,32 +4687,35 @@ fetch("/api/status").then(function (response) { return response.json(); }).then(
     state.style = data.style || "";
     var form = $("config-form");
     form.effort.value = data.llm.effort || "none";
-    form.base_url.value = data.llm.base_url || "";
     form.elements.style.value = state.style;
   }
   state.modelEndpoints = data.model_endpoints || [];
-  if (data.chat_llm) {
-    state.chat = data.chat_llm;
+  if (data.translation_llm) {
+    state.translation = data.translation_llm;
+  }
+  if (data.leaderboard_llm) {
+    state.leaderboard = data.leaderboard_llm;
+  }
+  if (data.image_llm) {
+    state.image = data.image_llm;
   }
   renderModelPicker();
-  renderChatModelPicker();
+  fillPurposePickers();
   renderEndpointLists();
+  if (data.platforms) { state.platforms = data.platforms; }
   if (data.platforms && data.platforms.xiaohongshu) {
     state.xiaohongshu.accountName = data.platforms.xiaohongshu.account_name || "";
     state.xiaohongshu.creatorUrl = data.platforms.xiaohongshu.creator_url || state.xiaohongshu.creatorUrl;
   }
-  if (data.platforms && data.platforms.wechat && data.platforms.wechat.configured) {
-    status("wechat-status", "微信公众号 API：已配置", "ok");
-  }
-  if (data.platforms && data.platforms.x && data.platforms.x.configured) {
-    status("x-status", "X 官方读取令牌：已配置", "ok");
-  }
+  renderAccountPanels();
   if (data.version) { $("service-status").textContent = "v" + data.version + " · 本地服务"; }
   if (data.sources) { renderSourceHealth(data.sources); }
+  loadFavorites();
   loadHotspots().then(function (hotspots) {
     return widenIfEmpty(hotspots || {}, currentHours());
   });
 }).catch(function () {
+  loadFavorites();
   loadHotspots().then(function (hotspots) {
     return widenIfEmpty(hotspots || {}, currentHours());
   });
@@ -2037,6 +4739,12 @@ class WebApp:
         llm_runner=None,
         credential_store=None,
         page_fetcher=None,
+        translation_service: LLMService | None = None,
+        github_fetcher=None,
+        leaderboard_service: LLMService | None = None,
+        image_service: LLMService | None = None,
+        image_generator=None,
+        visual_renderer=None,
     ) -> None:
         self.database = database
         self.packages_dir = Path(packages_dir)
@@ -2049,11 +4757,28 @@ class WebApp:
         # Chat uses its own in-memory settings; the default runner only ever
         # talks to the configured OpenAI-compatible base_url.
         self.chat_service = LLMService(database)
+        self.translation_service = translation_service or LLMService(database)
+        self._translation_model_configured = translation_service is not None
+        self.leaderboard_service = leaderboard_service or LLMService(database)
+        self._leaderboard_model_configured = leaderboard_service is not None
+        self.image_service = image_service or LLMService(database)
+        self._image_model_configured = image_service is not None
+        self.image_generator = image_generator
+        self.visual_renderer = visual_renderer
+        self.github_fetcher = github_fetcher
+        self.skill_complete = None
+        self.skill_screenshot = None
+        self.skill_web_search = None
         self.credential_store = (
             credential_store if credential_store is not None else MacOSKeychainCredentialStore()
         )
         self._restore_model_selections()
-        self.hotspots = HotspotService(database, source_tuple, fetcher=fetcher, llm_service=self.llm_service)
+        self.hotspots = HotspotService(
+            database,
+            source_tuple,
+            fetcher=fetcher,
+            llm_service=(self.translation_service if self._translation_model_configured else None),
+        )
         self.workbench = Workbench(
             database,
             llm_service=self.llm_service,
@@ -2070,13 +4795,23 @@ class WebApp:
         }
         self._wechat_base_url = wechat_base_url
         self._wechat_opener = wechat_opener
+        self._wechat_poster_renderer: object = None
         self.article_style = ""
+        self._original_text_cache: dict[str, dict[str, object]] = {}
+        self._hotspot_payloads: dict[str, dict[str, object]] = {}
         self.x_bearer_token = ""
         self.scheduler = PublishScheduler(database, self.publish, interval_seconds=15)
+        self._restore_accounts()
 
     def _restore_model_selections(self) -> None:
-        """Restore saved article/chat endpoint selections without network calls."""
-        for purpose, service in (("article", self.llm_service), ("chat", self.chat_service)):
+        """Restore saved model-purpose selections without network calls."""
+        for purpose, service in (
+            ("article", self.llm_service),
+            ("translation", self.translation_service),
+            ("chat", self.chat_service),
+            ("leaderboard", self.leaderboard_service),
+            ("image", self.image_service),
+        ):
             mapping = self.database.get_model_purpose(purpose)
             if mapping is None:
                 continue
@@ -2100,6 +4835,47 @@ class WebApp:
                     models = []
                 if isinstance(models, list):
                     self.article_models = [model for model in models if isinstance(model, str)]
+            elif purpose == "translation":
+                self._translation_model_configured = True
+            elif purpose == "leaderboard":
+                self._leaderboard_model_configured = True
+            elif purpose == "image":
+                self._image_model_configured = True
+
+    def _account_payload(self, platform: str) -> dict[str, str] | None:
+        raw = self.credential_store.get(ACCOUNT_STORE_IDS[platform])
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _store_account(self, platform: str, payload: dict[str, str]) -> None:
+        self.credential_store.set(
+            ACCOUNT_STORE_IDS[platform], json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+
+    def _restore_accounts(self) -> None:
+        wechat = self._account_payload("wechat")
+        if wechat and wechat.get("app_id") and wechat.get("app_secret"):
+            self.wechat_config = {
+                "app_id": str(wechat["app_id"]),
+                "app_secret": str(wechat["app_secret"]),
+                "thumb_media_id": str(wechat.get("thumb_media_id") or ""),
+                "author": str(wechat.get("author") or ""),
+            }
+        xhs = self._account_payload("xiaohongshu")
+        if xhs:
+            name = str(xhs.get("account_name") or "")
+            url = str(xhs.get("creator_url") or XIAOHONGSHU_CREATOR_URL)
+            if url.startswith("https://"):
+                self.xiaohongshu_config = {"account_name": name, "creator_url": url}
+        x_token = self._account_payload("x")
+        if x_token and x_token.get("bearer_token"):
+            self.x_bearer_token = str(x_token["bearer_token"])
+            self.hotspots.x_bearer_token = self.x_bearer_token
 
     def _model_endpoints(self) -> list[dict[str, object]]:
         endpoints: list[dict[str, object]] = []
@@ -2138,7 +4914,14 @@ class WebApp:
         if not isinstance(base_url, str) or not isinstance(api_key, str):
             raise ValueError("base_url and api_key are required")
         normalized_url = base_url.strip().rstrip("/")
-        current = self.llm_service.settings if purpose == "article" else self.chat_service.settings
+        services = {
+            "article": self.llm_service,
+            "translation": self.translation_service,
+            "chat": self.chat_service,
+            "leaderboard": self.leaderboard_service,
+            "image": self.image_service,
+        }
+        current = services[purpose].settings
         if api_key == "":
             api_key = self.credential_store.get(model_endpoint_id(normalized_url)) or ""
         if api_key == "" and current.base_url == normalized_url:
@@ -2160,15 +4943,20 @@ class WebApp:
         return WeChatPublisher(
             config["app_id"],
             config["app_secret"],
-            config["thumb_media_id"],
+            config.get("thumb_media_id", ""),
             config.get("author", ""),
             base_url=self._wechat_base_url or DEFAULT_WECHAT_BASE_URL,
             opener=self._wechat_opener,
+            image_fetcher=self.workbench.image_fetcher or download_image,
+            poster_renderer=self._wechat_poster_renderer,
         )
 
     def status(self) -> dict[str, object]:
         settings = self.llm_service.settings
         chat_settings = self.chat_service.settings
+        translation_settings = self.translation_service.settings
+        leaderboard_settings = self.leaderboard_service.settings
+        image_settings = self.image_service.settings
         return {
             "ok": True,
             "service": "autoposting",
@@ -2183,6 +4971,30 @@ class WebApp:
                 self.chat_service.settings_payload(chat_settings)
                 if chat_settings.base_url
                 else {"model": "", "base_url": "", "configured": False}
+            ),
+            "translation_llm": (
+                {
+                    **self.translation_service.settings_payload(translation_settings),
+                    "enabled": True,
+                }
+                if self._translation_model_configured
+                else {"model": "", "base_url": "", "configured": False, "enabled": False}
+            ),
+            "leaderboard_llm": (
+                {
+                    **self.leaderboard_service.settings_payload(leaderboard_settings),
+                    "enabled": True,
+                }
+                if self._leaderboard_model_configured
+                else {"model": "", "base_url": "", "configured": False, "enabled": False}
+            ),
+            "image_llm": (
+                {
+                    **self.image_service.settings_payload(image_settings),
+                    "enabled": True,
+                }
+                if self._image_model_configured
+                else {"model": "", "base_url": "", "configured": False, "enabled": False}
             ),
             "model_endpoints": self._model_endpoints(),
             "sources": self.hotspots.source_health(),
@@ -2200,25 +5012,196 @@ class WebApp:
         }
 
     def collect(
-        self, hours: int, force: bool = True, source_id: str | None = None
+        self,
+        hours: int,
+        force: bool = True,
+        source_id: str | None = None,
+        lane: str = "hotspots",
     ) -> dict[str, object]:
-        payload = self.hotspots.collect(hours, force=force, source_id=source_id)
+        payload = self.hotspots.collect(
+            hours, force=force, source_id=source_id, lane=lane
+        )
+        self._remember_hotspot_payloads(payload)
         return {
             "ok": True,
             "count": len(payload["candidates"]),
             **payload,
         }
 
-    def hotspots_window(self, hours: int, translate: bool = False) -> dict[str, object]:
-        payload = self.hotspots.list_window(hours, translate=translate)
+    def hotspots_window(
+        self, hours: int, translate: bool = False, lane: str = "hotspots"
+    ) -> dict[str, object]:
+        payload = self.hotspots.list_window(hours, translate=translate, lane=lane)
+        self._remember_hotspot_payloads(payload)
         return {
             "ok": True,
             "count": len(payload["candidates"]),
             **payload,
         }
+
+    def _remember_hotspot_payloads(self, payload: dict[str, object]) -> None:
+        buckets: list[object] = [payload.get("candidates") or []]
+        rankings = payload.get("rankings")
+        if isinstance(rankings, dict):
+            buckets.extend(rankings.values())
+        for items in buckets:
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict) and item.get("item_id"):
+                    self._hotspot_payloads[str(item["item_id"])] = dict(item)
+
+    def _favorite_payload_from_item(self, item: dict[str, object]) -> dict[str, object]:
+        item_id = str(item["item_id"])
+        sources = self.database.get_item_sources(item_id)
+        summary = _summary(str(item.get("content_text") or item.get("title") or ""))
+        return {
+            "item_id": item_id,
+            "title": str(item.get("title") or ""),
+            "summary": summary,
+            "content_text": str(item.get("content_text") or ""),
+            "source_ids": [str(pair["source_id"]) for pair in sources],
+            "source_urls": [str(pair.get("source_url") or "") for pair in sources],
+            "observed_at": str(item.get("published_at") or item.get("fetched_at") or ""),
+        }
+
+    def list_favorites(self) -> dict[str, object]:
+        return {"ok": True, "items": self.database.list_hotspot_favorites()}
+
+    def add_favorite(self, item_id: str) -> dict[str, object]:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise ValueError("item_id required")
+        payload = self._hotspot_payloads.get(item_id)
+        if payload is None:
+            payload = self._favorite_payload_from_item(self.database.get_item(item_id))
+        title = str(payload.get("title") or "")
+        summary = str(payload.get("summary") or payload.get("content_text") or "")
+        saved = self.database.add_hotspot_favorite(item_id, title, summary, dict(payload))
+        return {"ok": True, "item": saved}
+
+    def delete_favorite(self, item_id: str) -> dict[str, object]:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise ValueError("item_id required")
+        if not self.database.remove_hotspot_favorite(item_id):
+            raise KeyError(item_id)
+        return {"ok": True, "item_id": item_id}
 
     def find_hooks(self, item_id: str) -> dict[str, object]:
         return self.workbench.find_hooks(item_id)
+
+    def related_search(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("related search payload must be a JSON object")
+        draft_id = payload.get("draft_id")
+        selection = payload.get("selected_text", payload.get("selection"))
+        start = payload.get("selection_start")
+        end = payload.get("selection_end")
+        if not isinstance(draft_id, str) or not draft_id.strip():
+            raise ValueError("draft_id required")
+        if not isinstance(selection, str) or not selection.strip():
+            raise ValueError("selection required")
+        if len(selection) > RELATED_SELECTION_LIMIT:
+            raise ValueError(f"selection must be at most {RELATED_SELECTION_LIMIT} characters")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+        ):
+            raise ValueError("selection_start and selection_end must be integers")
+        return self.workbench.related_search(
+            draft_id.strip(), selection, start, end
+        )
+
+    def original(self, item_id: str) -> dict[str, object]:
+        cached = self._original_text_cache.get(item_id)
+        if cached is not None:
+            return {"ok": True, **cached}
+        item = self.database.get_item(item_id)
+        sources: list[dict[str, str]] = []
+        seen: set[str] = set()
+        pairs = self.database.get_item_sources(item_id)
+        candidates = [
+            (str(pair.get("source_id") or "原站"), str(pair.get("source_url") or ""))
+            for pair in pairs
+        ]
+        candidates.append(("原站", str(item.get("canonical_url") or "")))
+        for source_id, url in candidates:
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or url in seen:
+                continue
+            seen.add(url)
+            sources.append({"source_id": source_id, "url": url})
+        stored = str(item.get("content_text") or "")
+        content = stored
+        content_source = "feed"
+        is_reddit = "reddit.com" in str(item.get("canonical_url") or "").lower()
+        if is_reddit:
+            result = {
+                "item_id": item_id,
+                "title": str(item.get("title") or ""),
+                "content": content,
+                "content_source": "feed",
+                "content_note": "正文和热评来自 Reddit 收录，未抓板块页面",
+                "translatable": _looks_english(content or str(item.get("title") or "")),
+                "sources": sources,
+            }
+            return {"ok": True, **result}
+        if sources and self.workbench.page_fetcher is not None:
+            try:
+                fetched = article_page_text(self.workbench.page_fetcher(sources[0]["url"]))
+            except (OSError, TimeoutError, ValueError, UnicodeError):
+                fetched = ""
+            if fetched and (not stored or len(fetched) > max(240, len(stored) + 80)):
+                content = fetched
+                content_source = "page"
+        result = {
+            "item_id": item_id,
+            "title": str(item.get("title") or ""),
+            "content": content,
+            "content_source": content_source,
+            "content_note": (
+                "已从原站提取正文" if content_source == "page" else "原站正文不可用，显示 RSS 已收录内容"
+            ),
+            "translatable": _looks_english(content or str(item.get("title") or "")),
+            "sources": sources,
+        }
+        if content_source == "page":
+            self._original_text_cache[item_id] = result
+        return {"ok": True, **result}
+
+    def translate_original(self, item_id: str) -> dict[str, object]:
+        if not self._translation_model_configured:
+            raise ValueError("translation_model_not_configured")
+        original = self.original(item_id)
+        if not original["translatable"]:
+            raise ValueError("original_is_already_chinese")
+        translated = self.translation_service.translate_batch(
+            [
+                {
+                    "item_id": item_id,
+                    "title": (
+                        str(original["title"])
+                        if not _has_cjk(str(original["title"]))
+                        else "English article"
+                    ),
+                    "summary": str(original["content"]),
+                }
+            ]
+        )[item_id]
+        if translated["status"] != "translated":
+            raise LLMError(
+                str(translated.get("error_code") or "translation_failed"),
+                str(translated.get("error_reason") or "文章翻译失败"),
+            )
+        return {
+            "ok": True,
+            "item_id": item_id,
+            "translation": translated["summary_zh"],
+            "model": self.translation_service.settings.model,
+        }
 
     def articles(
         self,
@@ -2228,13 +5211,24 @@ class WebApp:
         provider: str | None = None,
         effort: str | None = None,
         chosen_hooks: object = None,
+        prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
+        item_ids: list[str] | None = None,
     ) -> dict[str, object]:
         if not self._article_model_configured:
             raise ValueError("article_model_not_configured")
         return {
             "ok": True,
             **self.workbench.generate_article(
-                item_id, platform, model, provider, effort, self.article_style, chosen_hooks
+                item_id,
+                platform,
+                model,
+                provider,
+                effort,
+                self.article_style,
+                chosen_hooks,
+                prompt_style,
+                self.xiaohongshu_config.get("account_name") or "",
+                item_ids,
             ),
         }
 
@@ -2244,17 +5238,31 @@ class WebApp:
 
     def edit_article(self, draft_id: str, title: str, body: str) -> dict[str, object]:
         draft = self.workflow.edit_draft(draft_id, title, body)
-        return {
+        return self._draft_view(draft)
+
+    def _draft_view(self, draft: dict[str, object]) -> dict[str, object]:
+        assets = normalize_assets(draft["assets_json"])
+        payload: dict[str, object] = {
             "ok": True,
-            "draft_id": draft_id,
+            "draft_id": str(draft["draft_id"]),
             "event_id": str(draft["event_id"]),
             "platform": str(draft["platform"]),
             "status": str(draft["status"]),
             "title": str(draft["title"]),
             "body": str(draft["body"]),
             "source_ids": json.loads(str(draft["source_ids_json"])),
-            "assets": normalize_assets(draft["assets_json"]),
+            "assets": assets,
         }
+        if str(draft["platform"]) == "xiaohongshu":
+            payload.update(
+                xhs_fields(
+                    str(draft["title"]),
+                    str(draft["body"]),
+                    assets,
+                    self.xiaohongshu_config.get("account_name") or "",
+                )
+            )
+        return payload
 
     def update_article_images(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict):
@@ -2271,30 +5279,14 @@ class WebApp:
         if not isinstance(body_ids, list) or any(not isinstance(item, str) for item in body_ids):
             raise ValueError("body_ids must be a list of strings")
         draft = self.workflow.update_draft_images(draft_id, cover_id, body_ids)
-        return {
-            "ok": True,
-            "draft_id": draft_id,
-            "title": str(draft["title"]),
-            "body": str(draft["body"]),
-            "status": str(draft["status"]),
-            "assets": normalize_assets(draft["assets_json"]),
-            "source_ids": json.loads(str(draft["source_ids_json"])),
-        }
+        return self._draft_view(draft)
 
     def rescan_article_images(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict) or not isinstance(payload.get("draft_id"), str):
             raise ValueError("draft_id required")
         bundle = self.workbench.rescan_images(payload["draft_id"])
         draft = self.workflow.replace_draft_image_bundle(payload["draft_id"], bundle)
-        return {
-            "ok": True,
-            "draft_id": payload["draft_id"],
-            "title": str(draft["title"]),
-            "body": str(draft["body"]),
-            "status": str(draft["status"]),
-            "assets": normalize_assets(draft["assets_json"]),
-            "source_ids": json.loads(str(draft["source_ids_json"])),
-        }
+        return self._draft_view(draft)
 
     def proxy_image(self, url: str) -> tuple[bytes, str]:
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -2332,13 +5324,27 @@ class WebApp:
         if not isinstance(payload, dict):
             raise ValueError("model discovery settings must be a JSON object")
         purpose = payload.get("purpose", "article")
-        if purpose not in ("article", "chat"):
-            raise ValueError("purpose must be article or chat")
+        if purpose not in ("article", "translation", "chat", "leaderboard", "image"):
+            raise ValueError("purpose must be article, translation, chat, leaderboard, or image")
+        persist = payload.get("persist", True)
+        if not isinstance(persist, bool):
+            raise ValueError("persist must be boolean")
+        saved_models = payload.get("models")
+        if saved_models is not None:
+            if not isinstance(saved_models, list) or any(
+                not isinstance(item, str) or not item.strip() for item in saved_models
+            ):
+                raise ValueError("models must be a list of strings")
+            saved_models = [item.strip() for item in saved_models]
         base_url, api_key = self._resolve_endpoint_credentials(payload, purpose)
         discovered = self.llm_service.discover_models(base_url, api_key)
         endpoint_id = model_endpoint_id(base_url)
-        self.database.upsert_model_endpoint(endpoint_id, base_url, discovered)
-        self.credential_store.set(endpoint_id, api_key)
+        if persist:
+            self.database.upsert_model_endpoint(
+                endpoint_id, base_url, discovered if saved_models is None else saved_models
+            )
+            if api_key:
+                self.credential_store.set(endpoint_id, api_key)
         return {
             "ok": True,
             "endpoint_id": endpoint_id,
@@ -2363,13 +5369,524 @@ class WebApp:
             "model_endpoints": self._model_endpoints(),
         }
 
+    def set_translation_model(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("translation model settings must be a JSON object")
+        base_url, api_key = self._resolve_endpoint_credentials(payload, "translation")
+        settings = self.translation_service.configure_verified(
+            model=payload.get("model"),
+            effort="none",
+            base_url=base_url,
+            api_key=api_key,
+        )
+        self._translation_model_configured = True
+        self.hotspots.llm_service = self.translation_service
+        self._activate_endpoint("translation", settings)
+        return {
+            "ok": True,
+            "translation_llm": {
+                **self.translation_service.settings_payload(settings),
+                "enabled": True,
+            },
+            "model_endpoints": self._model_endpoints(),
+        }
+
+    def set_leaderboard_model(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("leaderboard model settings must be a JSON object")
+        base_url, api_key = self._resolve_endpoint_credentials(payload, "leaderboard")
+        settings = self.leaderboard_service.configure_verified(
+            model=payload.get("model"),
+            effort="none",
+            base_url=base_url,
+            api_key=api_key,
+        )
+        self._leaderboard_model_configured = True
+        self._activate_endpoint("leaderboard", settings)
+        return {
+            "ok": True,
+            "leaderboard_llm": {
+                **self.leaderboard_service.settings_payload(settings),
+                "enabled": True,
+            },
+            "model_endpoints": self._model_endpoints(),
+        }
+
+    def set_image_model(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("image model settings must be a JSON object")
+        base_url, api_key = self._resolve_endpoint_credentials(payload, "image")
+        if self.image_generator is not None:
+            settings = self.image_service.configure(
+                model=str(payload.get("model") or "image"),
+                effort="none",
+                base_url=base_url,
+                api_key=api_key,
+            )
+        else:
+            settings = self.image_service.configure_verified_image(
+                model=payload.get("model"),
+                base_url=base_url,
+                api_key=api_key,
+            )
+        self._image_model_configured = True
+        self._activate_endpoint("image", settings)
+        return {
+            "ok": True,
+            "image_llm": {
+                **self.image_service.settings_payload(settings),
+                "enabled": True,
+            },
+            "model_endpoints": self._model_endpoints(),
+        }
+
+    def github_weekly(self) -> dict[str, object]:
+        snapshot = self.database.get_github_weekly()
+        if snapshot is None:
+            return {
+                "ok": True,
+                "week_start": week_window_start(),
+                "fetched_at": "",
+                "repos": [],
+                "xhs_title": XHS_TITLE,
+                "xhs_body": "",
+                "model_used": "",
+                "images": [],
+                "visual": {},
+                "count": 0,
+            }
+        return {"ok": True, "count": len(snapshot["repos"]), **snapshot}
+
+    def github_weekly_refresh(self) -> dict[str, object]:
+        repos = fetch_weekly_ai_repos(getter=self.github_fetcher)
+        model_used = ""
+        if self._leaderboard_model_configured:
+            try:
+                repos = self.leaderboard_service.enrich_github_repos(repos)
+                model_used = self.leaderboard_service.settings.model
+            except LLMError:
+                model_used = ""
+        title, body = build_xhs_copy(repos)
+        images = build_weekly_image_jobs(repos)
+        saved = self.database.save_github_weekly(
+            week_window_start(), repos, title, body, model_used, images
+        )
+        return {"ok": True, "count": len(repos), **saved}
+
+    def github_weekly_render(self, payload: object) -> dict[str, object]:
+        snapshot = self.database.get_github_weekly()
+        if snapshot is None or not snapshot.get("repos"):
+            raise ValueError("github_weekly_empty")
+        body = payload if isinstance(payload, dict) else {}
+        theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
+        palette = parse_palette(body.get("palette"))
+        repos = list(snapshot["repos"])
+        jobs = list(snapshot.get("images") or []) or build_weekly_image_jobs(repos)
+        generate = self.image_service.generate_image if self._image_model_configured else None
+        if self.visual_renderer is None:
+            images = render_weekly_visual(
+                repos,
+                jobs,
+                self.packages_dir / "github-weekly",
+                theme=theme,
+                palette=palette,
+                generate_image=generate,
+            )
+        else:
+            images = self.visual_renderer(
+                repos,
+                jobs,
+                self.packages_dir / "github-weekly",
+                theme=theme,
+                palette=palette,
+            )
+        visual = {"theme": theme, "palette": palette}
+        saved = self.database.save_github_weekly(
+            str(snapshot["week_start"]),
+            repos,
+            str(snapshot["xhs_title"]),
+            str(snapshot["xhs_body"]),
+            str(snapshot.get("model_used") or ""),
+            images,
+            visual=visual,
+        )
+        return {"ok": True, "count": len(repos), **saved}
+
+    def _skill_llm(self):
+        if self.skill_complete is not None:
+            return self.skill_complete
+        if not self._article_model_configured:
+            return None
+
+        def complete(prompt: str) -> str:
+            return self.llm_service._run(prompt, self.llm_service.settings)
+
+        return complete
+
+    def _merge_latest_skill_fields(self, snapshot: dict[str, object]) -> dict[str, object]:
+        latest = self.database.get_skill_finder() or {}
+        incoming = snapshot.get("article") if isinstance(snapshot.get("article"), dict) else {}
+        latest_article = latest.get("article") if isinstance(latest.get("article"), dict) else {}
+        if str(latest_article.get("body") or "").strip() and not str(incoming.get("body") or "").strip():
+            snapshot["article"] = dict(latest_article)
+            title = str(latest_article.get("title") or "").strip()
+            if title:
+                snapshot["title"] = title
+        latest_images = latest.get("images")
+        if isinstance(latest_images, list) and latest_images and not snapshot.get("images"):
+            snapshot["images"] = list(latest_images)
+        if isinstance(latest.get("visual"), dict) and not snapshot.get("visual"):
+            snapshot["visual"] = dict(latest["visual"])
+        latest_phase = str(latest.get("phase") or "")
+        if latest_phase in {"rendering", "done"} and snapshot.get("phase") not in {"error", "done"}:
+            snapshot["phase"] = latest_phase
+        return snapshot
+
+    def _restore_skill_article_from_package(self, snapshot: dict[str, object]) -> dict[str, object]:
+        article = snapshot.get("article") if isinstance(snapshot.get("article"), dict) else {}
+        if str(article.get("body") or "").strip():
+            return snapshot
+        package_path = Path(str(snapshot.get("package_path") or ""))
+        restored: dict[str, str] | None = None
+        index_path = package_path / "index.json"
+        if index_path.is_file():
+            try:
+                packed = json.loads(index_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                packed = {}
+            packed_article = packed.get("article") if isinstance(packed, dict) else None
+            if isinstance(packed_article, dict) and str(packed_article.get("body") or "").strip():
+                restored = {
+                    "title": str(packed_article.get("title") or snapshot.get("title") or "").strip(),
+                    "body": str(packed_article.get("body") or "").strip(),
+                }
+        if restored is None:
+            article_md = package_path / "article.md"
+            if article_md.is_file():
+                try:
+                    text = article_md.read_text(encoding="utf-8").strip()
+                except OSError:
+                    text = ""
+                if text:
+                    title = str(snapshot.get("title") or "")
+                    body = text
+                    if text.startswith("# "):
+                        first, _, rest = text.partition("\n")
+                        title = first[2:].strip() or title
+                        body = rest.strip()
+                    restored = {"title": title, "body": body}
+        if restored is None:
+            return snapshot
+        snapshot["article"] = restored
+        if restored.get("title"):
+            snapshot["title"] = restored["title"]
+        self.database.save_skill_finder(snapshot)
+        return snapshot
+
+    def skills_snapshot(self) -> dict[str, object]:
+        snapshot = self.database.get_skill_finder()
+        if snapshot is None:
+            return {
+                "ok": True,
+                "query": "",
+                "title": "",
+                "theme": "",
+                "stages": [],
+                "skills": [],
+                "article": {"title": "", "body": ""},
+                "package_path": "",
+                "images": [],
+                "phase": "",
+                "count": 0,
+            }
+        snapshot = self._restore_skill_article_from_package(dict(snapshot))
+        skills = snapshot.get("skills") if isinstance(snapshot.get("skills"), list) else []
+        body = {"ok": True, "count": len(skills), **snapshot}
+        body.setdefault("phase", "")
+        return body
+
+    def skills_search(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("query must be 1-200 characters")
+        if payload.get("abort"):
+            cancel = getattr(self, "_skill_cancel", None)
+            if isinstance(cancel, threading.Event):
+                cancel.set()
+            snapshot = self.database.get_skill_finder() or {}
+            snapshot = dict(snapshot)
+            if snapshot.get("phase") in {"searching", "rendering"}:
+                snapshot["phase"] = "error"
+                snapshot["error_reason"] = "已停止"
+                snapshot = self.database.save_skill_finder(snapshot)
+            skills = snapshot.get("skills") if isinstance(snapshot.get("skills"), list) else []
+            return {"ok": True, "count": len(skills), **snapshot}
+        if not isinstance(payload.get("query"), str):
+            raise ValueError("query must be 1-200 characters")
+        query = payload["query"].strip()
+        if not query or len(query) > 200:
+            raise ValueError("query must be 1-200 characters")
+        complete = self._skill_llm()
+        if complete is None:
+            raise LLMError("skill_search_failed", "模型未配置", cause_code="llm_not_configured")
+        previous = self.database.get_skill_finder()
+        cancel = threading.Event()
+        self._skill_cancel = cancel
+        seed = {
+            "query": query,
+            "title": query,
+            "theme": query,
+            "stages": [],
+            "skills": [],
+            "article": {"title": "", "body": ""},
+            "images": [],
+            "package_path": "",
+            "phase": "searching",
+        }
+        saved = self.database.save_skill_finder(seed)
+        persist_lock = getattr(self, "_skill_persist_lock", None)
+        if persist_lock is None:
+            persist_lock = threading.Lock()
+            self._skill_persist_lock = persist_lock
+
+        def persist(kind: str, data: dict[str, object]) -> None:
+            if cancel.is_set() and kind != "error":
+                return
+            body = dict(data)
+            with persist_lock:
+                self._merge_latest_skill_fields(body)
+                if kind == "error":
+                    body["phase"] = "error"
+                elif body.get("phase") not in {"rendering", "done"}:
+                    if kind in {"skills_ready", "article"}:
+                        body["phase"] = "skills_ready"
+                    elif str(body.get("phase") or "") in {
+                        "understanding",
+                        "chain",
+                        "decompose",
+                        "keywords",
+                        "search",
+                        "group",
+                        "compose",
+                    }:
+                        pass
+                    else:
+                        body["phase"] = "searching"
+                self.database.save_skill_finder(body)
+
+        def run() -> None:
+            try:
+                result = find_skills(
+                    query,
+                    complete=complete,
+                    github_get=self.github_fetcher,
+                    web_search=self.skill_web_search,
+                    output_root=self.packages_dir.parent / "skills",
+                    on_event=persist,
+                    previous=previous,
+                    cancel=cancel.is_set,
+                )
+                result = dict(result)
+                with persist_lock:
+                    self._merge_latest_skill_fields(result)
+                    if cancel.is_set():
+                        result["phase"] = "error"
+                        result["error_reason"] = "已停止"
+                    elif result.get("phase") not in {"skills_ready", "done", "error", "rendering"}:
+                        result["phase"] = "skills_ready"
+                    self.database.save_skill_finder(result)
+            except LLMError as exc:
+                failed = dict(self.database.get_skill_finder() or saved)
+                failed["phase"] = "error"
+                failed["error"] = exc.code
+                failed["error_reason"] = exc.reason
+                with persist_lock:
+                    self.database.save_skill_finder(failed)
+            except Exception as exc:
+                failed = dict(self.database.get_skill_finder() or saved)
+                failed["phase"] = "error"
+                failed["error"] = type(exc).__name__
+                failed["error_reason"] = str(exc)
+                with persist_lock:
+                    self.database.save_skill_finder(failed)
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._skill_thread = thread
+        thread.start()
+        return self.skills_snapshot()
+
+    def skills_render(self, payload: object) -> dict[str, object]:
+        snapshot = self.database.get_skill_finder()
+        if snapshot is None:
+            raise ValueError("skill_package_empty")
+        body = payload if isinstance(payload, dict) else {}
+        theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
+        palette = parse_palette(body.get("palette")) if body.get("palette") is not None else None
+        package_path = Path(str(snapshot.get("package_path") or self.packages_dir.parent / "skills" / "latest"))
+        images_dir = package_path / "images"
+        http_dir = self.packages_dir / "skills"
+        generate = self.image_service.generate_image if self._image_model_configured else None
+        snapshot = dict(snapshot)
+        persist_lock = getattr(self, "_skill_persist_lock", None)
+        if persist_lock is None:
+            persist_lock = threading.Lock()
+            self._skill_persist_lock = persist_lock
+        snapshot["phase"] = "rendering"
+        with persist_lock:
+            self._merge_latest_skill_fields(snapshot)
+            snapshot["phase"] = "rendering"
+            self.database.save_skill_finder(snapshot)
+
+        def publish_images(images: list[dict[str, object]]) -> None:
+            http_dir.mkdir(parents=True, exist_ok=True)
+            for image in images:
+                filename = str(image.get("file") or f"{image.get('id')}.png")
+                source = images_dir / filename
+                if source.is_file():
+                    target = http_dir / filename
+                    target.write_bytes(source.read_bytes())
+                image["url"] = f"/api/generated/skills/{filename}"
+            snapshot["images"] = list(images)
+            snapshot["phase"] = "rendering"
+            with persist_lock:
+                self._merge_latest_skill_fields(snapshot)
+                snapshot["images"] = list(images)
+                snapshot["phase"] = "rendering"
+                self.database.save_skill_finder(snapshot)
+
+        def on_image(image: dict[str, object]) -> None:
+            current = list(snapshot.get("images") or [])
+            replaced = False
+            for index, row in enumerate(current):
+                if str(row.get("id") or "") == str(image.get("id") or ""):
+                    current[index] = image
+                    replaced = True
+                    break
+            if not replaced:
+                current.append(image)
+            publish_images(current)
+
+        images = render_skill_package(
+            snapshot,
+            images_dir,
+            theme=theme,
+            palette=palette,
+            screenshot_fn=self.skill_screenshot,
+            visual_renderer=self.visual_renderer,
+            generate_image=generate,
+            on_image=on_image,
+        )
+        http_dir.mkdir(parents=True, exist_ok=True)
+        for image in images:
+            filename = str(image.get("file") or f"{image.get('id')}.png")
+            source = images_dir / filename
+            if source.is_file():
+                target = http_dir / filename
+                target.write_bytes(source.read_bytes())
+            image["url"] = f"/api/generated/skills/{filename}"
+        snapshot["images"] = images
+        snapshot["visual"] = {"theme": theme, "palette": palette or {}}
+        snapshot["phase"] = "done"
+        with persist_lock:
+            self._merge_latest_skill_fields(snapshot)
+            snapshot["images"] = images
+            snapshot["visual"] = {"theme": theme, "palette": palette or {}}
+            snapshot["phase"] = "done"
+            saved = self.database.save_skill_finder(snapshot)
+        skills = saved.get("skills") if isinstance(saved.get("skills"), list) else []
+        return {"ok": True, "count": len(skills), **saved}
+
+    def github_weekly_image(self, image_id: str, payload: object = None) -> dict[str, object]:
+        snapshot = self.database.get_github_weekly()
+        if snapshot is None:
+            raise ValueError("github_weekly_empty")
+        images = list(snapshot.get("images") or [])
+        match = next((item for item in images if str(item.get("id")) == image_id), None)
+        if match is None:
+            raise KeyError(image_id)
+        body = payload if isinstance(payload, dict) else {}
+        visual = snapshot.get("visual") if isinstance(snapshot.get("visual"), dict) else {}
+        if body.get("theme") is not None or body.get("palette") is not None:
+            theme = (
+                "light"
+                if str(body.get("theme") or visual.get("theme") or "").strip().lower() == "light"
+                else "dark"
+            )
+            palette = parse_palette(
+                body.get("palette") if body.get("palette") is not None else visual.get("palette")
+            )
+            visual = {"theme": theme, "palette": palette}
+        else:
+            theme = "light" if str(visual.get("theme") or "").strip().lower() == "light" else "dark"
+            palette = parse_palette(visual.get("palette"))
+        generate = self.image_service.generate_image if self._image_model_configured else None
+        if self.visual_renderer is None:
+            rendered = render_weekly_visual(
+                list(snapshot["repos"]),
+                [match],
+                self.packages_dir / "github-weekly",
+                theme=theme,
+                palette=palette,
+                generate_image=generate,
+            )
+        else:
+            rendered = self.visual_renderer(
+                list(snapshot["repos"]),
+                [match],
+                self.packages_dir / "github-weekly",
+                theme=theme,
+                palette=palette,
+            )
+        if not rendered:
+            raise ValueError("image_generation_failed")
+        updated = []
+        for item in images:
+            if str(item.get("id")) == image_id:
+                updated.append(rendered[0])
+            else:
+                updated.append(item)
+        saved = self.database.save_github_weekly(
+            str(snapshot["week_start"]),
+            list(snapshot["repos"]),
+            str(snapshot["xhs_title"]),
+            str(snapshot["xhs_body"]),
+            str(snapshot.get("model_used") or ""),
+            updated,
+            visual=visual if isinstance(visual, dict) else {},
+        )
+        return {"ok": True, **rendered[0], "count": len(saved["repos"])}
+
+    def generated_image(self, name: str, collection: str = "github-weekly") -> tuple[bytes, str]:
+        safe = Path(name).name
+        if safe != name or not safe.endswith(".png"):
+            raise ValueError("image_url_invalid")
+        folder = "skills" if collection == "skills" else "github-weekly"
+        path = (self.packages_dir / folder / safe).resolve()
+        root = (self.packages_dir / folder).resolve()
+        if root not in path.parents and path != root / safe:
+            raise ValueError("image_url_invalid")
+        if not path.is_file() and folder == "skills":
+            snapshot = self.database.get_skill_finder()
+            package = Path(str((snapshot or {}).get("package_path") or ""))
+            fallback = (package / "images" / safe).resolve()
+            if package.as_posix() and fallback.is_file():
+                path = fallback
+        if not path.is_file():
+            raise KeyError(name)
+        return path.read_bytes(), "image/png"
+
     def delete_model_endpoint(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict) or not isinstance(payload.get("endpoint_id"), str) or not payload["endpoint_id"].strip():
             raise ValueError("endpoint_id required")
         endpoint_id = payload["endpoint_id"].strip()
         if self.database.get_model_endpoint(endpoint_id) is None:
             raise KeyError(endpoint_id)
-        for purpose, service in (("article", self.llm_service), ("chat", self.chat_service)):
+        for purpose, service in (
+            ("article", self.llm_service),
+            ("translation", self.translation_service),
+            ("chat", self.chat_service),
+            ("leaderboard", self.leaderboard_service),
+            ("image", self.image_service),
+        ):
             mapping = self.database.get_model_purpose(purpose)
             if mapping is not None and str(mapping["endpoint_id"]) == endpoint_id:
                 service.configure(
@@ -2382,6 +5899,13 @@ class WebApp:
                 if purpose == "article":
                     self._article_model_configured = False
                     self.article_models = []
+                elif purpose == "translation":
+                    self._translation_model_configured = False
+                    self.hotspots.llm_service = None
+                elif purpose == "leaderboard":
+                    self._leaderboard_model_configured = False
+                elif purpose == "image":
+                    self._image_model_configured = False
         self.credential_store.delete(endpoint_id)
         self.database.delete_model_endpoint(endpoint_id)
         return {
@@ -2391,6 +5915,26 @@ class WebApp:
                 self.chat_service.settings_payload(self.chat_service.settings)
                 if self.chat_service.settings.base_url
                 else {"model": "", "base_url": "", "configured": False}
+            ),
+            "translation_llm": (
+                {
+                    **self.translation_service.settings_payload(
+                        self.translation_service.settings
+                    ),
+                    "enabled": True,
+                }
+                if self._translation_model_configured
+                else {"model": "", "base_url": "", "configured": False, "enabled": False}
+            ),
+            "leaderboard_llm": (
+                {
+                    **self.leaderboard_service.settings_payload(
+                        self.leaderboard_service.settings
+                    ),
+                    "enabled": True,
+                }
+                if self._leaderboard_model_configured
+                else {"model": "", "base_url": "", "configured": False, "enabled": False}
             ),
             "model_endpoints": self._model_endpoints(),
         }
@@ -2413,7 +5957,7 @@ class WebApp:
             raise ValueError("config must be a JSON object")
         platform = payload.get("platform")
         if platform == "wechat":
-            required = ("app_id", "app_secret", "thumb_media_id")
+            required = ("app_id", "app_secret")
             missing = [
                 field
                 for field in required
@@ -2421,17 +5965,22 @@ class WebApp:
             ]
             if missing:
                 raise ValueError(f"wechat config missing: {', '.join(missing)}")
+            thumb_media_id = payload.get("thumb_media_id", "")
+            if thumb_media_id is None:
+                thumb_media_id = ""
+            if not isinstance(thumb_media_id, str):
+                raise ValueError("thumb_media_id must be a string")
             self.wechat_config = {
                 "app_id": payload["app_id"],
                 "app_secret": payload["app_secret"],
-                "thumb_media_id": payload["thumb_media_id"],
+                "thumb_media_id": thumb_media_id,
                 "author": str(payload.get("author", "")),
             }
+            self._store_account("wechat", self.wechat_config)
             return {
                 "ok": True,
                 "platform": "wechat",
                 "configured": True,
-                "author": self.wechat_config["author"],
             }
         if platform == "xiaohongshu":
             account_name = payload.get("account_name", "")
@@ -2444,6 +5993,7 @@ class WebApp:
                 "creator_url": creator_url,
                 "account_name": account_name.strip(),
             }
+            self._store_account("xiaohongshu", self.xiaohongshu_config)
             return {"ok": True, "platform": "xiaohongshu", "configured": True}
         if platform == "x":
             token = payload.get("bearer_token", "")
@@ -2451,8 +6001,28 @@ class WebApp:
                 raise ValueError("x bearer_token required")
             self.x_bearer_token = token.strip()
             self.hotspots.x_bearer_token = self.x_bearer_token
+            self._store_account("x", {"bearer_token": self.x_bearer_token})
             return {"ok": True, "platform": "x", "configured": True}
         raise ValueError(f"unsupported platform: {platform}")
+
+    def delete_config(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("config must be a JSON object")
+        platform = payload.get("platform")
+        if platform not in ACCOUNT_STORE_IDS:
+            raise ValueError(f"unsupported platform: {platform}")
+        self.credential_store.delete(ACCOUNT_STORE_IDS[platform])
+        if platform == "wechat":
+            self.wechat_config = None
+        elif platform == "xiaohongshu":
+            self.xiaohongshu_config = {
+                "creator_url": XIAOHONGSHU_CREATOR_URL,
+                "account_name": "",
+            }
+        else:
+            self.x_bearer_token = ""
+            self.hotspots.x_bearer_token = ""
+        return {"ok": True, "platform": platform, "configured": False}
 
     def publish(self, draft_id: str, platform: str, live: bool = False) -> dict[str, object]:
         with self._publish_lock:
@@ -2498,10 +6068,10 @@ class WebApp:
             draft_id, str(draft["content_hash"]), False
         )
         existing = self.database.get_publication_attempt(attempt_id)
-        if existing and existing["status"] == "SUBMITTED":
+        if existing and existing["status"] in {"SUBMITTED", "DRAFT_SAVED"}:
             return {
                 "ok": True,
-                "status": "SUBMITTED",
+                "status": existing["status"],
                 "reference": str(existing["response_reference"]),
                 "archive_path": str(archive_path),
             }
@@ -2511,7 +6081,7 @@ class WebApp:
             draft_id,
             "wechat",
             False,
-            "SUBMITTED",
+            str(outcome["status"]),
             None,
             0,
             response_reference=str(outcome["reference"]),
@@ -2613,7 +6183,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             try:
-                if self.path == "/":
+                if urlsplit(self.path).path == "/":
                     body = INDEX_HTML.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2623,6 +6193,15 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     return
                 if self.path == "/api/status":
                     self._send_json(200, app.status())
+                    return
+                if self.path == "/api/github-weekly":
+                    self._send_json(200, app.github_weekly())
+                    return
+                if self.path == "/api/skills":
+                    self._send_json(200, app.skills_snapshot())
+                    return
+                if self.path == "/api/favorites":
+                    self._send_json(200, app.list_favorites())
                     return
                 parsed = urlsplit(self.path)
                 if parsed.path == "/api/hotspots":
@@ -2637,10 +6216,35 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         )
                     translate_flag = (parse_qs(parsed.query).get("translate") or ["0"])[0]
                     translate = translate_flag.lower() in {"1", "true", "yes"}
-                    self._send_json(200, app.hotspots_window(hours, translate=translate))
+                    lane = (parse_qs(parsed.query).get("lane") or ["hotspots"])[0]
+                    if lane not in {"hotspots", "viewpoints"}:
+                        raise ValueError("lane must be hotspots or viewpoints")
+                    self._send_json(
+                        200, app.hotspots_window(hours, translate=translate, lane=lane)
+                    )
                     return
                 if parsed.path == "/api/schedule":
                     self._send_json(200, app.list_schedule())
+                    return
+                if parsed.path.startswith("/api/generated/github-weekly/"):
+                    name = parsed.path.rsplit("/", 1)[-1]
+                    data, content_type = app.generated_image(name)
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if parsed.path.startswith("/api/generated/skills/"):
+                    name = parsed.path.rsplit("/", 1)[-1]
+                    data, content_type = app.generated_image(name, "skills")
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
                     return
                 if parsed.path == "/api/image-proxy":
                     url = (parse_qs(parsed.query).get("url") or [""])[0]
@@ -2704,28 +6308,81 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         not isinstance(source_id, str) or not source_id.strip()
                     ):
                         raise ValueError("source_id must be a non-empty string")
+                    lane = payload.get("lane", "hotspots") if isinstance(payload, dict) else "hotspots"
+                    if lane not in {"hotspots", "viewpoints"}:
+                        raise ValueError("lane must be hotspots or viewpoints")
                     result = app.collect(
-                        hours, force=force, source_id=source_id.strip() if source_id else None
+                        hours,
+                        force=force,
+                        source_id=source_id.strip() if source_id else None,
+                        lane=lane,
                     )
                 elif self.path == "/api/hooks/find":
                     result = app.find_hooks(self._require_string(payload, "item_id"))
+                elif self.path == "/api/original":
+                    result = app.original(self._require_string(payload, "item_id"))
+                elif self.path == "/api/original/translate":
+                    result = app.translate_original(self._require_string(payload, "item_id"))
+                elif self.path == "/api/favorites":
+                    result = app.add_favorite(self._require_string(payload, "item_id"))
                 elif self.path == "/api/articles":
+                    item_ids = payload.get("item_ids") if isinstance(payload, dict) else None
+                    if item_ids is not None:
+                        if not isinstance(item_ids, list) or any(
+                            not isinstance(value, str) for value in item_ids
+                        ):
+                            raise ValueError("item_ids must be a list of strings")
+                    item_id = payload.get("item_id") if isinstance(payload, dict) else None
+                    if isinstance(item_ids, list) and [
+                        value.strip() for value in item_ids if value.strip()
+                    ]:
+                        if not isinstance(item_id, str) or not item_id.strip():
+                            item_id = sorted(
+                                {value.strip() for value in item_ids if value.strip()}
+                            )[0]
+                    else:
+                        item_ids = None
+                        item_id = self._require_string(payload, "item_id")
                     result = app.articles(
-                        self._require_string(payload, "item_id"),
+                        item_id,
                         self._require_string(payload, "platform"),
                         payload.get("model") if isinstance(payload, dict) else None,
                         payload.get("provider") if isinstance(payload, dict) else None,
                         payload.get("effort") if isinstance(payload, dict) else None,
                         payload.get("chosen_hooks") if isinstance(payload, dict) else None,
+                        payload.get("prompt_style", DEFAULT_ARTICLE_PROMPT_STYLE)
+                        if isinstance(payload, dict)
+                        else DEFAULT_ARTICLE_PROMPT_STYLE,
+                        item_ids,
                     )
+                elif self.path == "/api/related-search":
+                    result = app.related_search(payload)
                 elif self.path == "/api/config":
                     result = app.set_config(payload)
+                elif self.path == "/api/config/delete":
+                    result = app.delete_config(payload)
                 elif self.path == "/api/model":
                     result = app.set_model(payload)
                 elif self.path == "/api/models":
                     result = app.models(payload)
                 elif self.path == "/api/chat/model":
                     result = app.set_chat_model(payload)
+                elif self.path == "/api/github-weekly":
+                    result = app.github_weekly_refresh()
+                elif self.path == "/api/github-weekly/render":
+                    result = app.github_weekly_render(payload)
+                elif self.path == "/api/github-weekly/image":
+                    result = app.github_weekly_image(self._require_string(payload, "id"), payload)
+                elif self.path == "/api/skills/search":
+                    result = app.skills_search(payload)
+                elif self.path == "/api/skills/render":
+                    result = app.skills_render(payload)
+                elif self.path == "/api/image/model":
+                    result = app.set_image_model(payload)
+                elif self.path == "/api/leaderboard/model":
+                    result = app.set_leaderboard_model(payload)
+                elif self.path == "/api/translation/model":
+                    result = app.set_translation_model(payload)
                 elif self.path == "/api/model-endpoints/delete":
                     result = app.delete_model_endpoint(payload)
                 elif self.path == "/api/chat":
@@ -2783,6 +6440,46 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         "error_type": "LLMError",
                     },
                 )
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+
+        def do_DELETE(self) -> None:
+            try:
+                if self.headers.get_content_type() != "application/json":
+                    raise ValueError("content_type_must_be_application_json")
+                origin = self.headers.get("Origin")
+                if origin:
+                    try:
+                        parsed_origin = urlsplit(origin)
+                        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+                    except ValueError:
+                        parsed_origin = None
+                        origin_port = None
+                    if (
+                        parsed_origin is None
+                        or parsed_origin.scheme != "http"
+                        or parsed_origin.hostname not in ALLOWED_HOSTS
+                        or origin_port != self.server.server_port
+                    ):
+                        self._send_json(
+                            403,
+                            {
+                                "ok": False,
+                                "error": "cross_origin_request_rejected",
+                                "error_type": "PermissionError",
+                            },
+                        )
+                        return
+                payload = self._read_json_body()
+                if self.path == "/api/favorites":
+                    result = app.delete_favorite(self._require_string(payload, "item_id"))
+                else:
+                    raise KeyError(self.path)
+                self._send_json(200, result)
+            except KeyError as exc:
+                self._send_json(404, {"ok": False, "error": f"not_found:{exc}", "error_type": "KeyError"})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc), "error_type": "ValueError"})
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
 

@@ -7,11 +7,9 @@ from dataclasses import dataclass
 
 from .db import Database
 from .images import (
-    append_image_credits,
     apply_selection,
-    cover_image,
     normalize_assets,
-    selected_body_images,
+    strip_image_credits,
 )
 from .engagement import frame_article_body
 from .normalize import contains_source_id
@@ -254,7 +252,12 @@ class ContentWorkflow:
         source_ids = tuple(json.loads(str(draft_row["source_ids_json"])))
         if "AIGC" not in body:
             raise ValueError("aigc_disclosure_required")
-        if any(not contains_source_id(body, source_id) for source_id in source_ids):
+        source_urls = self.database.get_source_urls(source_ids)
+        if any(
+            not contains_source_id(body, source_id)
+            and not any(url and url in body for url in source_urls.get(source_id, set()))
+            for source_id in source_ids
+        ):
             raise ValueError("source_ids_required")
         tags = tuple(json.loads(str(draft_row["tags_json"])))
         try:
@@ -288,11 +291,7 @@ class ContentWorkflow:
         bundle = apply_selection(
             normalize_assets(draft_row["assets_json"]), cover_id, body_ids
         )
-        body = append_image_credits(
-            str(draft_row["body"]),
-            selected_body_images(bundle),
-            cover_image(bundle),
-        )
+        body = strip_image_credits(str(draft_row["body"]))
         tags = tuple(json.loads(str(draft_row["tags_json"])))
         source_ids = tuple(json.loads(str(draft_row["source_ids_json"])))
         draft = Draft(
@@ -317,11 +316,7 @@ class ContentWorkflow:
         if not self.database.is_current_draft(draft_id):
             raise ValueError("draft_superseded")
         normalized = normalize_assets(bundle)
-        body = append_image_credits(
-            str(draft_row["body"]),
-            selected_body_images(normalized),
-            cover_image(normalized),
-        )
+        body = strip_image_credits(str(draft_row["body"]))
         tags = tuple(json.loads(str(draft_row["tags_json"])))
         source_ids = tuple(json.loads(str(draft_row["source_ids_json"])))
         draft = Draft(

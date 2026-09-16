@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,46 @@ from test_ingestion import RSS_FEED
 
 
 class ConfigAndPipelineTests(unittest.TestCase):
+    def test_existing_database_gains_translation_model_purpose(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "legacy.db"
+            with sqlite3.connect(path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE model_endpoints (
+                        endpoint_id TEXT PRIMARY KEY,
+                        base_url TEXT NOT NULL,
+                        models_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE model_endpoint_purposes (
+                        purpose TEXT PRIMARY KEY CHECK (purpose IN ('article', 'chat')),
+                        endpoint_id TEXT NOT NULL REFERENCES model_endpoints(endpoint_id),
+                        model TEXT NOT NULL,
+                        effort TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO model_endpoints VALUES (
+                        'legacy', 'https://models.example/v1', '[]', 'now', 'now'
+                    );
+                    INSERT INTO model_endpoint_purposes VALUES (
+                        'article', 'legacy', 'old-model', 'none', 'now'
+                    );
+                    """
+                )
+
+            database = Database(path)
+            database.initialize()
+            database.set_model_purpose("translation", "legacy", "translate-model", "none")
+
+            self.assertEqual("old-model", database.get_model_purpose("article")["model"])
+            self.assertEqual(
+                "translate-model", database.get_model_purpose("translation")["model"]
+            )
+            database.set_model_purpose("leaderboard", "legacy", "board-model", "none")
+            self.assertEqual("board-model", database.get_model_purpose("leaderboard")["model"])
+
     def test_source_registry_loads_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "sources.json"
@@ -181,7 +222,10 @@ class ConfigAndPipelineTests(unittest.TestCase):
         disabled_ids = {source.source_id for source in sources if not source.enabled}
 
         self.assertGreaterEqual(len(enabled), 8)
-        self.assertTrue(all(source.type in {"rss", "sitemap"} for source in enabled))
+        self.assertTrue(all(source.type in {"rss", "sitemap", "reddit"} for source in enabled))
+        reddit = [source for source in enabled if source.type == "reddit"]
+        self.assertEqual(6, len(reddit))
+        self.assertTrue(all(source.tier == "S4" for source in reddit))
         self.assertTrue(
             all("aihot.virxact.com" not in source.url_or_handle for source in enabled)
         )

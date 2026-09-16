@@ -19,3 +19,6 @@ output/
 archives/autoposting-patch-0.1*
 archives/autoposting-patch-0.2*
 archives/autoposting-patch-0.3*
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/

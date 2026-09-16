@@ -1,4 +1,4 @@
-"""Load article-generation instructions from docs/ARTICLE_PROMPT.md."""
+"""Load article-generation instructions from docs/ARTICLE_BASE_PROMPT.md."""
 
 from __future__ import annotations
 
@@ -7,8 +7,15 @@ import os
 import re
 from pathlib import Path
 
-ARTICLE_PROMPT_FILENAME = "ARTICLE_PROMPT.md"
-DEFAULT_ARTICLE_PROMPT_VERSION = "article-v4"
+ARTICLE_BASE_PROMPT_FILENAME = "ARTICLE_BASE_PROMPT.md"
+ARTICLE_STYLE_PROMPT_FILES = {
+    "AI专家": "AI专家.md",
+    "经验分享": "经验分享.md",
+}
+ARTICLE_STYLE_PROMPT_IDS = tuple(ARTICLE_STYLE_PROMPT_FILES)
+ARTICLE_STYLE_PROMPT_DIRNAME = "article_styles"
+DEFAULT_ARTICLE_PROMPT_VERSION = "article-v12"
+DEFAULT_ARTICLE_PROMPT_STYLE = "AI专家"
 _SECTION_RE = re.compile(r"^##\s+(\S+)\s*$", re.MULTILINE)
 _VERSION_RE = re.compile(r"^version:\s*(\S+)\s*$", re.MULTILINE)
 _PLATFORM_ALIASES = {
@@ -25,8 +32,8 @@ def article_prompt_paths() -> tuple[Path, ...]:
         path
         for path in (
             Path(override) if override else None,
-            here.parents[2] / "docs" / ARTICLE_PROMPT_FILENAME,
-            Path.cwd() / "docs" / ARTICLE_PROMPT_FILENAME,
+            here.parents[2] / "docs" / ARTICLE_BASE_PROMPT_FILENAME,
+            Path.cwd() / "docs" / ARTICLE_BASE_PROMPT_FILENAME,
         )
         if path is not None
     )
@@ -39,6 +46,24 @@ def load_article_prompt_doc(path: str | Path | None = None) -> str:
         if candidate.is_file():
             return candidate.read_text(encoding="utf-8")
     raise FileNotFoundError("article_prompt_doc_missing")
+
+
+def article_style_prompt_paths(style_id: str) -> tuple[Path, ...]:
+    filename = ARTICLE_STYLE_PROMPT_FILES.get(style_id)
+    if filename is None:
+        raise ValueError("prompt_style must be one of AI专家, 经验分享")
+    here = Path(__file__).resolve()
+    return (
+        here.parents[2] / "docs" / ARTICLE_STYLE_PROMPT_DIRNAME / filename,
+        Path.cwd() / "docs" / ARTICLE_STYLE_PROMPT_DIRNAME / filename,
+    )
+
+
+def load_article_style_prompt(style_id: str) -> str:
+    for candidate in article_style_prompt_paths(style_id):
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8").strip()
+    raise FileNotFoundError(f"article_style_prompt_missing:{style_id}")
 
 
 def parse_article_prompt_doc(text: str) -> dict[str, str]:
@@ -72,6 +97,7 @@ def build_article_prompt(
     source_ids: tuple[str, ...] | list[str],
     payload: dict[str, object],
     style: str = "",
+    preset_style: str = "",
     doc_text: str | None = None,
 ) -> str:
     if platform not in {"wechat", "xiaohongshu"}:
@@ -83,7 +109,9 @@ def build_article_prompt(
     specific = _section(sections, platform)
     if not specific:
         raise ValueError(f"article_prompt_missing_section:{platform}")
-    style_block = f"写作风格要求：\n{style.strip()}\n" if style.strip() else ""
+    styles = [value.strip() for value in (preset_style, style) if value.strip()]
+    style_text = "\n".join(styles)
+    style_block = f"写作风格要求：\n{style_text}\n" if styles else ""
     data = json.dumps(payload, ensure_ascii=False)
     values = {
         "{source_ids}": ", ".join(source_ids),

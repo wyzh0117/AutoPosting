@@ -14,6 +14,7 @@ from .db import Database
 from .engagement import extract_hn_id
 from .images import BROWSER_UA, extract_image_urls_from_feed_fields, is_chrome_image_url
 from .models import CollectionResult, FeedItem, Source
+from .reddit import RedditCollector
 from .normalize import canonicalize_url, normalize_text
 
 AI_CONTENT_PATTERN = re.compile(

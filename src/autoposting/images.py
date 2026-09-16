@@ -7,13 +7,15 @@ page). Nothing here generates pictures. Ranking prefers a 3:4 portrait ratio.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 import struct
 from html.parser import HTMLParser
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 IMAGE_LIMIT = 4
 IMAGE_CANDIDATE_CAP = 16
@@ -331,7 +333,27 @@ def default_probe_fetcher(url: str) -> bytes:
         return response.read(65536)
 
 
+def _validate_public_page_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+        raise ValueError("page_url_invalid")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    addresses = {
+        result[4][0]
+        for result in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    }
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("page_url_not_public")
+
+
+class _PublicRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_page_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def default_page_fetcher(url: str) -> bytes:
+    _validate_public_page_url(url)
     request = Request(
         url,
         headers={
@@ -339,7 +361,7 @@ def default_page_fetcher(url: str) -> bytes:
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
         },
     )
-    with urlopen(request, timeout=15) as response:
+    with build_opener(_PublicRedirectHandler()).open(request, timeout=15) as response:
         return response.read(1_500_000)
 
 
@@ -508,11 +530,9 @@ def append_image_credits(
     images: list[dict[str, object]],
     cover: dict[str, object] | None = None,
 ) -> str:
-    credits = format_image_credits(images, cover)
-    stripped = strip_image_credits(body)
-    if not credits:
-        return stripped
-    return stripped + "\n\n" + credits
+    # Source links belong on the image itself when the draft is rendered.
+    # Keep this compatibility helper from reintroducing a source block at the end.
+    return strip_image_credits(body)
 
 
 def candidate_entry(image: dict[str, object]) -> dict[str, object]:
@@ -543,10 +563,7 @@ def suggest_selection(candidates: list[dict[str, object]]) -> tuple[str, list[st
     ranked = select_article_images(candidates, limit=max(len(candidates), 1))
     if not ranked:
         return "", []
-    cover_id = str(ranked[0]["id"])
-    if len(ranked) <= IMAGE_LIMIT:
-        return cover_id, [str(item["id"]) for item in ranked]
-    return cover_id, [str(item["id"]) for item in ranked[1:IMAGE_LIMIT]]
+    return str(ranked[0]["id"]), []
 
 
 def build_asset_bundle(
@@ -595,6 +612,7 @@ def normalize_assets(raw: object) -> dict[str, object]:
         }
         if parsed.get("item_id"):
             payload["item_id"] = str(parsed["item_id"])
+        _copy_manuscript(parsed, payload)
         return payload
     if isinstance(parsed, list):
         return build_asset_bundle([item for item in parsed if isinstance(item, dict)])
@@ -619,7 +637,14 @@ def apply_selection(
     }
     if normalized.get("item_id"):
         payload["item_id"] = normalized["item_id"]
+    _copy_manuscript(normalized, payload)
     return payload
+
+
+def _copy_manuscript(source: dict[str, object], dest: dict[str, object]) -> None:
+    manuscript = source.get("manuscript")
+    if isinstance(manuscript, str) and manuscript.strip():
+        dest["manuscript"] = manuscript
 
 
 def _by_id(bundle: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -656,14 +681,17 @@ _SRC_RE = re.compile(r'src=["\']([^"\']+)["\']', re.I)
 
 def figure_html(image: dict[str, object], published_url: str | None = None) -> str:
     src = published_url or str(image.get("url") or "")
-    caption_source = str(image.get("source_id") or "原文")
-    original = str(image.get("url") or "")
-    return (
-        '<p class="autoposting-figure" style="margin:12px 0 16px;">'
+    original = str(image.get("source_url") or image.get("url") or "")
+    href = _safe_external_url(original)
+    image_html = (
         f'<img src="{_escape_attr(src)}" alt="" '
         'style="display:block;width:100%;max-width:100%;aspect-ratio:3/4;object-fit:cover;"/>'
-        f'<span style="display:block;margin-top:6px;font-size:12px;color:#888;">'
-        f"来源：{_escape_text(caption_source)} · {_escape_text(original)}</span></p>"
+    )
+    if href:
+        image_html = f'<a href="{_escape_attr(href)}">{image_html}</a>'
+    return (
+        '<p class="autoposting-figure" style="margin:12px 0 16px;">'
+        f"{image_html}</p>"
     )
 
 
@@ -676,5 +704,17 @@ def _escape_attr(value: str) -> str:
     )
 
 
-def _escape_text(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def _safe_external_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or any(char.isspace() for char in value)
+    ):
+        return ""
+    return value

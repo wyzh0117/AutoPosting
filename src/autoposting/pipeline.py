@@ -9,6 +9,7 @@ from .ingestion import (
     AggregateCollector,
     Fetcher,
     RSSCollector,
+    RedditCollector,
     SitemapNewsCollector,
     XCollector,
 )
@@ -75,7 +76,7 @@ def collect_sources(
             errors[source.source_id] = message
             failed += 1
             continue
-        if source.type not in {"rss", "web", "x", "sitemap"}:
+        if source.type not in {"rss", "web", "x", "sitemap", "reddit"}:
             message = f"collector_not_implemented_for_{source.type}"
             database.record_fetch_result(source.source_id, message)
             errors[source.source_id] = message
@@ -93,6 +94,8 @@ def collect_sources(
                 collector = AggregateCollector(database, fetcher=fetcher)
             elif source.type == "sitemap":
                 collector = SitemapNewsCollector(database, fetcher=fetcher)
+            elif source.type == "reddit":
+                collector = RedditCollector(database, fetcher=fetcher)
             else:
                 collector = XCollector(
                     database, fetcher=fetcher, bearer_token=x_bearer_token
@@ -110,6 +113,11 @@ def collect_sources(
                     continue
                 inserted += outcome.inserted
                 duplicates += outcome.duplicates
+                failed += outcome.failed
+                if outcome.failed:
+                    stored = database.get_source(source_id)
+                    message = str(stored.get("last_error") or "source_failed")
+                    errors[source_id] = message
 
     return CollectionBatchResult(
         inserted=inserted,

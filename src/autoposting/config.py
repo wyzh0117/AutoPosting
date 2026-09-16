@@ -63,12 +63,17 @@ def _source_from_mapping(data: object, index: int) -> Source:
         raise ConfigError(f"sources[{index}].source_id is invalid")
     if not isinstance(name, str) or not name.strip():
         raise ConfigError(f"sources[{index}].name is required")
-    if source_type not in {"rss", "web", "x", "sitemap"}:
-        raise ConfigError(f"sources[{index}].type must be rss, web, x, or sitemap")
+    if source_type not in {"rss", "web", "x", "sitemap", "reddit"}:
+        raise ConfigError(f"sources[{index}].type must be rss, web, x, sitemap, or reddit")
     if tier not in {"S1", "S2", "S3", "S4"}:
         raise ConfigError(f"sources[{index}].tier must be S1, S2, S3, or S4")
     if not isinstance(location, str) or not location.strip():
         raise ConfigError(f"sources[{index}].url_or_handle is required")
+    if source_type == "reddit":
+        handle = location.strip().lstrip("r/").lstrip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", handle):
+            raise ConfigError(f"sources[{index}].url_or_handle must be a subreddit name")
+        location = handle
     if source_type in {"rss", "web", "sitemap"}:
         parts = urlsplit(location)
         if parts.scheme not in {"http", "https"} or not parts.netloc:
