@@ -61,12 +61,12 @@ _RELATED_TRAILING = re.compile(r"[\s\"'‘’“”「」『』（）()【】\[\
 _RELATED_LEADING = re.compile(r"^[\s\"'‘’“”「」『』（）()【】\[\]《》]+")
 _RELATED_SEARCH_BUDGET_SECONDS = 20.0
 _RELATED_SEARCH_REQUEST_TIMEOUT = 3.5
-_RELATED_SEARCH_MAX_ATTEMPTS = 4
+_RELATED_SEARCH_MAX_ATTEMPTS = 5
 # The parent process must outlive the child by a wide margin.  The join window
 # covers the spawn/interpreter start (a fresh interpreter re-imports the whole
 # package) plus the macOS Foundation native fallback, which can add one extra
 # request timeout on top of a native attempt.  Worst-case child work is
-# 4 x 3.5s = 14s < the 20s budget, and the parent still waits 10s longer than
+# 5 x 3.5s = 17.5s < the 20s budget, and the parent still waits 10s longer than
 # that budget; total wall clock stays under ~35s, which is acceptable for an
 # interactive button.
 _RELATED_SEARCH_PROCESS_MARGIN_SECONDS = 10.0
@@ -155,6 +155,11 @@ RELATED_SEARCH_CAUSES = (
 # native plus a urllib timeout) and it is what consumed the old 14s budget; it
 # can be re-added here together with the attempt cap.
 _RELATED_SEARCH_SOURCES: tuple[tuple[str, str, str], ...] = (
+    (
+        "google",
+        "Google 新闻",
+        "https://news.google.com/rss/search?q={encoded}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    ),
     ("bing_news", "Bing 资讯", "https://www.bing.com/news/search?format=rss&q={encoded}"),
     ("bing_cn", "Bing 中国", "https://cn.bing.com/search?format=rss&q={encoded}"),
     ("bing", "Bing", "https://www.bing.com/search?format=rss&q={encoded}"),
@@ -162,14 +167,13 @@ _RELATED_SEARCH_SOURCES: tuple[tuple[str, str, str], ...] = (
 )
 _RELATED_SEARCH_SOURCE_LABELS = {name: label for name, label, _ in _RELATED_SEARCH_SOURCES}
 _RELATED_SEARCH_RSS_SOURCES = frozenset({"bing", "bing_cn", "bing_news", "google"})
-# News first for Chinese queries (Bing News answers Chinese queries with real
-# coverage), plain web search first for ASCII queries.
-_RELATED_SEARCH_CJK_ORDER = ("bing_news", "bing_cn", "bing", "ddg")
-_RELATED_SEARCH_ASCII_ORDER = ("bing", "bing_news", "bing_cn", "ddg")
+# Google News RSS first (no API key). Other hosts fill in if Google is empty.
+_RELATED_SEARCH_CJK_ORDER = ("google", "bing_news", "bing_cn", "bing", "ddg")
+_RELATED_SEARCH_ASCII_ORDER = ("google", "bing", "bing_news", "bing_cn", "ddg")
 
 
 def _related_search_sources(query: str) -> tuple[tuple[str, str, str], ...]:
-    """Order sources for the query script; Bing hosts always come first."""
+    """Order sources for the query script; Google News RSS always comes first."""
     order = (
         _RELATED_SEARCH_CJK_ORDER
         if _RELATED_CJK_RUN.search(query)
@@ -1153,7 +1157,7 @@ def _related_payload_loaded(payload: object) -> bool:
 
 
 def _search_related_news_impl(
-    selection: str, fetcher: Fetcher | None = None, limit: int = 1
+    selection: str, fetcher: Fetcher | None = None, limit: int = 8
 ) -> RelatedSearchReport:
     """Search the derived query and return the first qualified article.
 
@@ -1309,7 +1313,7 @@ def _related_report_payload(report: RelatedSearchReport) -> dict[str, object]:
 
 
 def _search_related_news_bounded(
-    selection: str, limit: int = 1
+    selection: str, limit: int = 8
 ) -> RelatedSearchReport:
     """Run default network search in a process that can be terminated."""
     start_methods = get_all_start_methods()
@@ -1375,7 +1379,7 @@ def _search_related_news_bounded(
 
 
 def search_related_news(
-    selection: str, fetcher: Fetcher | None = None, limit: int = 1
+    selection: str, fetcher: Fetcher | None = None, limit: int = 8
 ) -> RelatedSearchReport:
     """Search news related to a selection.
 

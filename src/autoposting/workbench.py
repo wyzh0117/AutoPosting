@@ -63,6 +63,21 @@ HOTSPOT_HOUR_MIN = 1
 HOTSPOT_HOUR_MAX = 720
 HOTSPOT_LIMIT = 10
 HOTSPOT_POOL = 40
+PASTED_PAGE_LIMIT = 20000
+RELATED_SEARCH_ITEM_LIMIT = 8
+
+
+def _with_pasted_page(
+    material: str, background: dict[str, object], pasted_text: object
+) -> tuple[str, dict[str, object]]:
+    text = str(pasted_text or "").strip()
+    if not text:
+        return material, background
+    clipped = text[:PASTED_PAGE_LIMIT]
+    updated = dict(background)
+    updated["pasted_page"] = clipped
+    prefix = f"{material}\n\n" if str(material or "").strip() else ""
+    return f"{prefix}用户粘贴的原文页面：\n{clipped}", updated
 
 
 def xhs_fields(
@@ -510,7 +525,9 @@ class Workbench:
         derived = derive_related_query(selection)
         try:
             search_fetcher = None if self.page_fetcher is default_page_fetcher else self.page_fetcher
-            query, results = search_related_news(selection, fetcher=search_fetcher, limit=1)
+            query, results = search_related_news(
+                selection, fetcher=search_fetcher, limit=RELATED_SEARCH_ITEM_LIMIT
+            )
         except RelatedSearchError as exc:
             # Full cause (including the upstream exception text) stays in the
             # server log; the API only ever sees the graded Chinese reason.
@@ -559,7 +576,7 @@ class Workbench:
         return {
             "ok": True,
             "query": query,
-            "items": items[:1],
+            "items": items[:RELATED_SEARCH_ITEM_LIMIT],
             "search_status": "ok" if items else "empty",
             "cause_code": cause_code,
             "query_degraded": bool(derived.degraded),
@@ -579,6 +596,7 @@ class Workbench:
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         xhs_handle: str = "",
         item_ids: list[str] | None = None,
+        pasted_text: str | None = None,
     ) -> dict[str, object]:
         if platform not in {"wechat", "xiaohongshu"}:
             raise ValueError(f"unsupported platform: {platform}")
@@ -594,6 +612,7 @@ class Workbench:
                 chosen_hooks=chosen_hooks,
                 prompt_style=prompt_style,
                 xhs_handle=xhs_handle,
+                pasted_text=pasted_text,
             )
         if ids:
             item_id = ids[0]
@@ -664,6 +683,7 @@ class Workbench:
         background["source_refs"] = source_refs
         if hooks:
             background["chosen_hooks"] = hooks
+        material, background = _with_pasted_page(material, background, pasted_text)
         article = self.llm_service.generate_article(
             platform,
             str(item["title"]),
@@ -770,6 +790,7 @@ class Workbench:
         chosen_hooks: object = None,
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         xhs_handle: str = "",
+        pasted_text: str | None = None,
     ) -> dict[str, object]:
         preset_style = load_article_style_prompt(prompt_style)
         prepared: list[dict[str, object]] = []
@@ -842,6 +863,7 @@ class Workbench:
         background["source_refs"] = source_refs
         if hooks:
             background["chosen_hooks"] = hooks
+        material, background = _with_pasted_page(material, background, pasted_text)
         article = self.llm_service.generate_article(
             platform,
             fused_title,

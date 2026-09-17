@@ -348,7 +348,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.0", payload["version"])
+        self.assertEqual("1.4.1", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1902,7 +1902,10 @@ class IndexPageContractTests(unittest.TestCase):
         html = self._index()
         self.assertIn("function resetArticle()", html)
         self.assertIn("state.draft = null", html)
-        self.assertIn("state.item = item;\n  resetArticle();", html)
+        select_js = html.split("function selectHotspot(item, button)")[1].split(
+            "function clearHotspotSelection("
+        )[0]
+        self.assertNotIn("resetArticle()", select_js)
         self.assertIn(
             "state.platform = platform;\n"
             '  document.body.classList.toggle("platform-xhs", platform === "xiaohongshu");\n'
@@ -2041,7 +2044,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.0", html)
+        self.assertIn("1.4.1", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2517,10 +2520,12 @@ class IndexPageContractTests(unittest.TestCase):
             'button.addEventListener("click", function () { selectHotspot(item, button); });',
             hotspots_js,
         )
+        self.assertNotIn("resetArticle()", select_js)
         # ...and the explicit multi-select checkbox lives on the card instead.
         self.assertIn("pickToggle(item)", hotspots_js)
         self.assertIn("function pickToggle(item)", html)
         self.assertIn('togglePicked(item.item_id);', html)
+        self.assertNotIn("resetArticle()", select_js)
 
     def test_render_picked_dock_shows_focus_and_picks_together(self) -> None:
         """A2: 焦点 and 已选 N are two independent groups and must coexist."""
@@ -2567,6 +2572,8 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertNotIn("storeGeneratedArticle", helper)
 
         generate_js = html.split("function generate()")[1].split("\nfunction persistArticle(")[0]
+        self.assertIn('id="article-paste"', html)
+        self.assertIn("payload.pasted_text", generate_js)
         success = generate_js.split('waitApi("generate", "/api/articles", payload).then(')[1]
         success_body = success.split("}).catch(")[0]
         failure = generate_js.split("}).catch(function (error) {")[1]
@@ -2615,10 +2622,11 @@ class IndexPageContractTests(unittest.TestCase):
         dock_css = html.split("#picked-dock{")[1].split("}")[0]
         self.assertIn("position:fixed", dock_css)
         self.assertIn("bottom:", dock_css)
-        self.assertIn("right:", dock_css)
+        self.assertIn("left:", dock_css)
         self.assertIn("bottom:1.5rem", dock_css)
-        self.assertIn("right:1.5rem", dock_css)
-        self.assertIn("z-index:25", dock_css)
+        self.assertIn("left:1.5rem", dock_css)
+        self.assertNotIn("right:", dock_css)
+        self.assertIn("z-index:45", dock_css)
         self.assertIn("flex-direction:column", dock_css)
         self.assertIn("max-width:18rem", dock_css)
         self.assertIn("max-height:40vh", dock_css)
@@ -2628,9 +2636,7 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("border-radius:", dock_css)
         self.assertIn("padding:", dock_css)
         self.assertNotIn("position:absolute", dock_css)
-        fav_css = html.split("body.favorites-open #picked-dock{")[1].split("}")[0]
-        self.assertIn("right:", fav_css)
-        self.assertIn("--favorites-drawer-w", fav_css)
+        self.assertNotIn("body.favorites-open #picked-dock{", html)
         chip_css = html.split(".picked-dock-chip{")[1].split("}")[0]
         self.assertIn("pointer-events:auto", chip_css)
         self.assertIn("text-align:left", chip_css)

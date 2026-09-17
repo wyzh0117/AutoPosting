@@ -333,7 +333,7 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual("OpenAI agent swarm", report.query)
         self.assertEqual("https://news.example/a", report.results[0]["url"])
         self.assertGreaterEqual(len(seen), 2)
-        self.assertIn("bing.com/search", seen[0])
+        self.assertTrue(any("news.google.com/rss" in url for url in seen))
 
     def test_search_related_news_unwraps_real_google_news_rss_article_token(self) -> None:
         # Google News uses a base64url protobuf token in the RSS link.  This
@@ -348,18 +348,35 @@ class BackgroundTests(unittest.TestCase):
         def fetcher(url: str) -> bytes:
             return rss if "news.google.com/rss" in url else b""
 
-        # Google News is not in the shipped source list any more, but its
-        # article-token unwrapping must keep working if it is re-added.
-        google = (
-            "bing",
-            "Bing",
-            "https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en",
-        )
-        with patch.object(background, "_RELATED_SEARCH_SOURCES", (google,)):
-            report = search_related_news("OpenAI rogue agent swarm", fetcher)
+        report = search_related_news("OpenAI rogue agent swarm", fetcher)
         self.assertEqual(
             "https://www.theverge.com/ai-artificial-intelligence/rogue-agent-swarm-report",
             report.results[0]["url"],
+        )
+
+    def test_related_search_keeps_multiple_google_news_hits(self) -> None:
+        rss = (
+            "<rss><channel>"
+            "<item><title>英伟达芯片一</title><link>https://news.a.example/one</link><description>一</description></item>"
+            "<item><title>英伟达芯片二</title><link>https://news.b.example/two</link><description>二</description></item>"
+            "<item><title>英伟达芯片三</title><link>https://news.c.example/three</link><description>三</description></item>"
+            "</channel></rss>"
+        ).encode("utf-8")
+
+        def fetcher(url: str) -> bytes:
+            return rss if "news.google.com/rss" in url else b""
+
+        self.assertEqual("google", background._RELATED_SEARCH_SOURCES[0][0])
+        self.assertIn("news.google.com/rss/search", background._RELATED_SEARCH_SOURCES[0][2])
+        report = search_related_news("英伟达 AI 芯片", fetcher, limit=8)
+        self.assertEqual(3, len(report.results))
+        self.assertEqual(
+            [
+                "https://news.a.example/one",
+                "https://news.b.example/two",
+                "https://news.c.example/three",
+            ],
+            [row["url"] for row in report.results],
         )
 
     def _bounded_context(self, payload: object, alive: bool = False):

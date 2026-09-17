@@ -493,7 +493,7 @@ class PosterCopyTests(unittest.TestCase):
         self.assertNotIn("项目主页", payload["keyMessage"])
         self.assertNotIn("安装步骤", payload["keyMessage"])
         self.assertFalse(payload["keyMessage"].startswith("它"))
-        self.assertIn("给", payload["keyMessage"])
+        self.assertIn("角色", payload["keyMessage"])
         self.assertFalse(payload.get("tagline"))
         self.assertFalse(payload.get("logo"))
         self.assertGreaterEqual(len(payload["features"]), 2)
@@ -626,6 +626,66 @@ class PosterCopyTests(unittest.TestCase):
         self.assertTrue(any("角色" in item or "任务" in item for item in payload["features"]))
         self.assertFalse(payload.get("tagline"))
         self.assertFalse(payload["keyMessage"].startswith("它"))
+
+    def test_specific_chinese_summary_is_kept_without_identity_formula(self) -> None:
+        from autoposting.visual.adapter import project_from_repo
+
+        payload = project_from_repo(
+            {
+                "rank": 1,
+                "name": "cutter",
+                "kind": "视频",
+                "summary": "把长素材按脚本切成能发的粗剪。",
+                "description": "video cutter",
+            }
+        )
+        self.assertEqual("把长素材按脚本切成能发的粗剪。", payload["keyMessage"])
+
+    def test_same_kind_empty_copy_includes_each_repo_name(self) -> None:
+        from autoposting.visual.adapter import project_from_repo
+
+        one = project_from_repo({"rank": 1, "name": "alpha-cli", "kind": "CLI"})
+        two = project_from_repo({"rank": 2, "name": "beta-cli", "kind": "CLI"})
+        self.assertIn("alpha-cli", one["keyMessage"])
+        self.assertIn("beta-cli", two["keyMessage"])
+        self.assertNotEqual(one["keyMessage"], two["keyMessage"])
+
+    def test_markdown_markers_are_stripped_from_poster_fields(self) -> None:
+        from autoposting.visual.adapter import project_from_repo
+
+        payload = project_from_repo(
+            {
+                "rank": 1,
+                "name": "cutter",
+                "kind": "视频",
+                "summary": "把**长素材**切开。",
+                "does": "- 先**粗剪**。\n- 再导出成片。",
+                "how": "# 步骤\n先把素材放进目录",
+                "scene": "交期近的时候",
+                "audience": "剪辑的人",
+            }
+        )
+        self.assertNotIn("**", payload["keyMessage"])
+        self.assertIn("长素材", payload["keyMessage"])
+        joined = " ".join(payload["features"] + payload["how"])
+        self.assertNotIn("**", joined)
+        self.assertNotIn("# 步骤", joined)
+        self.assertTrue(any("粗剪" in item for item in payload["features"]))
+
+    def test_placeholder_one_liner_label_is_not_the_key_message(self) -> None:
+        from autoposting.visual.adapter import project_from_repo
+
+        payload = project_from_repo(
+            {
+                "rank": 1,
+                "name": "cutter",
+                "kind": "视频",
+                "summary": "一句话看懂",
+            }
+        )
+        self.assertNotEqual("一句话看懂", payload["keyMessage"])
+        self.assertNotIn("**", payload["keyMessage"])
+        self.assertIn("cutter", payload["keyMessage"])
 
     def test_render_weekly_visual_cache_busts_image_url(self) -> None:
         from autoposting.visual.weekly import render_weekly_visual

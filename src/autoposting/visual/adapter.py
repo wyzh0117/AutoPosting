@@ -13,6 +13,12 @@ LATIN_RE = re.compile(r"[A-Za-z]")
 CJK_RE = re.compile(r"[\u3400-\u9fff]")
 CJK_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])[ \t]+(?=[\u3400-\u9fff])")
 CLIP_MARK_RE = re.compile(r"(…|\.{3})$")
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
+_MD_CODE = re.compile(r"`([^`]+)`")
+_MD_HEADING = re.compile(r"^#{1,6}\s+")
+_MD_LIST = re.compile(r"^[-*+]\s+")
+_PLACEHOLDER_LABELS = ("一句话看懂", "能做什么", "如何实现", "适合哪些人", "使用场景", "做什么？")
 
 KIND_ONE_LINER = {
     "Agent": "给想搭小型 AI 团队的人，在本地把开发和内容串成流水线时，把不同角色的助手组织起来一起干活。",
@@ -315,9 +321,9 @@ def project_from_repo(
 
 def to_bullets(text: Any, *, limit: int = 5, max_len: int = 28) -> list[str]:
     if isinstance(text, (list, tuple)):
-        parts = [str(item).strip(" -•\t") for item in text if str(item).strip()]
+        parts = [strip_poster_markup(str(item)) for item in text if str(item).strip()]
     else:
-        raw = str(text or "").strip()
+        raw = strip_poster_markup(str(text or ""))
         if not raw or is_generic_how(raw):
             return []
         if "\n" in raw:
@@ -352,16 +358,17 @@ def to_bullets(text: Any, *, limit: int = 5, max_len: int = 28) -> list[str]:
 
 
 def capability_line(repo: dict[str, Any]) -> str:
-    kind = str(repo.get("kind") or "")
-    for candidate in (repo.get("summary"),):
-        text = str(candidate or "").strip()
+    name = str(repo.get("name") or "").strip() or "这个工具"
+    for candidate in (repo.get("summary"), repo.get("description")):
+        text = strip_poster_markup(str(candidate or ""))
         if not text or is_generic_how(text) or _looks_english(text) or _is_it_sentence(text):
             continue
-        if not _looks_identity_line(text):
+        if text in _PLACEHOLDER_LABELS or len(text) < 6:
             continue
         return _clip_line(text, 72)
-    return KIND_ONE_LINER.get(
-        kind, "给想先看懂再动手的人，拿一个真实小任务试的时候，先判断这个工具能不能省事。"
+    return _clip_line(
+        f"给想先看懂再动手的人，拿 {name} 试的时候，先判断能不能省事。",
+        72,
     )
 
 
@@ -375,9 +382,26 @@ def _is_it_sentence(text: str) -> bool:
     )
 
 
-def _looks_identity_line(text: str) -> bool:
-    compact = (text or "").lstrip()
-    return compact.startswith("给") and ("时" in compact or "时候" in compact)
+def strip_poster_markup(text: str) -> str:
+    """Drop markdown markers and prompt-placeholder labels before a poster prints."""
+    value = str(text or "")
+    value = _MD_BOLD.sub(r"\1", value)
+    value = _MD_ITALIC.sub(r"\1", value)
+    value = _MD_CODE.sub(r"\1", value)
+    kept: list[str] = []
+    for raw in value.splitlines():
+        line = _MD_HEADING.sub("", raw)
+        line = _MD_LIST.sub("", line)
+        line = line.replace("**", "").replace("`", "").strip(" -•\t")
+        if line in _PLACEHOLDER_LABELS:
+            continue
+        for label in _PLACEHOLDER_LABELS:
+            if line.startswith(label):
+                line = line[len(label) :].lstrip("：: ").strip()
+                break
+        if line:
+            kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def is_generic_how(text: str) -> bool:

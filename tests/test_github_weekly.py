@@ -252,7 +252,7 @@ class GitHubWeeklyTests(unittest.TestCase):
         self.assertEqual("把大模型塞进命令行的小工具。", updated[0]["summary"])
         self.assertEqual("在终端里直接问模型、跑脚本。", updated[0]["does"])
         self.assertTrue(updated[0]["enriched"])
-        self.assertIn("项目简介", fake.calls[0][2])
+        self.assertIn('"summary":"..."', fake.calls[0][2])
         self.assertIn("不要改项目名", fake.calls[0][2])
         self.assertIn("完整陈述句", fake.calls[0][2])
         self.assertIn("22", fake.calls[0][2])

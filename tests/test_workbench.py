@@ -476,6 +476,19 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(first["source_ids"], second["source_ids"])
         self.assertEqual(first["body"], second["body"])
 
+    def test_generate_article_includes_pasted_page_text_in_prompt(self) -> None:
+        item_id = self._named_item("paste-1", "Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        workbench.generate_article(
+            item_id,
+            "wechat",
+            pasted_text="这是用户从内容页粘贴进来的完整正文，必须进入生成提示。",
+        )
+        prompt = model.calls[-1][2]
+        self.assertIn("这是用户从内容页粘贴进来的完整正文，必须进入生成提示。", prompt)
+        self.assertIn("pasted_page", prompt)
+
     def test_generate_article_item_ids_fuses_two_items_into_one_prompt(self) -> None:
         first_id = self._named_item("fuse-a", "Alpha launch", "Alpha body from lab")
         second_id = self._named_item("fuse-b", "Beta debate", "Beta body from media")
@@ -548,6 +561,26 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(derive_related_query(selection).text, result["query"])
         self.assertEqual("https://news.example/chip", result["items"][0]["url"])
         self.assertEqual("", result["cause_code"])
+
+    def test_related_search_returns_more_than_one_google_hit(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        rss = (
+            "<rss><channel>"
+            "<item><title>英伟达芯片一</title><link>https://news.a.example/one</link><description>一</description></item>"
+            "<item><title>英伟达芯片二</title><link>https://news.b.example/two</link><description>二</description></item>"
+            "</channel></rss>"
+        ).encode("utf-8")
+
+        def fetcher(url: str) -> bytes:
+            return rss if "news.google.com/rss" in url else b""
+
+        result = Workbench(self.db, page_fetcher=fetcher).related_search(
+            draft_id, selection, 0, len(selection)
+        )
+        self.assertEqual(2, len(result["items"]))
+        self.assertEqual("https://news.a.example/one", result["items"][0]["url"])
+        self.assertEqual("https://news.b.example/two", result["items"][1]["url"])
         self.assertFalse(result["query_degraded"])
         self.assertEqual(len(selection), result["query_source_chars"])
 

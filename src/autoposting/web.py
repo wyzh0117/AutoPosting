@@ -58,7 +58,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -345,6 +345,11 @@ main{
 .panel-sub{font-size:.72rem; color:var(--text-muted); margin:.2rem 0 0; line-height:1.45;}
 
 .row{display:flex; gap:.5rem; align-items:center; flex-wrap:wrap;}
+#article-paste{
+  flex:1 1 14rem; width:auto; min-width:10rem; max-width:min(32rem, 100%);
+  min-height:40px; max-height:12rem; height:40px; resize:none; overflow:hidden;
+  padding:.45rem .7rem; font-size:.82rem; line-height:1.35; font-weight:400;
+}
 .row > select,.row > input,.row > button{height:40px; min-height:40px; padding-top:0; padding-bottom:0;}
 select, input[type=text], input[type=password], textarea{
   border:1px solid var(--border); border-radius:var(--radius-sm);
@@ -444,7 +449,7 @@ body.lane-github .panel-header .row{width:100%;}
 .source-health .sh-dot{width:7px; height:7px; border-radius:50%; flex:0 0 auto;}
 .source-health .sh-dot.ok{background:var(--ok);}
 #picked-dock{
-  position:fixed; right:1.5rem; bottom:1.5rem; z-index:25;
+  position:fixed; left:1.5rem; bottom:1.5rem; z-index:45;
   display:flex; flex-direction:column; align-items:stretch;
   gap:.35rem; min-width:0; max-width:18rem; max-height:40vh; overflow-y:auto;
   padding:.65rem .75rem; pointer-events:auto;
@@ -453,9 +458,6 @@ body.lane-github .panel-header .row{width:100%;}
   box-shadow:0 18px 40px -18px rgba(0, 0, 0, 0.72), inset 0 1px 0 rgba(243, 238, 228, 0.04);
 }
 #picked-dock[hidden]{display:none !important;}
-body.favorites-open #picked-dock{
-  right: calc(var(--favorites-drawer-w) + 1.25rem);
-}
 .picked-dock-label{
   font-size:.72rem; color:var(--text-muted); font-weight:600;
 }
@@ -780,6 +782,7 @@ body.lane-github #article-panel .panel-header .platform-tabs,
 body.lane-github #prompt-style-select,
 body.lane-github #find-hooks-btn,
 body.lane-github #generate-btn,
+body.lane-github #article-paste,
 body.lane-github #article-empty,
 body.lane-github #article-view,
 body.lane-github #hook-list,
@@ -796,6 +799,7 @@ body.lane-skills #github-studio,
 body.lane-skills #prompt-style-select,
 body.lane-skills #find-hooks-btn,
 body.lane-skills #generate-btn,
+body.lane-skills #article-paste,
 body.lane-skills #article-empty,
 body.lane-skills #article-view,
 body.lane-skills #hook-list{display:none !important;}
@@ -1004,7 +1008,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.0 · 本地服务</span>
+  <span id="service-status">v1.4.1 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1126,6 +1130,7 @@ body.lane-skills #github-render-btn{display:none;}
       </select>
       <button type="button" id="find-hooks-btn" disabled>找切口</button>
       <button type="button" id="generate-btn" class="btn-magic" disabled>生成文章</button>
+      <textarea id="article-paste" rows="1" placeholder="可粘贴原文页面，点生成文章时一并送进模型"></textarea>
       </div>
     </div>
     <p id="article-status" role="status" aria-live="polite"></p>
@@ -2408,10 +2413,7 @@ function selectHotspot(item, button) {
     return;
   }
   state.newsFocus = null;
-  state.articleLastKeys[articleContextKey(state.lane, state.platform)] = "";
-  state.articleRequestGen += 1;
   state.item = item;
-  resetArticle();
   clearHooks();
   var nodes = $("hotspot-list").querySelectorAll(".hotspot-item");
   nodes.forEach(function (node) {
@@ -3508,6 +3510,8 @@ function generate() {
   if (chosen.length > 0) {
     payload.chosen_hooks = chosen;
   }
+  var pasted = String((($("article-paste") || {}).value) || "").trim();
+  if (pasted) { payload.pasted_text = pasted.slice(0, 20000); }
   if (waitRunning("generate")) { return; }
   busy(button, true);
   waitStart("generate");
@@ -5053,6 +5057,13 @@ $("favorites-close").addEventListener("click", function () { toggleFavoritesDraw
 $("news-supplement-btn").addEventListener("click", function () { toggleNewsSupplementDrawer(); });
 $("news-supplement-close").addEventListener("click", function () { toggleNewsSupplementDrawer(false); });
 $("related-search-btn").addEventListener("click", relatedSearch);
+if ($("article-paste")) {
+  $("article-paste").addEventListener("input", function () {
+    var box = $("article-paste");
+    box.style.height = "40px";
+    box.style.height = Math.min(Math.max(box.scrollHeight, 40), 192) + "px";
+  });
+}
 $("endpoint-connect").addEventListener("click", connectEndpoint);
 $("endpoint-use-article").addEventListener("click", function () { assignEndpoint("article"); });
 $("endpoint-use-translation").addEventListener("click", function () { assignEndpoint("translation"); });
@@ -5713,6 +5724,7 @@ class WebApp:
         chosen_hooks: object = None,
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         item_ids: list[str] | None = None,
+        pasted_text: str | None = None,
     ) -> dict[str, object]:
         if not self._article_model_configured:
             raise ValueError("article_model_not_configured")
@@ -5729,6 +5741,7 @@ class WebApp:
                 prompt_style,
                 self.xiaohongshu_config.get("account_name") or "",
                 item_ids,
+                pasted_text=pasted_text,
             ),
         }
 
@@ -7091,6 +7104,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         if isinstance(payload, dict)
                         else DEFAULT_ARTICLE_PROMPT_STYLE,
                         item_ids,
+                        payload.get("pasted_text") if isinstance(payload, dict) else None,
                     )
                 elif self.path == "/api/related-search":
                     result = app.related_search(payload)
