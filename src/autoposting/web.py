@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,10 +25,19 @@ from .github_weekly import (
     XHS_TITLE,
     build_xhs_copy,
     fetch_weekly_ai_repos,
+    set_github_token,
     week_window_start,
 )
-from .image_gen import build_weekly_image_jobs
-from .skill_finder import find_skills, render_skill_package
+from .image_gen import build_weekly_render_plan
+from .skill_finder import (
+    aggregate_skills,
+    crawl_sources,
+    fetch_manual_hits,
+    find_skills,
+    merge_manual_hits,
+    render_skill_package,
+)
+from .skill_links import parse_skill_links
 from .visual.tokens import parse_palette
 from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
@@ -48,7 +58,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.4.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -57,6 +67,18 @@ ACCOUNT_STORE_IDS = {
     "x": "account:x",
     "xiaohongshu": "account:xiaohongshu",
 }
+# Optional GitHub token: raises the finder's api.github.com quota from 60
+# core requests/hour to 5000. Kept in the same credential store as the other
+# secrets and never echoed back to the page.
+GITHUB_TOKEN_STORE_ID = "github:token"
+# One paste may not exceed the package's own skill cap, so nothing is silently
+# dropped later by cap_skills; the overflow is reported as a `too_many` reject.
+MAX_PASTE_LINKS = 16
+# The paste box is a multi-line textarea now, so a real paste (16 links plus
+# prose and markdown bullets) is far longer than the old 4000-char input limit.
+MAX_PASTE_CHARS = 20000
+# How many rejected paste tokens are echoed back (the count is always exact).
+MAX_PASTE_REJECTS = 20
 
 
 def _looks_english(text: str) -> bool:
@@ -203,8 +225,10 @@ body.news-supplement-open #wait-banner{
 .news-supplement-item .news-meta{display:block; margin-top:.45rem; color:var(--text-muted); font-size:.7rem;}
 .fav-item{
   position:relative; background:var(--bg-input); border:1px solid transparent;
-  border-radius:var(--radius-md); padding:.8rem 2.4rem .8rem .9rem;
+  border-radius:var(--radius-md); padding:.8rem 2.4rem 2.1rem .9rem;
 }
+.fav-item .ht-pick{bottom:auto; top:2.5rem;}
+.fav-item .fav-open-original{margin-right:1.6rem;}
 .fav-item.is-picked, .hotspot-item.is-picked{
   border-color:var(--accent);
   background:linear-gradient(145deg, rgba(196, 164, 106, 0.16), rgba(196, 164, 106, 0.05));
@@ -449,11 +473,21 @@ body.favorites-open #picked-dock{
   -webkit-box-orient:vertical; -webkit-line-clamp:2;
   text-overflow:ellipsis; white-space:normal; word-break:break-word;
 }
-#picked-dock.is-focus .picked-dock-chip{
+#picked-dock .picked-dock-chip.is-static{
   pointer-events:none; cursor:default; max-width:100%;
   color:var(--text-muted); background:transparent; border-color:transparent;
   font-weight:500;
 }
+.ht-pick{
+  position:absolute; right:.45rem; bottom:.45rem; z-index:2;
+  width:1.5rem; height:1.5rem; padding:0; border-radius:6px;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--bg-raised); border:1px solid var(--border);
+  color:var(--text-muted); font-size:.85rem; line-height:1;
+  cursor:pointer;
+}
+.ht-pick:hover{border-color:rgba(196, 164, 106, 0.45);}
+.ht-pick.is-on{border-color:var(--accent); color:var(--accent); font-weight:700;}
 .source-health .sh-dot.error{background:var(--err);}
 .source-health .sh-dot.stale{background:var(--warn);}
 .source-health .sh-dot.never,.source-health .sh-dot.disabled{background:#5a564c;}
@@ -766,28 +800,96 @@ body.lane-skills #article-empty,
 body.lane-skills #article-view,
 body.lane-skills #hook-list{display:none !important;}
 body.lane-github #picked-dock, body.lane-skills #picked-dock { display:none !important; }
-#github-list,#github-studio,#skill-search-row,#skill-stage-chips,#skill-list,#skills-studio{display:none;}
+#github-list,#github-studio,#skill-search-row,#skill-source-bar,#skill-source-toggle,#skill-crawl-sources,#skills-studio,
+#skill-degraded-note,#skill-paste-row,#skill-paste-hint,#skill-paste-status,#skill-token-box{display:none;}
 body.lane-github #github-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
 body.lane-github #github-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
 body.lane-skills #skill-search-row{display:flex; gap:.5rem; align-items:center; width:100%; margin:.35rem 0 .55rem;}
 body.lane-skills #skill-search-row input{
   flex:1 1 auto; width:auto; min-width:0; height:40px;
 }
-body.lane-skills #skill-search-btn{
+body.lane-skills #skill-search-btn,
+body.lane-skills #skill-clear-btn{
   flex:0 0 auto; min-width:4.75rem; height:40px; padding:0 1.15rem;
   white-space:nowrap; line-height:1; display:inline-flex;
   align-items:center; justify-content:center;
 }
-body.lane-skills #skill-stage-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0 0 .55rem; padding:0; list-style:none;}
-body.lane-skills #skill-stage-chips li{
+body.lane-skills #skill-clear-btn{min-width:3.6rem; padding:0 .85rem;}
+/* The paste box is a textarea on purpose: a real paste is multi-line, and the
+   box has to grow with it instead of scrolling one line at a time. */
+body.lane-skills #skill-paste-row{display:flex; gap:.5rem; align-items:flex-start; width:100%; margin:0 0 .35rem;}
+body.lane-skills #skill-paste-hint{display:block; margin:0 0 .55rem;}
+/* The paste result keeps its own line: the shared status line is overwritten by
+   the render that starts right after a paste, which hid skips and warnings. */
+#skill-paste-status{margin:0 0 .55rem; font-size:.78rem; line-height:1.5; word-break:break-word; color:var(--text-muted);}
+#skill-paste-status[hidden]{display:none;}
+body.lane-skills #skill-paste-status:not([hidden]){display:block;}
+body.lane-skills #skill-paste-status.status-ok{color:var(--ok);}
+body.lane-skills #skill-paste-status.status-error{color:var(--err);}
+body.lane-skills #skill-paste-row textarea{
+  flex:1 1 auto; width:auto; min-width:0; min-height:76px; max-height:40vh;
+  padding:.6rem .7rem; line-height:1.5; resize:vertical; overflow-y:auto;
+  font:inherit; font-size:.85rem;
+}
+body.lane-skills #skill-paste-btn{
+  flex:0 0 auto; min-width:4.75rem; height:40px; padding:0 1.15rem;
+  white-space:nowrap; line-height:1; display:inline-flex;
+  align-items:center; justify-content:center;
+}
+body.lane-skills #skill-token-box{display:block; margin:0 0 .6rem;}
+#skill-token-box summary{
+  cursor:pointer; font-size:.74rem; color:var(--text-muted); font-weight:600;
+}
+#skill-token-box .skill-token-row{display:flex; gap:.5rem; align-items:center; margin:.45rem 0 .35rem;}
+#skill-token-box .skill-token-row input{flex:1 1 auto; min-width:0; height:36px;}
+#skill-token-box .skill-token-row button{flex:0 0 auto; height:36px; min-height:36px; padding:0 .9rem;}
+#skill-token-status{margin:0; font-size:.72rem; line-height:1.45;}
+/* One merged block replaces the stage chips + gap note: it answers the only
+   question the user asks here — where did the collected skills come from. */
+#skill-source-bar{margin:.15rem 0 .55rem;}
+#skill-source-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0; padding:0; list-style:none;}
+#skill-source-chips li{
   padding:.2rem .65rem; border-radius:99px; border:1px solid var(--border);
   font-size:.72rem; color:var(--text-muted);
 }
-body.lane-skills #skill-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
+#skill-source-chips li.is-manual{border-style:dashed; color:var(--text-main);}
+#skill-degraded-note{
+  margin:.35rem 0 0; font-size:.78rem; line-height:1.5;
+  color:var(--text-muted); word-break:break-word;
+}
+#skill-degraded-note[hidden]{display:none;}
+body.lane-skills #skill-source-bar:not([hidden]),
+body.lane-skills #skill-degraded-note:not([hidden]){display:block;}
+body.lane-skills #skill-source-bar{display:block;}
+/* Clicking the shared status line expands the list of configured crawlers. */
+body.lane-skills #skill-source-toggle{
+  display:block; width:100%; text-align:left; cursor:pointer;
+  margin:.15rem 0 0; padding:.3rem .55rem; border-radius:var(--radius-sm,6px);
+  border:1px dashed var(--border); background:transparent;
+  font-size:.76rem; color:var(--text-muted); font-weight:600;
+}
+body.lane-skills #skill-source-toggle:hover{color:var(--text-main); border-color:var(--accent);}
+#skill-source-toggle[hidden]{display:none !important;}
+body.lane-skills #skill-crawl-sources{
+  display:block; margin:.4rem 0 0; padding:.55rem .7rem; list-style:none;
+  border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-card);
+}
+#skill-crawl-sources[hidden]{display:none !important;}
+body.lane-skills #skill-crawl-sources li{
+  display:flex; flex-direction:column; gap:.15rem; padding:.4rem 0;
+  border-bottom:1px solid var(--border); font-size:.76rem; line-height:1.5;
+}
+body.lane-skills #skill-crawl-sources li:last-child{border-bottom:0;}
+body.lane-skills #skill-crawl-sources strong{font-size:.8rem; color:var(--text-main);}
+body.lane-skills #skill-crawl-sources a{color:var(--accent); word-break:break-all; font-size:.72rem;}
+body.lane-skills #skill-crawl-sources span{color:var(--text-muted);}
+#skill-title{font-size:.92rem;}
+body.lane-skills #skills-studio > .article-field{flex:0 0 auto;}
 body.lane-skills #skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0; flex:1 1 auto;}
 body.lane-skills #skills-gallery{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem; min-height:12rem;}
 #skills-article{
-  flex:0 0 auto; min-height:6rem; padding:.85rem 1rem 1rem;
+  flex:0 0 auto; min-height:6rem; max-height:24rem; overflow-y:auto;
+  padding:.85rem 1rem 1rem;
   border:1px solid var(--border); border-radius:var(--radius-md);
   background:rgba(0,0,0,0.22);
 }
@@ -902,7 +1004,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.2.9 · 本地服务</span>
+  <span id="service-status">v1.4.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -979,14 +1081,34 @@ body.lane-skills #github-render-btn{display:none;}
     </div>
     <div id="hotspot-pane">
       <div id="skill-search-row">
-        <input id="skill-query" type="text" maxlength="200" aria-label="Skill 查找关键词">
+        <input id="skill-query" type="text" maxlength="200" aria-label="Skill 查找关键词" placeholder="关键词，空格分隔多个：视频 剪辑 字幕">
         <button type="button" id="skill-search-btn">查找</button>
+        <button type="button" id="skill-clear-btn" title="清空已收录的 skill（标题保留）">清空</button>
       </div>
-      <ul id="skill-stage-chips" aria-label="覆盖阶段"></ul>
+      <div id="skill-paste-row">
+        <textarea id="skill-links" rows="3" aria-label="粘贴 skill 链接" title="粘贴 skill 链接（可多行、可多个），加入后和检索到的一样出简介和海报" placeholder="每行一个 skill 链接，可以粘贴多条"></textarea>
+        <button type="button" id="skill-paste-btn">加入</button>
+      </div>
+      <p id="skill-paste-hint" class="muted">支持 GitHub / skills.sh 的 skill 链接；可多行、每行一条，加入后和检索到的一样出海报。</p>
+      <p id="skill-paste-status" role="status" aria-live="polite" hidden></p>
+      <details id="skill-token-box">
+        <summary>GitHub Token（可选）</summary>
+        <div class="skill-token-row">
+          <input id="skill-github-token" type="password" autocomplete="off" aria-label="GitHub Token" title="粘贴 GitHub Personal Access Token；只存本机钥匙串，不回显">
+          <button type="button" id="skill-token-save">保存</button>
+          <button type="button" id="skill-token-clear">清除</button>
+        </div>
+        <p id="skill-token-status" class="muted">未配置。不配也能用，但 GitHub 接口每小时只给 60 次，容易限流。</p>
+      </details>
+      <div id="skill-source-bar">
+        <ul id="skill-source-chips" aria-label="已收录 skill 的来源"></ul>
+        <p id="skill-degraded-note" role="status" hidden></p>
+      </div>
       <ul id="hotspot-list"></ul>
       <ul id="github-list"></ul>
-      <ul id="skill-list"></ul>
       <p id="hotspot-status" role="status" aria-live="polite"></p>
+      <button type="button" id="skill-source-toggle" aria-expanded="false" aria-controls="skill-crawl-sources" hidden></button>
+      <ul id="skill-crawl-sources" hidden aria-label="已配置的自动抓取源"></ul>
     </div>
     <div id="source-health-wrap">
       <button type="button" id="source-health-toggle" aria-expanded="false" aria-controls="source-health">订阅源状态</button>
@@ -1021,16 +1143,19 @@ body.lane-skills #github-render-btn{display:none;}
       <canvas id="github-canvas" hidden></canvas>
     </div>
     <div id="skills-studio">
-      <div id="skills-article">
-        <h3 id="skills-title">介绍文</h3>
-        <div id="skills-body">查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。</div>
-      </div>
+      <label class="article-field" for="skill-title">标题
+        <input id="skill-title" type="text" maxlength="120" placeholder="封面海报标题；同时作为介绍文标题">
+      </label>
       <div class="gh-toolbar">
         <button type="button" id="skills-render-btn">生成图片</button>
         <button type="button" id="skills-select-all" disabled>全选</button>
         <button type="button" id="skills-export-btn" disabled>导出选中图片</button>
       </div>
       <div id="skills-gallery" class="gh-gallery"></div>
+      <div id="skills-article">
+        <h3 id="skills-title">介绍文</h3>
+        <div id="skills-body">查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。</div>
+      </div>
     </div>
     <article id="article-view">
       <div id="article-scroll" class="article-scroll" hidden>
@@ -1093,7 +1218,7 @@ body.lane-skills #github-render-btn{display:none;}
       </div>
       <fieldset class="settings-page" data-page="model">
         <legend>模型</legend>
-        <p class="muted">文章、翻译、榜单、出图各自保存。先选提供方，再从下拉列表选模型。下方已保存的提供方可一键套到全部入口。</p>
+        <p class="muted">文章、翻译、榜单各自保存。先选提供方，再从下拉列表选模型。下方已保存的提供方可一键套到全部入口。</p>
         <div class="purpose-stack">
           <section class="purpose-card">
             <h3>文章模型</h3>
@@ -1123,24 +1248,13 @@ body.lane-skills #github-render-btn{display:none;}
           </section>
           <section class="purpose-card">
             <h3>榜单模型</h3>
-            <p class="muted">只改写周榜海报里的简介、能做什么、适合什么场景、如何实现。项目名、星标和封面模板不走模型。</p>
+            <p class="muted">只改写周榜海报和 skill 海报里的简介、能做什么、适合什么场景、如何实现。名称、星标／装机量、页面模板不走模型。</p>
             <div class="purpose-grid">
               <label>提供方<select name="leaderboard_provider"></select></label>
               <label>模型<select name="leaderboard_model"></select></label>
             </div>
             <div class="purpose-actions">
               <button type="button" id="endpoint-use-leaderboard">用于榜单</button>
-            </div>
-          </section>
-          <section class="purpose-card">
-            <h3>出图模型</h3>
-            <p class="muted">选好后必须点「用于出图」保存。任意已接入模型都可以。周榜封面 3:4；项目卡与小红书纸卡仍为当前比例；图像模型默认仍 9:16。</p>
-            <div class="purpose-grid">
-              <label>提供方<select name="image_provider"></select></label>
-              <label>模型<select name="image_model"></select></label>
-            </div>
-            <div class="purpose-actions">
-              <button type="button" id="endpoint-use-image">用于出图</button>
             </div>
           </section>
         </div>
@@ -1278,7 +1392,6 @@ var state = {
   llm: {model: "", base_url: "", effort: "none", configured: false},
   translation: {model: "", base_url: "", configured: false, enabled: false},
   leaderboard: {model: "", base_url: "", configured: false, enabled: false},
-  image: {model: "", base_url: "", configured: false, enabled: false},
   newsSupplements: [],
   articleSessions: {},
   articleLastKeys: {},
@@ -1286,7 +1399,9 @@ var state = {
   relatedSearchGen: 0,
   githubWeekly: {repos: [], xhs_title: "本周值得关注的github ai项目前10", xhs_body: ""},
   githubTheme: "dark",
-  skillsPackage: {query: "", title: "", theme: "", stages: [], skills: [], article: {title: "", body: ""}, images: []},
+  skillsPackage: {query: "", title: "", user_title: "", theme: "", stages: [], skills: [], article: {title: "", body: ""}, images: [], crawl_sources: []},
+  crawlSourcesOpen: false,
+  githubTokenConfigured: false,
   modelEndpoints: [],
   platforms: {wechat: {configured: false}, xiaohongshu: {account_configured: false}, x: {configured: false}},
   providerDraft: {open: false, mode: "add", endpointId: "", models: []},
@@ -1354,6 +1469,7 @@ var WAIT_HINTS = {
   save: {title: "正在保存", hint: "通常一两秒"},
   assign: {title: "正在保存模型配置", hint: "通常一两秒"},
   skill_search: {title: "正在查找 Skill", hint: "通常 20–60 秒；超时会先交已找到的结果"},
+  skill_paste: {title: "正在读取粘贴的 Skill", hint: "每个链接抓一次 SKILL.md，通常几秒", unit: "个"},
   skill_render: {title: "正在生成技能包图片", hint: "封面大字报加项目卡，大约半分钟到几分钟", unit: "张"}
 };
 var waitJobs = {};
@@ -1648,11 +1764,6 @@ function renderHotspots(items) {
     button.appendChild(el("span", "idx", (index + 1) + "."));
     button.appendChild(el("span", "ht-label", "原文"));
     var title = el("span", "ht-title", item.title);
-    title.addEventListener("click", function (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      togglePicked(item.item_id);
-    });
     button.appendChild(title);
     button.appendChild(el("span", "ht-summary", item.summary));
     var originalCjk = /[\u3400-\u9fff]/.test(String(item.title || ""));
@@ -1692,6 +1803,7 @@ function renderHotspots(items) {
     li.className = "hotspot-row";
     li.appendChild(button);
     li.appendChild(starButton(item));
+    li.appendChild(pickToggle(item));
     list.appendChild(li);
   });
   if (selectedItem) {
@@ -1959,7 +2071,6 @@ function fillPurposePickers() {
     ["article", "article_provider", "model", state.llm],
     ["translation", "translation_provider", "translation_model", state.translation],
     ["leaderboard", "leaderboard_provider", "leaderboard_model", state.leaderboard],
-    ["image", "image_provider", "image_model", state.image],
   ];
   pairs.forEach(function (pair) {
     var providerSelect = form.elements[pair[1]];
@@ -1978,8 +2089,8 @@ function fillPurposePickers() {
 
 function onPurposeProviderChange(purpose) {
   var form = $("config-form");
-  var names = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider", image: "image_provider"};
-  var models = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
+  var names = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider"};
+  var models = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model"};
   var endpoint = state.modelEndpoints.find(function (item) {
     return item.id === form.elements[names[purpose]].value;
   });
@@ -1988,7 +2099,7 @@ function onPurposeProviderChange(purpose) {
 
 function renderSettingsModels(purpose, models, selected) {
   var form = $("config-form");
-  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
+  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model"};
   var select = form.elements[names[purpose]];
   fillSelect(
     select,
@@ -2014,8 +2125,6 @@ function endpointPurposeTags(endpoint) {
   if (translation && translation.id === endpoint.id) { tags.push("翻译"); }
   var leaderboard = endpointForState(state.leaderboard);
   if (leaderboard && leaderboard.id === endpoint.id) { tags.push("榜单"); }
-  var imageEp = endpointForState(state.image);
-  if (imageEp && imageEp.id === endpoint.id) { tags.push("出图"); }
   return tags;
 }
 
@@ -2172,11 +2281,11 @@ function applyProvider() {
 
 function assignEndpoint(purpose) {
   var form = $("config-form");
-  var providers = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider", image: "image_provider"};
-  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model", image: "image_model"};
-  var paths = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model", image: "/api/image/model"};
-  var buttons = {article: "endpoint-use-article", translation: "endpoint-use-translation", leaderboard: "endpoint-use-leaderboard", image: "endpoint-use-image"};
-  var labels = {article: "文章", translation: "翻译", leaderboard: "榜单", image: "出图"};
+  var providers = {article: "article_provider", translation: "translation_provider", leaderboard: "leaderboard_provider"};
+  var names = {article: "model", translation: "translation_model", leaderboard: "leaderboard_model"};
+  var paths = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model"};
+  var buttons = {article: "endpoint-use-article", translation: "endpoint-use-translation", leaderboard: "endpoint-use-leaderboard"};
+  var labels = {article: "文章", translation: "翻译", leaderboard: "榜单"};
   var endpointId = form.elements[providers[purpose]].value.trim();
   var model = form.elements[names[purpose]].value.trim();
   if (!endpointId || !model) {
@@ -2245,7 +2354,6 @@ function applyModelResponse(data) {
   if (data.llm) { state.llm = data.llm; }
   if (data.translation_llm) { state.translation = data.translation_llm; }
   if (data.leaderboard_llm) { state.leaderboard = data.leaderboard_llm; }
-  if (data.image_llm) { state.image = data.image_llm; }
   renderModelPicker();
   fillPurposePickers();
   renderEndpointLists();
@@ -2254,7 +2362,7 @@ function applyModelResponse(data) {
 function activateModel(purpose, endpointId, model) {
   var payload = {endpoint_id: endpointId, model: model};
   if (purpose === "article") { payload.effort = "none"; }
-  var path = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model", image: "/api/image/model"}[purpose];
+  var path = {article: "/api/model", translation: "/api/translation/model", leaderboard: "/api/leaderboard/model"}[purpose];
   return api(path, payload).then(function (data) {
     applyModelResponse(data);
     status(purpose === "article" ? "article-status" : "model-endpoint-status", "模型已切换", "ok");
@@ -2339,6 +2447,23 @@ function clearHotspotSelection(keepArticle) {
   if (typeof renderPickedDock === "function") renderPickedDock();
 }
 
+function clearFocusAfterGenerate() {
+  // A1: 只在生成成功后清空「焦点」分组。正文、草稿、钩子与「已选 N」多选集合都不动。
+  state.item = null;
+  state.newsFocus = null;
+  var list = $("hotspot-list");
+  if (list) {
+    list.querySelectorAll(".hotspot-item").forEach(function (node) {
+      node.setAttribute("aria-pressed", "false");
+      node.classList.remove("selected");
+    });
+  }
+  $("find-hooks-btn").disabled = true;
+  $("open-original-btn").disabled = true;
+  syncGenerateEnabled();
+  if (typeof renderPickedDock === "function") renderPickedDock();
+}
+
 function pickedIdList() {
   return Object.keys(state.pickedIds || {}).filter(function (id) {
     return state.pickedIds[id];
@@ -2368,14 +2493,19 @@ function renderPickedDock() {
   if (!dock) { return; }
   var ids = pickedIdList();
   dock.textContent = "";
-  dock.classList.remove("is-focus");
+  // 焦点与「已选 N」是两个互不覆盖的分组：多选非空时焦点仍然可见。
   if (state.newsFocus) {
     dock.hidden = false;
-    dock.classList.add("is-focus");
     dock.appendChild(el("span", "picked-dock-label", "焦点"));
-    var newsFocusChip = el("span", "picked-dock-chip");
+    var newsFocusChip = el("span", "picked-dock-chip is-static");
     newsFocusChip.appendChild(el("span", "picked-dock-chip-label", state.newsFocus.title || ""));
     dock.appendChild(newsFocusChip);
+  } else if (state.item) {
+    dock.hidden = false;
+    dock.appendChild(el("span", "picked-dock-label", "焦点"));
+    var focusChip = el("span", "picked-dock-chip is-static");
+    focusChip.appendChild(el("span", "picked-dock-chip-label", state.item.title || ""));
+    dock.appendChild(focusChip);
   }
   if (ids.length) {
     dock.hidden = false;
@@ -2411,19 +2541,9 @@ function renderPickedDock() {
     });
     return;
   }
-  if (state.newsFocus) {
-    return;
+  if (!state.newsFocus && !state.item) {
+    dock.hidden = true;
   }
-  if (state.item) {
-    dock.hidden = false;
-    dock.classList.add("is-focus");
-    dock.appendChild(el("span", "picked-dock-label", "焦点"));
-    var focusChip = el("span", "picked-dock-chip");
-    focusChip.appendChild(el("span", "picked-dock-chip-label", state.item.title || ""));
-    dock.appendChild(focusChip);
-    return;
-  }
-  dock.hidden = true;
 }
 
 function syncPickedHighlights() {
@@ -2431,6 +2551,32 @@ function syncPickedHighlights() {
     var id = node.getAttribute("data-item-id");
     node.classList.toggle("is-picked", !!state.pickedIds[id]);
   });
+  document.querySelectorAll("#hotspot-list .ht-pick, #favorites-list .ht-pick").forEach(function (node) {
+    var on = !!state.pickedIds[node.getAttribute("data-item-id")];
+    node.classList.toggle("is-on", on);
+    node.setAttribute("aria-checked", String(on));
+    node.setAttribute("aria-label", on ? "移出已选" : "加入已选（可多篇融合生成）");
+    node.querySelectorAll(".ht-pick-box").forEach(function (box) {
+      box.textContent = on ? "✓" : "";
+    });
+  });
+}
+
+function pickToggle(item) {
+  var picked = !!state.pickedIds[item.item_id];
+  var toggle = el("button", "ht-pick" + (picked ? " is-on" : ""));
+  toggle.type = "button";
+  toggle.setAttribute("role", "checkbox");
+  toggle.setAttribute("aria-checked", String(picked));
+  toggle.setAttribute("aria-label", picked ? "移出已选" : "加入已选（可多篇融合生成）");
+  toggle.setAttribute("data-item-id", item.item_id);
+  toggle.appendChild(el("span", "ht-pick-box", picked ? "✓" : ""));
+  toggle.addEventListener("click", function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    togglePicked(item.item_id);
+  });
+  return toggle;
 }
 
 function starButton(item) {
@@ -2483,11 +2629,6 @@ function renderFavorites() {
     li.setAttribute("data-item-id", item.item_id);
     li.classList.toggle("is-picked", !!state.pickedIds[item.item_id]);
     var title = el("span", "ht-title", item.title || "");
-    title.addEventListener("click", function (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      togglePicked(item.item_id);
-    });
     var openBtn = el("button", "fav-open-original", "打开原文");
     openBtn.type = "button";
     openBtn.addEventListener("click", function (event) {
@@ -2499,6 +2640,8 @@ function renderFavorites() {
     li.appendChild(title);
     li.appendChild(el("span", "ht-summary", item.summary || ""));
     li.appendChild(openBtn);
+    // A2: 已选 is driven by a visible checkbox on every surface that feeds it.
+    li.appendChild(pickToggle(item));
     list.appendChild(li);
   });
   if (typeof renderPickedDock === "function") renderPickedDock();
@@ -2626,6 +2769,19 @@ function toggleNewsSupplementDrawer(open) {
   if (next) { renderNewsSupplements(); }
 }
 
+var RELATED_SEARCH_FAILURE_HINTS = {
+  timeout: "检索超时：这段选区太久没有源返回结果。可以选短一点，或稍后重试。",
+  transport_unavailable: "网络不可达：新闻源当前都连不上。稍后重试，或检查代理设置。",
+  parse_error: "检索结果解析失败：源返回的内容无法识别，换一段选区再试。"
+};
+
+function relatedSearchFailureMessage(error) {
+  var cause = String((error && error.code) || "");
+  var hint = RELATED_SEARCH_FAILURE_HINTS[cause] || "";
+  if (hint) { return hint; }
+  return showApiError("相关检索失败：", error);
+}
+
 function relatedSearch() {
   var selection = selectedArticleContext();
   if (!selection) {
@@ -2660,13 +2816,22 @@ function relatedSearch() {
     if (!state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
     state.newsSupplements = Array.isArray(data.items) ? data.items : [];
     renderNewsSupplements();
-    status("news-supplement-status", state.newsSupplements.length ? "找到 " + state.newsSupplements.length + " 条相关新闻" : "未找到相关新闻", state.newsSupplements.length ? "ok" : "");
-    waitDone(state.newsSupplements.length ? "相关新闻已找到" : "未找到相关新闻", "related_search");
+    // 「没找到」和「检索失败」是两回事：空结果不是错误。
+    var empty = String(data.search_status || "") === "empty" || !state.newsSupplements.length;
+    status(
+      "news-supplement-status",
+      state.newsSupplements.length
+        ? "找到 " + state.newsSupplements.length + " 条相关新闻"
+        : "没找到相关新闻：检索词「" + String(data.query || "").slice(0, 24) + "」没有匹配，换一段更具体的选区再试",
+      state.newsSupplements.length ? "ok" : ""
+    );
+    waitDone(state.newsSupplements.length ? "相关新闻已找到" : "没找到相关新闻", "related_search");
   }).catch(function (error) {
     if (isWaitAbort(error, "related_search")) { return; }
     if (gen !== state.relatedSearchGen || !state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
-    status("news-supplement-status", showApiError("相关检索失败：", error), "error");
-    waitFail(error.message || "相关检索失败", "related_search");
+    var message = relatedSearchFailureMessage(error);
+    status("news-supplement-status", message, "error");
+    waitFail(message, "related_search");
   }).then(function () {
     if (gen === state.relatedSearchGen) { busy(button, false); }
   });
@@ -3356,6 +3521,7 @@ function generate() {
     applyPublishLabels();
     $("publish-btn").disabled = false;
     $("schedule-btn").disabled = false;
+    clearFocusAfterGenerate();
     waitDone("文章已生成", "generate");
     status("article-status", "文章已生成", "ok");
   }).catch(function (error) {
@@ -4054,6 +4220,110 @@ function exportGithubImages() {
 function skillImages() {
   return (state.skillsPackage && state.skillsPackage.images) || [];
 }
+// 降级原因来自后端，是 `来源:kind` 形式的记号。给用户看中文，原始记号留在 title 里。
+var DEGRADE_LABELS = {
+  "github:rate_limited": "GitHub 接口限流（未配置 Token 时每小时只给 60 次）",
+  "github:timeout": "GitHub 响应超时",
+  "github:unreachable": "GitHub 连不上",
+  "github:server_error": "GitHub 服务端错误",
+  "github:forbidden": "GitHub 拒绝访问",
+  "github:not_found": "GitHub 找不到资源",
+  "github:UnicodeEncodeError": "仓库路径里的非 ASCII 字符没能拼成合法 URL（1.4.0 起已按百分号编码，旧快照里可能还有这条）",
+  "github:InvalidURL": "GitHub 上有一个地址无法请求（已跳过）",
+  // 1.3.0 只存了异常类名，旧快照里的这条也要说人话。
+  "github:RuntimeError": "GitHub 接口本次没返回（多半是限流）",
+  "budget_exhausted": "本次检索预算用完",
+  "skills.sh:unparseable": "skills.sh 返回无法解析",
+  "skills.sh:timeout": "skills.sh 响应超时",
+  "skills.sh:unreachable": "skills.sh 连不上",
+  "web_search:timeout": "网页检索超时"
+};
+function degradeLabel(reason) {
+  var key = String(reason || "");
+  if (!key) { return ""; }
+  if (DEGRADE_LABELS[key]) { return DEGRADE_LABELS[key]; }
+  if (key.indexOf("skills.sh:") === 0) { return "skills.sh " + key.slice(10); }
+  if (key.indexOf("web_search:") === 0) { return "网页检索 " + key.slice(11); }
+  if (key.indexOf("github:") === 0) { return "GitHub 返回了异常：" + key.slice(7); }
+  // Never print a raw identifier at the user: an unmapped reason still says which
+  // source failed and what it was, in one readable line.
+  return "来源" + key + " 返回了异常";
+}
+function degradedSummary(reasons) {
+  var labels = reasons.map(degradeLabel).filter(function (item) { return !!item; });
+  var text = "部分来源本次没有返回：" + (labels.length ? labels.join("；") : "已降级") + "，结果可能偏少。";
+  if (reasons.indexOf("github:rate_limited") >= 0 && !state.githubTokenConfigured) {
+    text += "配好下面的 GitHub Token 后，GitHub 每小时额度从 60 次升到 5000 次，收录会明显变多。";
+  }
+  return text;
+}
+var SKILL_SOURCE_LABELS = {
+  "github": "GitHub",
+  "GitHub": "GitHub",
+  "skills.sh": "skills.sh",
+  "web": "网页检索"
+};
+function skillSourceLabel(skill) {
+  if (skill && skill.manual) { return "手动粘贴"; }
+  var raw = String((skill && skill.source) || "").trim();
+  if (!raw) { return "未知来源"; }
+  return SKILL_SOURCE_LABELS[raw.toLowerCase()] || SKILL_SOURCE_LABELS[raw] || raw;
+}
+// One chip per source, with how many collected skills came from it. This is the
+// whole of the old stage-chip + gap-note area: the user asked where the skills
+// came from, not which coverage stage the search plan happened to define.
+function renderSkillSourceChips(skills) {
+  var chips = $("skill-source-chips");
+  if (!chips) { return; }
+  chips.textContent = "";
+  var counts = {};
+  var order = [];
+  (skills || []).forEach(function (skill) {
+    if (!skill || skill.gap) { return; }
+    var label = skillSourceLabel(skill);
+    if (counts[label] === undefined) { counts[label] = 0; order.push(label); }
+    counts[label] += 1;
+  });
+  if (!order.length) {
+    chips.appendChild(el("li", "", "还没有收录 skill"));
+    return;
+  }
+  order.forEach(function (label) {
+    var chip = el("li", label === "手动粘贴" ? "is-manual" : "", label + " · " + counts[label]);
+    chip.title = "来自" + label + "的 " + counts[label] + " 个 skill";
+    chips.appendChild(chip);
+  });
+}
+function renderCrawlSources(pack) {
+  var toggle = $("skill-source-toggle");
+  var list = $("skill-crawl-sources");
+  if (!toggle || !list) { return; }
+  var sources = (pack && pack.crawl_sources) || [];
+  var count = Number((pack && pack.crawl_source_count) || sources.length || 0);
+  toggle.hidden = !sources.length;
+  toggle.textContent = sources.length
+    ? ("当前自动抓取 skill 的源：" + count + " 个 · 点击" + (state.crawlSourcesOpen ? "收起" : "展开"))
+    : "";
+  toggle.setAttribute("aria-expanded", String(!!state.crawlSourcesOpen));
+  list.textContent = "";
+  list.hidden = !state.crawlSourcesOpen || !sources.length;
+  sources.forEach(function (source) {
+    var row = el("li", "");
+    row.appendChild(el("strong", "", source.name || source.id || ""));
+    var link = document.createElement("a");
+    link.href = String(source.url || "#");
+    link.target = "_blank";
+    link.rel = "noreferrer noopener";
+    link.textContent = String(source.url || "");
+    row.appendChild(link);
+    row.appendChild(el("span", "", (source.enabled === "1" ? "已启用" : "未启用") + " · " + String(source.detail || "")));
+    list.appendChild(row);
+  });
+}
+function toggleCrawlSources() {
+  state.crawlSourcesOpen = !state.crawlSourcesOpen;
+  renderCrawlSources(state.skillsPackage || {});
+}
 function renderSkillPackage(payload) {
   state.skillsPackage = payload || state.skillsPackage || {};
   var pack = state.skillsPackage;
@@ -4063,43 +4333,44 @@ function renderSkillPackage(payload) {
   if (savedPalette.main && $("gh-color-main")) { $("gh-color-main").value = savedPalette.main; }
   if (savedPalette.secondary && $("gh-color-secondary")) { $("gh-color-secondary").value = savedPalette.secondary; }
   if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
-  var stages = (pack.stages || []).filter(function (stage) { return stage && !stage.gap; });
   var skills = (pack.skills || []).filter(function (skill) { return skill && !skill.gap; });
-  pack.stages = stages;
+  pack.stages = (pack.stages || []).filter(function (stage) { return !!stage; });
   pack.skills = skills;
-  var chips = $("skill-stage-chips");
-  chips.textContent = "";
-  stages.forEach(function (stage) {
-    chips.appendChild(el("li", "", stage.name || stage.id));
-  });
-  var list = $("skill-list");
-  list.textContent = "";
-  skills.forEach(function (skill) {
-    var row = el("li", "gh-row");
-    row.appendChild(el("span", "muted", skill.stage_name || skill.stage_id || ""));
-    var meta = document.createElement("div");
-    meta.appendChild(el("strong", "", skill.name || skill.source_id || ""));
-    meta.appendChild(el("span", "gh-kind", (skill.source || "GitHub") + (skill.source_id ? " · " + skill.source_id : "")));
-    row.appendChild(meta);
-    var stars = el("div", "gh-stars");
-    stars.appendChild(el("span", "", String(skill.stars || 0)));
-    row.appendChild(stars);
-    list.appendChild(row);
-  });
+  renderSkillSourceChips(skills);
+  renderCrawlSources(pack);
+  // B1: a degraded source must be visible, not silent — GitHub results still
+  // count, but the user should know one source did not answer.
+  var degradedNote = $("skill-degraded-note");
+  if (degradedNote) {
+    var reasons = (pack.degraded_reasons || []).map(function (item) {
+      return typeof item === "string" ? item : (item && (item.reason || item.source)) || "";
+    }).filter(function (item) { return !!item; });
+    var degraded = !!pack.degraded || reasons.length > 0;
+    degradedNote.hidden = !degraded;
+    degradedNote.textContent = degraded ? degradedSummary(reasons) : "";
+    degradedNote.title = reasons.join("、");
+  }
+  var userTitle = String(pack.user_title || "");
+  var titleInput = $("skill-title");
+  if (titleInput && document.activeElement !== titleInput) { titleInput.value = userTitle; }
   var articleTitle = (pack.article && pack.article.title) || pack.title || "";
   var articleBody = (pack.article && pack.article.body) || "";
-  $("skills-title").textContent = articleTitle || "介绍文";
+  // 标题框 is the title of the whole package: it titles the cover poster and it
+  // titles the intro piece in the text area.
+  $("skills-title").textContent = userTitle || articleTitle || "介绍文";
   $("skills-body").textContent = articleBody || "查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。";
   $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
   renderSkillsGallery();
   var images = skillImages();
   $("skills-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
   $("skills-select-all").disabled = !images.length;
-  $("skills-render-btn").disabled = !pack.title && !skills.length;
+  $("skills-render-btn").disabled = !skills.length;
+  renderGithubTokenState(pack);
   if (waitRunning("skill_search")) { paintWait(); }
 }
 function queuedSkillImages(pack) {
-  var tiles = [{id: "cover", kind: "cover", title: (pack && pack.title) || "Skill 查找结果", queued: true, selected: true, url: "", file: "cover.png"}];
+  var coverTitle = (pack && (pack.user_title || pack.title)) || "Skill 查找结果";
+  var tiles = [{id: "cover", kind: "cover", title: coverTitle, queued: true, selected: true, url: "", file: "cover.png"}];
   ((pack && pack.skills) || []).forEach(function (skill, index) {
     var rank = index + 1;
     var name = skill.name || skill.source_id || ("skill-" + rank);
@@ -4178,6 +4449,184 @@ function selectAllSkillImages() {
   images.forEach(function (image) { image.selected = !allOn; });
   renderSkillPackage(state.skillsPackage);
 }
+function setPasteStatus(text, kind) {
+  // 粘贴结果单独一行：紧随其后的出图会覆写共享状态行，不这样做结果就永远看不见。
+  var node = $("skill-paste-status");
+  if (!node) { return; }
+  node.textContent = text || "";
+  node.hidden = !text;
+  node.className = kind ? "status-" + kind : "";
+}
+// The paste box grows with its content instead of scrolling one line at a time:
+// a real paste is several links plus whatever prose came with them.
+function growSkillLinks() {
+  var box = $("skill-links");
+  if (!box) { return; }
+  var ceiling = Math.round(window.innerHeight * 0.4);
+  box.style.height = "auto";
+  box.style.height = Math.min(Math.max(box.scrollHeight, 76), ceiling) + "px";
+}
+function resetSkillLinks() {
+  var box = $("skill-links");
+  if (!box) { return; }
+  box.value = "";
+  growSkillLinks();
+}
+var skillTitleTimer = null;
+var skillTitleInFlight = false;
+var skillTitleDirty = false;
+function saveSkillTitle() {
+  var input = $("skill-title");
+  if (!input) { return; }
+  var title = String(input.value || "").trim();
+  // The title is shown immediately (封面 + 文本区) and persisted right after, so a
+  // reload keeps it without waiting for the next render.
+  var pack = state.skillsPackage || {};
+  pack.user_title = title;
+  renderSkillPackage(pack);
+  if (skillTitleInFlight) {
+    // Never drop the tail of a fast edit: remember that the newest value still
+    // needs a round trip and send it as soon as the current one lands.
+    skillTitleDirty = true;
+    return;
+  }
+  skillTitleInFlight = true;
+  api("/api/skills/title", {title: title}).then(function (data) {
+    // A response that lost the race must not repaint an older title over what
+    // the user typed while it was in flight.
+    if (!skillTitleDirty) { renderSkillPackage(data); }
+  }).catch(function (error) {
+    status("hotspot-status", "标题保存失败：" + (error.reason || error.message), "error");
+  }).then(function () {
+    skillTitleInFlight = false;
+    if (skillTitleDirty) {
+      skillTitleDirty = false;
+      saveSkillTitle();
+    }
+  });
+}
+function scheduleSkillTitleSave() {
+  if (skillTitleTimer) { window.clearTimeout(skillTitleTimer); }
+  skillTitleTimer = window.setTimeout(function () {
+    skillTitleTimer = null;
+    saveSkillTitle();
+  }, 450);
+}
+function clearSkills() {
+  if (waitRunning("skill_search") || waitRunning("skill_render")) {
+    status("hotspot-status", "正在查找或出图，等这一轮结束再清空", "error");
+    return;
+  }
+  var button = $("skill-clear-btn");
+  if (button) { busy(button, true); }
+  api("/api/skills/clear", {}).then(function (data) {
+    renderSkillPackage(data);
+    status("hotspot-status", "已清空收录的 skill（标题保留）", "ok");
+  }).catch(function (error) {
+    status("hotspot-status", "清空失败：" + (error.reason || error.message), "error");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function pasteSkills() {
+  // 粘贴进来的 skill 与检索到的一样：先进包（拿阶段、写介绍文），再出海报。
+  var links = ($("skill-links").value || "").trim();
+  if (!links) {
+    status("hotspot-status", "请先粘贴 skill 链接", "error");
+    return;
+  }
+  if (links.length > 20000) {
+    // 输入框不再截断，所以超长要在这里说清楚，而不是把尾巴上的链接切一半当成仓库名。
+    setPasteStatus("链接太长（" + links.length + " 字，上限 20000），请分几次粘贴", "error");
+    status("hotspot-status", "粘贴内容过长，请分几次粘贴", "error");
+    return;
+  }
+  if (waitRunning("skill_paste")) { return; }
+  if (waitRunning("skill_render")) {
+    setPasteStatus("正在出图，等这一轮出完再粘贴", "error");
+    status("hotspot-status", "正在出图，等这一轮出完再粘贴", "error");
+    return;
+  }
+  var button = $("skill-paste-btn");
+  if (button) { busy(button, true); }
+  setPasteStatus("");
+  waitStart("skill_paste");
+  status("hotspot-status", "正在读取粘贴的 skill…");
+  waitApi("skill_paste", "/api/skills/paste", {links: links}).then(function (data) {
+    if (waitCancelled("skill_paste")) { return; }
+    renderSkillPackage(data);
+    var added = Number(data.added || 0);
+    var replaced = Number(data.replaced || 0);
+    var rejected = Number(data.rejected_count || (data.rejected || []).length);
+    var unverified = (data.unverified || []).length;
+    resetSkillLinks();
+    var count = (data.skills || []).length;
+    if (!added && !replaced) {
+      var empty = rejected ? ("没有可加入的链接，已跳过 " + rejected + " 条") : "没有识别到 skill 链接";
+      setPasteStatus(empty, "error");
+      status("hotspot-status", empty, "error");
+      waitFail(empty, "skill_paste");
+      return;
+    }
+    var parts = [];
+    if (added) { parts.push("新增 " + added + " 个"); }
+    if (replaced) { parts.push("替换 " + replaced + " 个"); }
+    if (rejected) { parts.push("跳过 " + rejected + " 条"); }
+    if (unverified) { parts.push("有 " + unverified + " 条没读到 SKILL.md，海报会用模板文案"); }
+    var summary = parts.join("，") + "；当前共 " + count + " 个 skill";
+    setPasteStatus(summary, unverified ? "" : "ok");
+    status("hotspot-status", summary + "，正在出图…", unverified ? "" : "ok");
+    waitDone(summary, "skill_paste");
+    renderSkillImages();
+  }).catch(function (error) {
+    if (isWaitAbort(error, "skill_paste")) { return; }
+    var reason = error.reason || error.message || "加入失败";
+    var code = String(error.message || "");
+    if (code.indexOf("skill_search_running") >= 0) {
+      reason = "查找还在进行，等它结束再粘贴";
+    } else if (code.indexOf("skill_render_running") >= 0) {
+      reason = "正在出图，等这一轮出完再粘贴";
+    }
+    setPasteStatus("加入失败：" + reason, "error");
+    status("hotspot-status", "加入失败：" + reason, "error");
+    waitFail(reason, "skill_paste");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
+function renderGithubTokenState(data) {
+  var configured = !!(data && data.github_token);
+  state.githubTokenConfigured = configured;
+  var box = $("skill-token-status");
+  if (box) {
+    box.textContent = configured
+      ? "已配置 GitHub Token：每小时 5000 次额度，收录更稳。"
+      : "未配置。不配也能用，但 GitHub 接口每小时只给 60 次，容易限流。";
+  }
+}
+function saveGithubToken() {
+  var input = $("skill-github-token");
+  var token = (input && input.value || "").trim();
+  if (!token) {
+    status("hotspot-status", "请先粘贴 GitHub Token", "error");
+    return;
+  }
+  api("/api/skills/github-token", {token: token}).then(function (data) {
+    if (input) { input.value = ""; }
+    renderGithubTokenState(data);
+    status("hotspot-status", "GitHub Token 已保存，下次查找生效", "ok");
+  }).catch(function (error) {
+    status("hotspot-status", "保存失败：" + (error.reason || error.message), "error");
+  });
+}
+function clearGithubToken() {
+  api("/api/skills/github-token", {token: ""}).then(function (data) {
+    renderGithubTokenState(data);
+    status("hotspot-status", "GitHub Token 已清除", "ok");
+  }).catch(function (error) {
+    status("hotspot-status", "清除失败：" + (error.reason || error.message), "error");
+  });
+}
 function openSkillsLightbox(index) {
   var images = skillImages().filter(function (image) { return image.url; });
   if (!images.length) { return; }
@@ -4201,7 +4650,7 @@ function loadSkills() {
   return fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
     renderSkillPackage(data);
     var count = (data.skills || []).length;
-    status("hotspot-status", count ? "已显示 " + count + " 个 skill，可再输入关键词查找" : "输入关键词或需求，点「查找」。", count ? "ok" : "");
+    status("hotspot-status", count ? "已收录 " + count + " 个 skill；再输入关键词可继续累加，点「生成图片」做汇总出图" : "输入关键词（空格分隔多个），点「查找」；也可以直接粘贴 skill 链接。", count ? "ok" : "");
     return data;
   }).catch(function (error) {
     status("hotspot-status", "读取技能包失败：" + error.message, "error");
@@ -4213,22 +4662,37 @@ function abortSkillSearch(query) {
 function skillArticleReady(data) {
   return !!(data && data.article && String(data.article.body || "").trim());
 }
+// A search is finished once the backend publishes skills_ready/done: the intro is
+// written *before* that phase, so waiting for an article body after it can never
+// end. A zero-result keyword search used to spin here forever.
+var SKILL_POLL_PHASES = {
+  "searching": 1, "keywords": 1, "search": 1, "group": 1, "compose": 1, "rendering": 1,
+  "understanding": 1, "chain": 1, "decompose": 1
+};
+// ~10 minutes of 350ms ticks. A phase stuck in-flight (a crashed search thread, an
+// unreachable database) must end as a visible failure, not an endless spinner.
+var SKILL_POLL_MAX_TICKS = 1800;
+var skillPollTicks = 0;
 function pollSkillSnapshot() {
   if (waitCancelled("skill_search")) {
     return abortSkillSearch(($("skill-query").value || "").trim());
   }
+  skillPollTicks += 1;
+  if (skillPollTicks > SKILL_POLL_MAX_TICKS) {
+    return Promise.reject(new Error("查找一直没有结束，请重试；若反复出现请看服务日志"));
+  }
   return fetch("/api/skills", {signal: waitSignal("skill_search")}).then(function (response) { return response.json(); }).then(function (data) {
     renderSkillPackage(data);
     var phase = data.phase || "";
-    if (phase === "skills_ready") { renderSkillImages(); }
     if (phase === "error") {
       var error = new Error(data.error_reason || data.error || "查找失败");
       throw error;
     }
+    if (phase === "skills_ready" || phase === "done") { return data; }
     if (skillArticleReady(data)) {
       return data;
     }
-    if (phase === "understanding" || phase === "chain" || phase === "decompose" || phase === "keywords" || phase === "search" || phase === "group" || phase === "compose" || phase === "searching" || phase === "skills_ready" || phase === "rendering" || phase === "done" || !phase) {
+    if (!phase || SKILL_POLL_PHASES[phase]) {
       return new Promise(function (resolve, reject) {
         window.setTimeout(function () { pollSkillSnapshot().then(resolve, reject); }, 350);
       });
@@ -4239,19 +4703,19 @@ function pollSkillSnapshot() {
 function searchSkills() {
   var query = ($("skill-query").value || "").trim();
   if (!query) {
-    status("hotspot-status", "请先输入关键词或需求", "error");
+    status("hotspot-status", "请先输入关键词", "error");
     return;
   }
   if (waitRunning("skill_search")) { return; }
   var button = $("skill-search-btn");
   if (button) { busy(button, true); }
+  skillPollTicks = 0;
   waitStart("skill_search");
-  status("hotspot-status", "正在按覆盖地图查找 skill…");
+  status("hotspot-status", "正在按关键词去各来源抓取 skill…");
   waitApi("skill_search", "/api/skills/search", {query: query}).then(function (data) {
     if (waitCancelled("skill_search")) { return abortSkillSearch(query); }
     renderSkillPackage(data);
     var phase = data.phase || "";
-    if (phase === "skills_ready") { renderSkillImages(); }
     if (phase === "searching" || !phase || !skillArticleReady(data)) {
       return pollSkillSnapshot();
     }
@@ -4260,9 +4724,16 @@ function searchSkills() {
     if (!data || waitCancelled("skill_search")) { return; }
     renderSkillPackage(data);
     var count = (data.skills || []).length;
-    var phase = data.phase || "";
-    if (phase === "skills_ready") { renderSkillImages(); }
-    status("hotspot-status", count ? "已收录 " + count + " 个 skill" : "没有找到合格 skill", count ? "ok" : "error");
+    // 环节一「查找」到此结束：结果与介绍文落地，但绝不自动出图 —— 出图只由「生成图片」触发。
+    queueSkillImagesForRender();
+    var text = count ? ("已收录 " + count + " 个 skill，点「生成图片」做汇总出图") : "这些关键词没有抓到合格 skill，换个词或直接粘贴链接";
+    var dropped = data.capped_dropped || [];
+    if (dropped.length) {
+      // Never let a skill vanish silently: say the package hit its cap and who
+      // made room. 粘贴的 skill 不会被挤掉，让位的只会是检索到的。
+      text += "；已达 " + (data.skill_cap || 16) + " 个上限，让位 " + dropped.length + " 个检索结果（" + dropped.slice(0, 3).join("、") + (dropped.length > 3 ? " 等" : "") + "）";
+    }
+    status("hotspot-status", text, count ? "ok" : "error");
     waitDone(count ? ("已收录 " + count + " 个 skill") : "没有找到合格 skill", "skill_search");
   }).catch(function (error) {
     if (isWaitAbort(error, "skill_search")) {
@@ -4275,21 +4746,29 @@ function searchSkills() {
     if (button) { busy(button, false); }
   });
 }
+function queueSkillImagesForRender() {
+  var pack = state.skillsPackage || {};
+  if (!(pack.skills || []).length) { return; }
+  if ((pack.images || []).length) { return; }
+  pack.images = queuedSkillImages(pack);
+  renderSkillsGallery();
+}
 function renderSkillImages() {
   var pack = state.skillsPackage || {};
-  if (!(pack.skills || []).length && !pack.title) {
-    status("hotspot-status", "请先查找 skill，再生成图片", "error");
+  if (!(pack.skills || []).length) {
+    status("hotspot-status", "还没有收录 skill：先输入关键词查找，或粘贴 skill 链接", "error");
     return;
   }
   if (waitRunning("skill_render")) { return; }
   var button = $("skills-render-btn");
   if (button) { busy(button, true); }
-  if (!(pack.images || []).length) {
-    pack.images = queuedSkillImages(pack);
-    renderSkillsGallery();
-  }
+  queueSkillImagesForRender();
   waitStart("skill_render");
-  status("hotspot-status", "正在生成技能包封面和项目卡…");
+  var laneStatus = function (text, kind) {
+    // 结果只报给还在第四栏的用户；切走以后别在别人的状态行里喊。
+    if (state.lane === "skills") { status("hotspot-status", text, kind); }
+  };
+  laneStatus("正在生成技能包封面和项目卡…");
   var poll = window.setInterval(function () {
     if (waitCancelled("skill_render")) { return; }
     fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
@@ -4298,17 +4777,33 @@ function renderSkillImages() {
   }, 400);
   waitApi("skill_render", "/api/skills/render", {
     theme: state.githubTheme || "dark",
-    palette: visualPalette()
+    palette: visualPalette(),
+    title: String((($("skill-title") || {}).value) || "").trim()
   }).then(function (data) {
     if (waitCancelled("skill_render")) { return; }
     renderSkillPackage(data);
     var images = skillImages().filter(function (image) { return image.url; });
-    status("hotspot-status", images.length ? "已生成 " + images.length + " 张，勾选后可导出" : "没有生成图片", images.length ? "ok" : "error");
+    laneStatus(images.length ? "已生成 " + images.length + " 张，勾选后可导出" : "没有生成图片", images.length ? "ok" : "error");
     waitDone(images.length ? ("已生成 " + images.length + " 张") : "没有生成图片", "skill_render");
   }).catch(function (error) {
     if (isWaitAbort(error, "skill_render")) { return; }
-    status("hotspot-status", "出图失败：" + (error.reason || error.message), "error");
-    waitFail(error.message || "出图失败", "skill_render");
+    var reason = error.reason || error.message || "出图失败";
+    if (String(error.message || "").indexOf("skill_package_changed") >= 0) {
+      reason = "包在出图期间被改了（新粘贴或新查找），请重新点「生成图片」";
+    }
+    // The queued tiles are the only place a failed render is visible in the
+    // gallery: without this they keep saying 排队中 while the status line reports
+    // the error.
+    skillImages().forEach(function (image) {
+      if (!image.url) {
+        image.queued = false;
+        image.busy = false;
+        image.error = reason;
+      }
+    });
+    renderSkillsGallery();
+    laneStatus("出图失败：" + reason, "error");
+    waitFail(reason, "skill_render");
   }).then(function () {
     window.clearInterval(poll);
     if (button) { busy(button, false); }
@@ -4471,7 +4966,7 @@ function setLane(lane) {
     : (lane === "viewpoints"
     ? "下面是 Reddit 上正在热的 AI 使用/经验帖。热度看分数和评论数；这是社区说法，不是官方新闻。"
     : (lane === "skills"
-    ? "输入关键词或需求，按覆盖地图全网找 skill，打包成总览文和周榜式图片。封面是主题大字报。"
+    ? "输入关键词（空格分隔多个），直接去 GitHub / skills.sh / 网页抓 skill；也可以粘贴链接。点「生成图片」把所有已收录 skill 汇总成封面 + 每个 skill 一张海报。"
     : "下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载"));
   $("source-health-wrap").hidden = lane !== "hotspots";
   if (select) {
@@ -4484,6 +4979,7 @@ function setLane(lane) {
   }
   if (lane === "skills") {
     clearHotspotSelection(true);
+    growSkillLinks();
     loadSkills();
     return;
   }
@@ -4561,7 +5057,6 @@ $("endpoint-connect").addEventListener("click", connectEndpoint);
 $("endpoint-use-article").addEventListener("click", function () { assignEndpoint("article"); });
 $("endpoint-use-translation").addEventListener("click", function () { assignEndpoint("translation"); });
 $("endpoint-use-leaderboard").addEventListener("click", function () { assignEndpoint("leaderboard"); });
-$("endpoint-use-image").addEventListener("click", function () { assignEndpoint("image"); });
 $("provider-add").addEventListener("click", function () { openProviderEditor("add", null); });
 $("provider-apply").addEventListener("click", applyProvider);
 $("provider-cancel").addEventListener("click", closeProviderEditor);
@@ -4571,7 +5066,6 @@ $("provider-remove").addEventListener("click", function () {
 $("config-form").elements.article_provider.addEventListener("change", function () { onPurposeProviderChange("article"); });
 $("config-form").elements.translation_provider.addEventListener("change", function () { onPurposeProviderChange("translation"); });
 $("config-form").elements.leaderboard_provider.addEventListener("change", function () { onPurposeProviderChange("leaderboard"); });
-$("config-form").elements.image_provider.addEventListener("change", function () { onPurposeProviderChange("image"); });
 $("github-export-btn").addEventListener("click", exportGithubImages);
 $("github-select-all").addEventListener("click", selectAllGithubImages);
 $("github-render-btn").addEventListener("click", renderGithubWeeklyImages);
@@ -4582,6 +5076,22 @@ $("skill-query").addEventListener("keydown", function (event) {
     searchSkills();
   }
 });
+$("skill-paste-btn").addEventListener("click", pasteSkills);
+// In a textarea Enter is the user's line break, so pasting is the button only:
+// Ctrl/Cmd+Enter is the shortcut for "加入".
+$("skill-links").addEventListener("input", growSkillLinks);
+$("skill-links").addEventListener("keydown", function (event) {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    pasteSkills();
+  }
+});
+$("skill-clear-btn").addEventListener("click", clearSkills);
+$("skill-source-toggle").addEventListener("click", toggleCrawlSources);
+$("skill-title").addEventListener("input", scheduleSkillTitleSave);
+$("skill-title").addEventListener("change", saveSkillTitle);
+$("skill-token-save").addEventListener("click", saveGithubToken);
+$("skill-token-clear").addEventListener("click", clearGithubToken);
 $("skills-render-btn").addEventListener("click", renderSkillImages);
 $("skills-select-all").addEventListener("click", selectAllSkillImages);
 $("skills-export-btn").addEventListener("click", exportSkillImages);
@@ -4696,9 +5206,6 @@ fetch("/api/status").then(function (response) { return response.json(); }).then(
   if (data.leaderboard_llm) {
     state.leaderboard = data.leaderboard_llm;
   }
-  if (data.image_llm) {
-    state.image = data.image_llm;
-  }
   renderModelPicker();
   fillPurposePickers();
   renderEndpointLists();
@@ -4742,8 +5249,6 @@ class WebApp:
         translation_service: LLMService | None = None,
         github_fetcher=None,
         leaderboard_service: LLMService | None = None,
-        image_service: LLMService | None = None,
-        image_generator=None,
         visual_renderer=None,
     ) -> None:
         self.database = database
@@ -4761,9 +5266,6 @@ class WebApp:
         self._translation_model_configured = translation_service is not None
         self.leaderboard_service = leaderboard_service or LLMService(database)
         self._leaderboard_model_configured = leaderboard_service is not None
-        self.image_service = image_service or LLMService(database)
-        self._image_model_configured = image_service is not None
-        self.image_generator = image_generator
         self.visual_renderer = visual_renderer
         self.github_fetcher = github_fetcher
         self.skill_complete = None
@@ -4802,6 +5304,17 @@ class WebApp:
         self.x_bearer_token = ""
         self.scheduler = PublishScheduler(database, self.publish, interval_seconds=15)
         self._restore_accounts()
+        self._restore_github_token()
+
+    def _restore_github_token(self) -> None:
+        """Hand the saved GitHub token to the HTTP layer; the value stays secret."""
+        try:
+            token = self.credential_store.get(GITHUB_TOKEN_STORE_ID) or ""
+        except Exception:
+            token = ""
+        self.github_token_configured = bool(token.strip())
+        # None (not "") so an unset keychain entry still lets GITHUB_TOKEN apply.
+        set_github_token(token.strip() or None)
 
     def _restore_model_selections(self) -> None:
         """Restore saved model-purpose selections without network calls."""
@@ -4810,7 +5323,6 @@ class WebApp:
             ("translation", self.translation_service),
             ("chat", self.chat_service),
             ("leaderboard", self.leaderboard_service),
-            ("image", self.image_service),
         ):
             mapping = self.database.get_model_purpose(purpose)
             if mapping is None:
@@ -4839,8 +5351,6 @@ class WebApp:
                 self._translation_model_configured = True
             elif purpose == "leaderboard":
                 self._leaderboard_model_configured = True
-            elif purpose == "image":
-                self._image_model_configured = True
 
     def _account_payload(self, platform: str) -> dict[str, str] | None:
         raw = self.credential_store.get(ACCOUNT_STORE_IDS[platform])
@@ -4919,7 +5429,6 @@ class WebApp:
             "translation": self.translation_service,
             "chat": self.chat_service,
             "leaderboard": self.leaderboard_service,
-            "image": self.image_service,
         }
         current = services[purpose].settings
         if api_key == "":
@@ -4956,7 +5465,6 @@ class WebApp:
         chat_settings = self.chat_service.settings
         translation_settings = self.translation_service.settings
         leaderboard_settings = self.leaderboard_service.settings
-        image_settings = self.image_service.settings
         return {
             "ok": True,
             "service": "autoposting",
@@ -4986,14 +5494,6 @@ class WebApp:
                     "enabled": True,
                 }
                 if self._leaderboard_model_configured
-                else {"model": "", "base_url": "", "configured": False, "enabled": False}
-            ),
-            "image_llm": (
-                {
-                    **self.image_service.settings_payload(image_settings),
-                    "enabled": True,
-                }
-                if self._image_model_configured
                 else {"model": "", "base_url": "", "configured": False, "enabled": False}
             ),
             "model_endpoints": self._model_endpoints(),
@@ -5324,8 +5824,8 @@ class WebApp:
         if not isinstance(payload, dict):
             raise ValueError("model discovery settings must be a JSON object")
         purpose = payload.get("purpose", "article")
-        if purpose not in ("article", "translation", "chat", "leaderboard", "image"):
-            raise ValueError("purpose must be article, translation, chat, leaderboard, or image")
+        if purpose not in ("article", "translation", "chat", "leaderboard"):
+            raise ValueError("purpose must be article, translation, chat, or leaderboard")
         persist = payload.get("persist", True)
         if not isinstance(persist, bool):
             raise ValueError("persist must be boolean")
@@ -5412,34 +5912,6 @@ class WebApp:
             "model_endpoints": self._model_endpoints(),
         }
 
-    def set_image_model(self, payload: object) -> dict[str, object]:
-        if not isinstance(payload, dict):
-            raise ValueError("image model settings must be a JSON object")
-        base_url, api_key = self._resolve_endpoint_credentials(payload, "image")
-        if self.image_generator is not None:
-            settings = self.image_service.configure(
-                model=str(payload.get("model") or "image"),
-                effort="none",
-                base_url=base_url,
-                api_key=api_key,
-            )
-        else:
-            settings = self.image_service.configure_verified_image(
-                model=payload.get("model"),
-                base_url=base_url,
-                api_key=api_key,
-            )
-        self._image_model_configured = True
-        self._activate_endpoint("image", settings)
-        return {
-            "ok": True,
-            "image_llm": {
-                **self.image_service.settings_payload(settings),
-                "enabled": True,
-            },
-            "model_endpoints": self._model_endpoints(),
-        }
-
     def github_weekly(self) -> dict[str, object]:
         snapshot = self.database.get_github_weekly()
         if snapshot is None:
@@ -5467,7 +5939,7 @@ class WebApp:
             except LLMError:
                 model_used = ""
         title, body = build_xhs_copy(repos)
-        images = build_weekly_image_jobs(repos)
+        images = build_weekly_render_plan(repos)
         saved = self.database.save_github_weekly(
             week_window_start(), repos, title, body, model_used, images
         )
@@ -5481,8 +5953,7 @@ class WebApp:
         theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
         palette = parse_palette(body.get("palette"))
         repos = list(snapshot["repos"])
-        jobs = list(snapshot.get("images") or []) or build_weekly_image_jobs(repos)
-        generate = self.image_service.generate_image if self._image_model_configured else None
+        jobs = list(snapshot.get("images") or []) or build_weekly_render_plan(repos)
         if self.visual_renderer is None:
             images = render_weekly_visual(
                 repos,
@@ -5490,7 +5961,6 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
-                generate_image=generate,
             )
         else:
             images = self.visual_renderer(
@@ -5511,6 +5981,12 @@ class WebApp:
             visual=visual,
         )
         return {"ok": True, "count": len(repos), **saved}
+
+    def _skill_copy_writer(self):
+        """B5: skill posters go through the same copy layer as the weekly lane."""
+        if not self._leaderboard_model_configured:
+            return None
+        return self.leaderboard_service.enrich_skill_repos
 
     def _skill_llm(self):
         if self.skill_complete is not None:
@@ -5535,11 +6011,26 @@ class WebApp:
         latest_images = latest.get("images")
         if isinstance(latest_images, list) and latest_images and not snapshot.get("images"):
             snapshot["images"] = list(latest_images)
+        # The user's own title is state, not output: a search or a paste must never
+        # silently drop it (it titles the cover poster and the intro panel).
+        if str(latest.get("user_title") or "").strip() and "user_title" not in snapshot:
+            snapshot["user_title"] = str(latest["user_title"])
         if isinstance(latest.get("visual"), dict) and not snapshot.get("visual"):
             snapshot["visual"] = dict(latest["visual"])
         latest_phase = str(latest.get("phase") or "")
         if latest_phase in {"rendering", "done"} and snapshot.get("phase") not in {"error", "done"}:
             snapshot["phase"] = latest_phase
+        # Partial writes (progress events, image batches) must not reset the
+        # package revision: the render stage uses it to detect a moved package.
+        try:
+            latest_revision = int(latest.get("revision") or 0)
+        except (TypeError, ValueError):
+            latest_revision = 0
+        try:
+            own_revision = int(snapshot.get("revision") or 0)
+        except (TypeError, ValueError):
+            own_revision = 0
+        snapshot["revision"] = max(latest_revision, own_revision)
         return snapshot
 
     def _restore_skill_article_from_package(self, snapshot: dict[str, object]) -> dict[str, object]:
@@ -5583,6 +6074,19 @@ class WebApp:
         self.database.save_skill_finder(snapshot)
         return snapshot
 
+    def _skill_source_payload(self) -> dict[str, object]:
+        """Sources of the collected skills + the configured auto-scrape sources.
+
+        The skills lane shows two different things and must not confuse them:
+        where the *collected* skills came from (GitHub / skills.sh / 粘贴), and how
+        many *crawlers* are configured to go find more.
+        """
+        crawled = crawl_sources(github_token=bool(getattr(self, "github_token_configured", False)))
+        return {
+            "crawl_sources": crawled,
+            "crawl_source_count": len([row for row in crawled if row.get("enabled") == "1"]),
+        }
+
     def skills_snapshot(self) -> dict[str, object]:
         snapshot = self.database.get_skill_finder()
         if snapshot is None:
@@ -5590,6 +6094,7 @@ class WebApp:
                 "ok": True,
                 "query": "",
                 "title": "",
+                "user_title": "",
                 "theme": "",
                 "stages": [],
                 "skills": [],
@@ -5598,12 +6103,167 @@ class WebApp:
                 "images": [],
                 "phase": "",
                 "count": 0,
+                "github_token": bool(getattr(self, "github_token_configured", False)),
+                **self._skill_source_payload(),
             }
         snapshot = self._restore_skill_article_from_package(dict(snapshot))
         skills = snapshot.get("skills") if isinstance(snapshot.get("skills"), list) else []
         body = {"ok": True, "count": len(skills), **snapshot}
         body.setdefault("phase", "")
+        body.setdefault("user_title", "")
+        body["github_token"] = bool(getattr(self, "github_token_configured", False))
+        body.update(self._skill_source_payload())
         return body
+
+    def skills_paste(self, payload: object) -> dict[str, object]:
+        """Pasted skill links join the package the same way searched ones do.
+
+        The links become collected skills, get a stage, are named in the intro
+        and are rendered as posters by the regular 生成图片 step.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("links must be a string")
+        links = payload.get("links")
+        if not isinstance(links, str) or not links.strip():
+            raise ValueError("links must contain at least one skill link")
+        if len(links) > MAX_PASTE_CHARS:
+            raise ValueError(f"links must be at most {MAX_PASTE_CHARS} characters")
+        thread = getattr(self, "_skill_thread", None)
+        if thread is not None and thread.is_alive():
+            raise ValueError("skill_search_running")
+        # Only a render that is alive *in this process* blocks a paste. The stored
+        # phase may say "rendering" forever after a crash or a restart, and that
+        # must not park the paste box.
+        if getattr(self, "_skill_render_active", False):
+            raise ValueError("skill_render_running")
+        candidates, rejects = parse_skill_links(links)
+        reject_total = len(rejects)
+        if len(candidates) > MAX_PASTE_LINKS:
+            for extra in candidates[MAX_PASTE_LINKS:]:
+                rejects.append(
+                    {
+                        "input": str(extra.get("url") or extra.get("source_id") or ""),
+                        "reason": "too_many",
+                    }
+                )
+            candidates = candidates[:MAX_PASTE_LINKS]
+        if not candidates:
+            return {
+                "ok": True,
+                "added": 0,
+                "rejected": rejects,
+                **self.skills_snapshot(),
+            }
+        # Network work first, lock second: fetching under the lock would stall a
+        # render's progress writes for as long as the paste takes.
+        hits, skipped = fetch_manual_hits(
+            candidates, getter=self.github_fetcher, api_ok=None
+        )
+        with self._skill_lock():
+            # The freshest snapshot, so a render that finished during the fetch
+            # (or any other writer) is not rolled back by this paste.
+            latest = self.database.get_skill_finder()
+            result = merge_manual_hits(
+                latest,
+                hits,
+                complete=self._skill_llm(),
+                output_root=self.packages_dir.parent / "skills",
+                skipped=skipped,
+            )
+            saved = self.database.save_skill_finder(result)
+        skills = saved.get("skills") if isinstance(saved.get("skills"), list) else []
+        skipped_rows = (
+            saved.get("paste_skipped") if isinstance(saved.get("paste_skipped"), list) else []
+        )
+        unverified = (
+            saved.get("paste_unverified") if isinstance(saved.get("paste_unverified"), list) else []
+        )
+        replaced = int(saved.get("paste_replaced") or 0)
+        return {
+            "ok": True,
+            "added": max(0, len(hits) - len(skipped_rows) - replaced),
+            "replaced": replaced,
+            # The detail is capped: pasting a block of prose turns every token into
+            # a reject, and returning hundreds of rows helps nobody. The UI reports
+            # the exact count from `rejected_count`.
+            "rejected": rejects[:MAX_PASTE_REJECTS],
+            "rejected_count": max(len(rejects), reject_total),
+            "unverified": unverified,
+            "count": len(skills),
+            **saved,
+        }
+
+    def save_github_token(self, payload: object) -> dict[str, object]:
+        """Store (or clear) the optional GitHub token for the skill finder."""
+        if not isinstance(payload, dict):
+            raise ValueError("token must be a string")
+        token = payload.get("token")
+        if not isinstance(token, str):
+            raise ValueError("token must be a string")
+        token = token.strip()
+        if len(token) > 255:
+            raise ValueError("token must be at most 255 characters")
+        if token:
+            self.credential_store.set(GITHUB_TOKEN_STORE_ID, token)
+        else:
+            self.credential_store.delete(GITHUB_TOKEN_STORE_ID)
+        self.github_token_configured = bool(token)
+        # Clearing falls back to the environment instead of forcing "no token".
+        set_github_token(token or None)
+        return {"ok": True, "configured": bool(token)}
+
+    def set_skill_title(self, payload: object) -> dict[str, object]:
+        """Store the user's own title for the skill package.
+
+        The title is user state, not search output: it survives a new search, it
+        titles the cover poster, and it titles the intro panel in the text area.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("title must be a string")
+        title = payload.get("title")
+        if not isinstance(title, str):
+            raise ValueError("title must be a string")
+        title = title.strip()
+        if len(title) > 120:
+            raise ValueError("title must be at most 120 characters")
+        with self._skill_lock():
+            current = dict(self.database.get_skill_finder() or {})
+            current["user_title"] = title
+            self.database.save_skill_finder(current)
+        return {"ok": True, "user_title": title, **self.skills_snapshot()}
+
+    def clear_skills(self) -> dict[str, object]:
+        """Drop the collected skills (and their posters) but keep the title.
+
+        Keyword search adds to the package, so clearing is the way back to an
+        empty sheet; without it the only reset was editing the database.
+        """
+        thread = getattr(self, "_skill_thread", None)
+        if thread is not None and thread.is_alive():
+            raise ValueError("skill_search_running")
+        if getattr(self, "_skill_render_active", False):
+            raise ValueError("skill_render_running")
+        with self._skill_lock():
+            current = dict(self.database.get_skill_finder() or {})
+            title = str(current.get("user_title") or "")
+            self.database.save_skill_finder(
+                {
+                    "query": "",
+                    "user_title": title,
+                    "title": title,
+                    "theme": "",
+                    "stages": [],
+                    "skills": [],
+                    "manual_skills": [],
+                    "groups": [],
+                    "article": {"title": "", "body": ""},
+                    "images": [],
+                    "package_path": "",
+                    "phase": "skills_ready",
+                    "revision": self._skill_revision() + 1,
+                }
+            )
+        return self.skills_snapshot()
 
     def skills_search(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict):
@@ -5625,20 +6285,28 @@ class WebApp:
         query = payload["query"].strip()
         if not query or len(query) > 200:
             raise ValueError("query must be 1-200 characters")
+        # The model is optional now: keywords drive the scrape, and when a model
+        # is configured it is only used to write the intro piece.
         complete = self._skill_llm()
-        if complete is None:
-            raise LLMError("skill_search_failed", "模型未配置", cause_code="llm_not_configured")
         previous = self.database.get_skill_finder()
         cancel = threading.Event()
         self._skill_cancel = cancel
+        try:
+            previous_revision = int((previous or {}).get("revision") or 0)
+        except (TypeError, ValueError):
+            previous_revision = 0
         seed = {
             "query": query,
             "title": query,
+            "user_title": str((previous or {}).get("user_title") or ""),
             "theme": query,
             "stages": [],
             "skills": [],
             "article": {"title": "", "body": ""},
             "images": [],
+            # A new search replaces the skill set: bump so an in-flight render
+            # refuses to write its older package back.
+            "revision": previous_revision + 1,
             "package_path": "",
             "phase": "searching",
         }
@@ -5673,6 +6341,28 @@ class WebApp:
                         body["phase"] = "searching"
                 self.database.save_skill_finder(body)
 
+        def mark_failed(error_code: str, reason: str) -> None:
+            """Record a failed search without ever raising out of the thread.
+
+            The previous handler read the snapshot inside `except`, so a database
+            error there killed the thread and left the stored phase in-flight —
+            which is exactly the state the browser polls forever.
+            """
+            try:
+                failed = dict(self.database.get_skill_finder() or saved)
+            except Exception:
+                failed = dict(saved)
+            failed["phase"] = "error"
+            failed["error"] = error_code
+            failed["error_reason"] = reason
+            with persist_lock:
+                try:
+                    self.database.save_skill_finder(failed)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "skill finder: could not persist the failure state"
+                    )
+
         def run() -> None:
             try:
                 result = find_skills(
@@ -5695,24 +6385,53 @@ class WebApp:
                         result["phase"] = "skills_ready"
                     self.database.save_skill_finder(result)
             except LLMError as exc:
-                failed = dict(self.database.get_skill_finder() or saved)
-                failed["phase"] = "error"
-                failed["error"] = exc.code
-                failed["error_reason"] = exc.reason
-                with persist_lock:
-                    self.database.save_skill_finder(failed)
+                mark_failed(exc.code, exc.reason)
             except Exception as exc:
-                failed = dict(self.database.get_skill_finder() or saved)
-                failed["phase"] = "error"
-                failed["error"] = type(exc).__name__
-                failed["error_reason"] = str(exc)
-                with persist_lock:
-                    self.database.save_skill_finder(failed)
+                mark_failed(type(exc).__name__, str(exc))
 
         thread = threading.Thread(target=run, daemon=True)
         self._skill_thread = thread
         thread.start()
         return self.skills_snapshot()
+
+    def _skill_lock(self) -> threading.Lock:
+        """The one lock that serializes every read-modify-write of the package."""
+        lock = getattr(self, "_skill_persist_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._skill_persist_lock = lock
+        return lock
+
+    def _skill_revision(self) -> int:
+        snapshot = self.database.get_skill_finder() or {}
+        try:
+            return int(snapshot.get("revision") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _save_skill_render_fields(
+        self,
+        revision: int,
+        fields: dict[str, object],
+        *,
+        expected_phase: str,
+    ) -> dict[str, object]:
+        """Write only what the render stage owns, and only for the same package.
+
+        The package is read again under the lock, so a paste (or a new search)
+        that landed while the posters were being rendered is never overwritten
+        with the render's stale skill list. When the package really did change,
+        the render's images belong to a skill set that no longer exists: they are
+        dropped and the caller is told to render again.
+        """
+        with self._skill_lock():
+            current = dict(self.database.get_skill_finder() or {})
+            if int(current.get("revision") or 0) != revision:
+                raise ValueError("skill_package_changed")
+            self._merge_latest_skill_fields(current)
+            current.update(fields)
+            current["phase"] = expected_phase
+            return self.database.save_skill_finder(current)
 
     def skills_render(self, payload: object) -> dict[str, object]:
         snapshot = self.database.get_skill_finder()
@@ -5721,20 +6440,31 @@ class WebApp:
         body = payload if isinstance(payload, dict) else {}
         theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
         palette = parse_palette(body.get("palette")) if body.get("palette") is not None else None
+        # The title box travels with the render request so the cover cannot be
+        # painted from a stale title the user already replaced.
+        if isinstance(body.get("title"), str):
+            title = body["title"].strip()[:120]
+            with self._skill_lock():
+                current = dict(self.database.get_skill_finder() or {})
+                current["user_title"] = title
+                snapshot = self.database.save_skill_finder(current)
+        # One aggregate for the whole sheet: searched + pasted, ordered as one
+        # workflow, so the cover and the individual posters describe the same set.
+        aggregated = aggregate_skills(snapshot)
+        if not aggregated:
+            raise ValueError("skill_package_empty")
+        snapshot = dict(snapshot)
+        snapshot["skills"] = aggregated
         package_path = Path(str(snapshot.get("package_path") or self.packages_dir.parent / "skills" / "latest"))
         images_dir = package_path / "images"
         http_dir = self.packages_dir / "skills"
-        generate = self.image_service.generate_image if self._image_model_configured else None
-        snapshot = dict(snapshot)
-        persist_lock = getattr(self, "_skill_persist_lock", None)
-        if persist_lock is None:
-            persist_lock = threading.Lock()
-            self._skill_persist_lock = persist_lock
-        snapshot["phase"] = "rendering"
-        with persist_lock:
-            self._merge_latest_skill_fields(snapshot)
-            snapshot["phase"] = "rendering"
-            self.database.save_skill_finder(snapshot)
+        revision = self._skill_revision()
+        self._skill_render_active = True
+        self._save_skill_render_fields(
+            revision,
+            {"images": list(snapshot.get("images") or []), "skills": aggregated},
+            expected_phase="rendering",
+        )
 
         def publish_images(images: list[dict[str, object]]) -> None:
             http_dir.mkdir(parents=True, exist_ok=True)
@@ -5745,13 +6475,9 @@ class WebApp:
                     target = http_dir / filename
                     target.write_bytes(source.read_bytes())
                 image["url"] = f"/api/generated/skills/{filename}"
-            snapshot["images"] = list(images)
-            snapshot["phase"] = "rendering"
-            with persist_lock:
-                self._merge_latest_skill_fields(snapshot)
-                snapshot["images"] = list(images)
-                snapshot["phase"] = "rendering"
-                self.database.save_skill_finder(snapshot)
+            self._save_skill_render_fields(
+                revision, {"images": list(images)}, expected_phase="rendering"
+            )
 
         def on_image(image: dict[str, object]) -> None:
             current = list(snapshot.get("images") or [])
@@ -5765,16 +6491,32 @@ class WebApp:
                 current.append(image)
             publish_images(current)
 
-        images = render_skill_package(
-            snapshot,
-            images_dir,
-            theme=theme,
-            palette=palette,
-            screenshot_fn=self.skill_screenshot,
-            visual_renderer=self.visual_renderer,
-            generate_image=generate,
-            on_image=on_image,
-        )
+        try:
+            images = render_skill_package(
+                snapshot,
+                images_dir,
+                theme=theme,
+                palette=palette,
+                screenshot_fn=self.skill_screenshot,
+                visual_renderer=self.visual_renderer,
+                copy_writer=self._skill_copy_writer(),
+                on_image=on_image,
+            )
+        except Exception as exc:
+            # Never leave the package parked in "rendering": that phase is what
+            # refused the next paste.
+            failed = {
+                "images": list(snapshot.get("images") or []),
+                "phase": "skills_ready",
+                "render_error": f"{type(exc).__name__}: {exc}"[:300],
+            }
+            try:
+                self._save_skill_render_fields(revision, failed, expected_phase="skills_ready")
+            except ValueError:
+                pass
+            raise
+        finally:
+            self._skill_render_active = False
         http_dir.mkdir(parents=True, exist_ok=True)
         for image in images:
             filename = str(image.get("file") or f"{image.get('id')}.png")
@@ -5783,15 +6525,15 @@ class WebApp:
                 target = http_dir / filename
                 target.write_bytes(source.read_bytes())
             image["url"] = f"/api/generated/skills/{filename}"
-        snapshot["images"] = images
-        snapshot["visual"] = {"theme": theme, "palette": palette or {}}
-        snapshot["phase"] = "done"
-        with persist_lock:
-            self._merge_latest_skill_fields(snapshot)
-            snapshot["images"] = images
-            snapshot["visual"] = {"theme": theme, "palette": palette or {}}
-            snapshot["phase"] = "done"
-            saved = self.database.save_skill_finder(snapshot)
+        saved = self._save_skill_render_fields(
+            revision,
+            {
+                "images": images,
+                "visual": {"theme": theme, "palette": palette or {}},
+                "render_error": "",
+            },
+            expected_phase="done",
+        )
         skills = saved.get("skills") if isinstance(saved.get("skills"), list) else []
         return {"ok": True, "count": len(skills), **saved}
 
@@ -5818,7 +6560,6 @@ class WebApp:
         else:
             theme = "light" if str(visual.get("theme") or "").strip().lower() == "light" else "dark"
             palette = parse_palette(visual.get("palette"))
-        generate = self.image_service.generate_image if self._image_model_configured else None
         if self.visual_renderer is None:
             rendered = render_weekly_visual(
                 list(snapshot["repos"]),
@@ -5826,7 +6567,6 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
-                generate_image=generate,
             )
         else:
             rendered = self.visual_renderer(
@@ -5885,7 +6625,6 @@ class WebApp:
             ("translation", self.translation_service),
             ("chat", self.chat_service),
             ("leaderboard", self.leaderboard_service),
-            ("image", self.image_service),
         ):
             mapping = self.database.get_model_purpose(purpose)
             if mapping is not None and str(mapping["endpoint_id"]) == endpoint_id:
@@ -5904,8 +6643,6 @@ class WebApp:
                     self.hotspots.llm_service = None
                 elif purpose == "leaderboard":
                     self._leaderboard_model_configured = False
-                elif purpose == "image":
-                    self._image_model_configured = False
         self.credential_store.delete(endpoint_id)
         self.database.delete_model_endpoint(endpoint_id)
         return {
@@ -6375,10 +7112,16 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     result = app.github_weekly_image(self._require_string(payload, "id"), payload)
                 elif self.path == "/api/skills/search":
                     result = app.skills_search(payload)
+                elif self.path == "/api/skills/title":
+                    result = app.set_skill_title(payload)
+                elif self.path == "/api/skills/clear":
+                    result = app.clear_skills()
+                elif self.path == "/api/skills/paste":
+                    result = app.skills_paste(payload)
+                elif self.path == "/api/skills/github-token":
+                    result = app.save_github_token(payload)
                 elif self.path == "/api/skills/render":
                     result = app.skills_render(payload)
-                elif self.path == "/api/image/model":
-                    result = app.set_image_model(payload)
                 elif self.path == "/api/leaderboard/model":
                     result = app.set_leaderboard_model(payload)
                 elif self.path == "/api/translation/model":
@@ -6436,6 +7179,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         "ok": False,
                         "error": exc.code,
                         "error_code": exc.cause_code or exc.code,
+                        "cause_code": exc.cause_code or exc.code,
                         "error_reason": exc.reason,
                         "error_type": "LLMError",
                     },

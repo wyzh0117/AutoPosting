@@ -101,7 +101,7 @@ macOS 可直接双击项目根目录的 `AutoPosting服务控制.command`。控�
 autoposting web --db data/autoposting.db --sources config/sources.example.json --port 8080
 ```
 
-浏览器打开 `http://127.0.0.1:8080/` 即单页工作台。页面最上方切换四个栏目（热点候选 / 观点候选 / GitHub 周榜 / Skill查找器）以及微信/小红书。热点来自 RSS，观点来自 Reddit 使用/经验向板块的当前热帖，周榜封面为 3:4，Skill查找器按覆盖地图检索并打包 skill。下方仍是左右两栏。左栏默认高度刚好露出两条候选，其余在栏内滚动；点开看来源后才展开订阅健康。原文配图收在独立配图栏内滚动，照片再多也不靠整页滚轮翻。标题和正文可在文章区修改并保存；模型选择和发布位于文章区右下角。文章生成区正下方提供独立的原生模型聊天框，聊天记录在首次输入/输出前不显示且只保存在当前浏览器会话；输出出现后页面保持上部尺寸并向下自然扩展，由页面滚动承载长对话。顶栏「设置」分别配置文章与翻译模型、聊天模型、微信公众号 API 和小红书账号；模型接口元数据持久化到 SQLite，API Key 与平台账号凭据存入 macOS 钥匙串，重启后自动恢复，可手动删除。小红书仍只生成本地包，需到官方创作中心人工提交。
+浏览器打开 `http://127.0.0.1:8080/` 即单页工作台。页面最上方切换四个栏目（热点候选 / 观点候选 / GitHub 周榜 / Skill查找器）以及微信/小红书。热点来自 RSS，观点来自 Reddit 使用/经验向板块的当前热帖，周榜封面为 3:4，Skill查找器按你输入的关键词去 GitHub / skills.sh / 网页抓 skill，粘贴链接也能一起汇总出图。下方仍是左右两栏。左栏默认高度刚好露出两条候选，其余在栏内滚动；点开看来源后才展开订阅健康。原文配图收在独立配图栏内滚动，照片再多也不靠整页滚轮翻。标题和正文可在文章区修改并保存；模型选择和发布位于文章区右下角。文章生成区正下方提供独立的原生模型聊天框，聊天记录在首次输入/输出前不显示且只保存在当前浏览器会话；输出出现后页面保持上部尺寸并向下自然扩展，由页面滚动承载长对话。顶栏「设置」分别配置文章与翻译模型、聊天模型、微信公众号 API 和小红书账号；模型接口元数据持久化到 SQLite，API Key 与平台账号凭据存入 macOS 钥匙串，重启后自动恢复，可手动删除。小红书仍只生成本地包，需到官方创作中心人工提交。
 
 `--host` 只接受 `127.0.0.1` 或 `localhost`，其他值直接拒绝，避免无认证暴露。端点为：
 
@@ -120,13 +120,16 @@ curl -X POST http://127.0.0.1:8080/api/approve -d '{"draft_id": "DRAFT_ID", "rev
 curl -X POST http://127.0.0.1:8080/api/config -d '{"platform": "wechat", "app_id": "...", "app_secret": "...", "author": "..."}'
 curl -X POST http://127.0.0.1:8080/api/publish -d '{"draft_id": "DRAFT_ID", "platform": "wechat", "live": true}'
 curl -X POST http://127.0.0.1:8080/api/skills/search -H 'Content-Type: application/json' -d '{"query": "从零做播客"}'
+curl -X POST http://127.0.0.1:8080/api/skills/paste -H 'Content-Type: application/json' -d '{"links": "https://github.com/anthropics/skills/tree/main/skills/web-artifacts-builder"}'
+curl -X POST http://127.0.0.1:8080/api/skills/github-token -H 'Content-Type: application/json' -d '{"token": "ghp_..."}'
 curl -X POST http://127.0.0.1:8080/api/skills/render -H 'Content-Type: application/json' -d '{"theme": "dark"}'
 curl http://127.0.0.1:8080/api/skills
 ```
 
 - `collect` 默认强制刷新已启用一手 RSS（`force: true`）；可传 `source_id` 只刷新一个源。不抓 AIHOT 聚合页或 API。响应含 `rankings.heat`（独立来源数优先，其次新旧）和 `rankings.time`（新旧优先，其次来源数），以及 `sources` 健康状态（`ok`/`error`/`stale`/`never`/`disabled`）和 `collection.inserted`。`candidates` 仍是时间优先列表，兼容旧调用。窗口内最多各取 10 条，不是 `hotspot-check` 的统计显著热点。刷新全部只抓源、不阻塞翻译，列表先显示库里已有候选。`hours` 接受 1–720；工作台默认 4 小时，并提供 4/6/24/72/168/720 与自定义。左栏上方是话题/新闻卡片；底部折叠的是订阅源健康（抓取成功 / 只刷这个），不是新闻标题。左栏可切换热度优先 / 时间优先。网页逐步点选验收见 `docs/WEB_FUNCTIONAL_TEST.md`。
-- `github-weekly` 是顶栏第三栏「GitHub 周榜」。`POST /api/github-weekly` 只抓仓库和文案，不生成图片。优先本周新建的 AI 仓库（Search `created:>=7d`），不够再用 Trending weekly 补齐，固定前 10。「生成图片」走 `POST /api/github-weekly/render`：HTML/CSS 排版后用本机 Chrome 截 PNG。周榜封面 3:4（1080×1440）；项目卡与小红书纸卡仍为当前比例；图像模型默认仍 9:16。旁边可选浅色/暗色，以及主色、副色、强调色三个色盘；这三色写入 Design Token 后改卡片背景、表面和强调色。3 列 3:4 网格平铺，可点大图、勾选，只导出已勾选且保持网页顺序。设置里的「榜单模型」只改写简介四句。
-- `skills` 是顶栏第四栏「Skill查找器」。`POST /api/skills/search` 接收 `{"query":"..."}`（1–200 字），按覆盖地图拆 6–12 个阶段，检索 GitHub / 网页上的 `SKILL.md`，质量门槛过滤后写入 `output/skills/<hash>/`，并生成总览文。模型未配置时 502 `skill_search_failed`。`POST /api/skills/render` 用本地大字报截 3:4 封面，项目卡复用周榜视觉。`GET /api/skills` 读上次结果。工作台左侧是搜索框、阶段条和 skill 列表，右侧是介绍文和图片画廊。
+- `github-weekly` 是顶栏第三栏「GitHub 周榜」。`POST /api/github-weekly` 只抓仓库和文案，不生成图片。优先本周新建的 AI 仓库（Search `created:>=7d`），不够再用 Trending weekly 补齐，固定前 10。「生成图片」走 `POST /api/github-weekly/render`：出图只有一条链路——HTML/CSS 页面排版后用本机 Chrome 截 PNG，画布统一 3:4（1080×1440），周榜封面、项目卡与项目海报同为 1080×1440，小红书纸卡仍是 9:16 手写纸比例。旁边可选浅色/暗色，以及主色、副色、强调色三个色盘；这三色写入 Design Token 后改卡片背景、表面和强调色。3 列 3:4 网格平铺，可点大图、勾选，只导出已勾选且保持网页顺序。设置里的「榜单模型」只改写简介四句。
+- `skills` 是顶栏第四栏「Skill查找器」。`POST /api/skills/search` 接收 `{"query":"..."}`（1–200 字），**按用户自己的关键词抓取**：按空格 / 逗号 / 分号 / 斜杠切词（最多 6 个，去重保序），一个关键词一条检索 lane，同时打 GitHub 代码检索、skills.sh 站内搜索、网页检索，外加 `anthropics/skills` 兜底清单；质量门槛过滤后写入 `output/skills/<hash>/`，并生成总览文。**查找不再需要模型**（模型只在写介绍文时用，没配模型时介绍文按工作流环节机械生成；`coverage` 参数可显式传一份检索计划）。查找是**累加**的：上一轮的 skill 会重新归档保留，`POST /api/skills/clear` 回到空盘（保留标题）。`POST /api/skills/paste` 接收 `{"links":"..."}`（≤20000 字，一次最多 16 条，可多行/多个 GitHub 或 skills.sh 链接），解析出的 skill 与检索到的一样进入同一个包：按内容归到最合适的工作流环节（名字 > 描述 > `SKILL.md` 正文加权匹配；匹配不上进兜底桶「通用工具」）、抓 `SKILL.md`、重写介绍文、参与缩略图上限排序；同一个 monorepo 里的多个 skill 目录各算一条，重复粘贴只替换不翻倍，超出 16 条的以 `too_many` 报告。`POST /api/skills/github-token` 保存/清除可选 GitHub Token（`{"token":""}` 为清除），只回 `{configured}`，不回显明文，清空后回落环境变量 `AUTOPOSTING_GITHUB_TOKEN` / `GITHUB_TOKEN`。`POST /api/skills/title` 接收 `{"title":"..."}`（≤120 字）保存用户标题：它决定封面海报大字与介绍文标题，且查找 / 粘贴 / 清空都不会冲掉它。`POST /api/skills/render` 把包内**全部** skill（检索到的 + 粘贴的）汇总成一份、按工作流顺序排好，出一张封面海报和每个 skill 一张海报，画布 3:4（1080×1440），项目卡复用周榜视觉。`GET /api/skills` 读上次结果，并返回 `crawl_sources` / `crawl_source_count`（当前配置的自动抓取源）。工作台左侧是关键词框 + 清空、可自适应变高的多行粘贴框、来源 chip 条（`GitHub · 3` 这类）与「自动抓取源 N 个 · 点击展开」；右侧是标题框、介绍文和图片画廊。来源降级（`degraded_reasons`）说明只在第四栏显示，切到别的栏目不可见。出图依赖本机 Chrome 写系统临时目录，服务不要跑在只允许写工作区的受限沙箱里；`explain_chrome_failure` 会把 Chrome 的原始报错翻成中文提示。
+- GitHub 接口失败会分类上报：`degraded_reasons` 里是 `github:rate_limited` / `github:timeout` / `github:unreachable` / `github:server_error` 等记号（页面翻成中文，原始记号在 tooltip），404 不算来源故障。未鉴权 `api.github.com` 只有 60 次 core/小时与 10 次 search/分钟，配额耗尽时该额度桶在本次运行内熔断，候选改走 `raw.githubusercontent.com` 探测（不占 API 额度）；配置 GitHub Token 后额度为 5000 次/小时。
 - `models` 用 Hermes 式三步添加接口：接口地址 + API Key → 连接并拉取模型 → 点「用于文章」「用于翻译」「用于对话」或「用于榜单」。四个入口可共用同一接口。`model` 保存前会对所选模型执行一次真实 `/chat/completions` 请求；验证失败不会覆盖旧配置。文章与翻译只使用验证成功的模型，不再回退到预设 DeepSeek 模型。`effort` 支持 `none|minimal|low|medium|high|xhigh|max|ultra`，非 `none` 时以 `reasoning_effort` 发送。
 - `chat/model` 独立设置聊天模型的 OpenAI 兼容 `model`、`base_url` 和 `api_key`，不会改变文章生成或热点翻译模型；`chat` 接收最多 50 条 `user`/`assistant` 消息，每条最多 20,000 字符，原样转发给聊天模型。聊天记录不写入 SQLite、日志或响应；模型接口元数据写入 SQLite，API Key 只写入 macOS 钥匙串；请求体上限为 4 MiB。
 - `hooks/find` 对已选 item 抽点并现场搜 `{短语} 争议`，返回可多选切口卡；一张没有则 `hooks` 为空并给稳定文案「未发现可用切口」。检索页只当素材，不写入事实清单、不分配 `source_id`。不点「找切口」或点「生成文章」都不会偷偷搜索。
@@ -141,7 +144,7 @@ curl http://127.0.0.1:8080/api/skills
 
 ## 视觉出版
 
-GitHub 周榜的中文信息图不再只靠一张图像模型 Prompt。`docs/image_prompts/` 拆成五层：Design System、Component Library、Page Schema、Content Schema、Rendering Rules。渲染器在 `src/autoposting/visual/`，周榜封面输出 1080×1440（3:4）HTML，再用本机 Chrome 或可选 Playwright 截 PNG。图像模型只负责主视觉等资产，默认比例仍 9:16。
+GitHub 周榜的中文信息图不再靠图像模型排字。`docs/image_prompts/` 拆成五层：Design System、Component Library、Page Schema、Content Schema、Rendering Rules。渲染器在 `src/autoposting/visual/`，画布统一输出 1080×1440（3:4）HTML，再用本机 Chrome 或可选 Playwright 截 PNG。1.3.0 已删除图像模型层：出图只有一条链路（HTML/CSS 页面 → 浏览器截图），设置页不再有「出图模型」，也不得再新增图像模型调用点。
 
 ```bash
 PYTHONPATH=src python3 -m autoposting.cli visual-render --example --out output/visual

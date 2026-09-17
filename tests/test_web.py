@@ -18,7 +18,7 @@ from autoposting.images import default_page_fetcher
 from autoposting.llm import LLMService
 from autoposting.models import FeedItem, Source
 from autoposting.publishing import PublicationError, PublicationService
-from autoposting.web import WebApp, create_server
+from autoposting.web import INDEX_HTML, WebApp, create_server
 
 from test_github_weekly import TRENDING_HTML
 from test_workbench import FakeModel, WechatStubHandler, _feed
@@ -200,28 +200,63 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(payload["repos"][0]["enriched"])
         self.assertEqual(len(payload["repos"]) + 1, len(payload["images"]))
         self.assertEqual("cover", payload["images"][0]["kind"])
-        self.assertIn("3:4", payload["images"][0]["prompt"])
         self.assertEqual("本周爆火ai工具", payload["images"][0]["title"])
-        self.assertIn("3:4", payload["images"][0]["prompt"])
+        # D5/D8: the plan is render-only; no image-model prompt may survive.
+        for image in payload["images"]:
+            self.assertNotIn("prompt", image)
         status2, saved = self._request("GET", "/api/github-weekly")
         self.assertEqual(200, status2)
         self.assertEqual(payload["repos"][0]["full_name"], saved["repos"][0]["full_name"])
 
     def test_github_weekly_refresh_does_not_call_image_model(self) -> None:
-        calls: list[str] = []
+        """D5/D8 regression guard: no image-model surface may come back."""
         self.app.github_fetcher = (
             lambda url: TRENDING_HTML if "trending" in url else {"items": []}
         )
-        self.app.image_generator = lambda prompt: calls.append(prompt) or (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
-            b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
+        # The image model is torn out entirely: it must not be reachable at all.
+        self.assertFalse(hasattr(self.app, "image_service"))
+        self.assertFalse(hasattr(self.app, "image_generator"))
+        self.assertFalse(hasattr(self.app, "_image_model_configured"))
         status, payload = self._request("POST", "/api/github-weekly", {})
         self.assertEqual(200, status)
-        self.assertEqual([], calls)
         self.assertTrue(payload["images"])
         self.assertTrue(all(not image.get("url") for image in payload["images"]))
+        self.assertTrue(all("prompt" not in image for image in payload["images"]))
+        # The configuration endpoint is gone too.
+        status2, _ = self._request("POST", "/api/image/model", {"model": "x"})
+        self.assertNotEqual(200, status2)
+
+    def test_no_image_model_call_site_can_come_back(self) -> None:
+        """D5/D8 teardown guard: the model-image layer must stay deleted.
+
+        Both image lanes render through HTML/CSS + browser screenshot only, and
+        the image-model prompt/config surface is gone. Reintroducing any of these
+        names would silently re-create a call path that has no consumer.
+        """
+        root = Path(__file__).resolve().parents[1]
+        forbidden = (
+            "generate_image",
+            "IMAGE_ASPECT_RATIO",
+            "configure_verified_image",
+            "load_image_prompt",
+            "render_weekly_images",
+            "generate_missing_images",
+            "image_prompt_dir",
+            "IMAGE_PROMPT_FILES",
+        )
+        offenders: list[str] = []
+        for path in sorted((root / "src" / "autoposting").rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for name in forbidden:
+                if name in text:
+                    offenders.append(f"{path.relative_to(root)}:{name}")
+        self.assertEqual([], offenders, msg=f"图像模型调用面又回来了：{offenders}")
+        self.assertFalse((root / "src" / "autoposting" / "skill_cover.py").exists())
+        for gone in ("STYLE.md", "cover.md", "poster.md", "skill_cover.md"):
+            self.assertFalse((root / "docs" / "image_prompts" / gone).exists())
+        # The config route is gone, not merely disabled.
+        self.assertNotIn("/api/image/model", INDEX_HTML)
+        self.assertNotIn("image_llm", INDEX_HTML)
 
     def test_github_weekly_render_applies_theme_and_palette(self) -> None:
         self.app.github_fetcher = (
@@ -313,7 +348,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.2.9", payload["version"])
+        self.assertEqual("1.4.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1787,6 +1822,37 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="skill-query"', html)
         self.assertIn('id="skills-gallery"', html)
 
+    def test_skill_result_notes_are_scoped_to_the_skills_lane(self) -> None:
+        """The source block and degraded note live in the shared pane, so CSS owns the lane."""
+        html = self._index()
+        # 1.4.0 merged the stage chips + gap note into one source block, and the
+        # skill list module is gone entirely.
+        self.assertIn('id="skill-source-bar"', html)
+        self.assertIn('id="skill-source-chips"', html)
+        self.assertIn('id="skill-degraded-note"', html)
+        self.assertNotIn('id="skill-stage-chips"', html)
+        self.assertNotIn('id="skill-gap-note"', html)
+        self.assertNotIn('id="skill-list"', html)
+        style = html.split("</style>", 1)[0]
+        # The whole block is off by default, like every other skill-only block.
+        self.assertRegex(
+            style,
+            r"#skill-search-row,[^{]*#skill-source-bar[^{]*#skills-studio[^{]*"
+            r"#skill-degraded-note[^{]*\{[^}]*display:none",
+        )
+        # ...and only the skills lane turns it back on.
+        self.assertRegex(
+            style,
+            r"body\.lane-skills #skill-source-bar:not\(\[hidden\]\),\s*"
+            r"body\.lane-skills #skill-degraded-note:not\(\[hidden\]\)\{display:block;\}",
+        )
+        self.assertIn("#skill-degraded-note[hidden]{display:none;}", style)
+        for note in ("skill-source-bar", "skill-degraded-note"):
+            self.assertNotRegex(
+                style,
+                r"body\.lane-(?:hotspots|viewpoints|github)[^{]*#" + note,
+            )
+
     def test_github_cover_css_is_three_by_four(self) -> None:
         html = self._index()
         self.assertRegex(html, r"\.gh-cover\{[^}]*aspect-ratio:3/4")
@@ -1796,9 +1862,11 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn(".gh-tile.gh-cover{aspect-ratio:3/4;}", html)
         self.assertIn(".gh-tile.gh-poster{aspect-ratio:3/4;}", html)
         self.assertIn("object-fit:contain", html)
-        from autoposting.llm import IMAGE_ASPECT_RATIO
-
-        self.assertEqual("9:16", IMAGE_ASPECT_RATIO)
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "autoposting" / "llm.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("IMAGE_ASPECT_RATIO", source)
+        self.assertNotIn("generate_image", source)
         overview = (
             Path(__file__).resolve().parents[1]
             / "docs"
@@ -1808,11 +1876,10 @@ class IndexPageContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("画布 3:4", overview)
         self.assertNotIn("画布 9:16", overview)
-        cover = (
-            Path(__file__).resolve().parents[1] / "docs" / "image_prompts" / "cover.md"
-        ).read_text(encoding="utf-8")
-        self.assertIn("3:4", cover)
-        self.assertIn("1080", cover)
+        # D5: the model-image prompt files are gone; only the HTML visual system remains.
+        prompts_dir = Path(__file__).resolve().parents[1] / "docs" / "image_prompts"
+        for gone in ("STYLE.md", "cover.md", "poster.md", "skill_cover.md"):
+            self.assertFalse((prompts_dir / gone).exists(), f"{gone} must be deleted")
 
     def test_api_paths_and_approve_before_publish(self) -> None:
         html = self._index()
@@ -1899,10 +1966,16 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns:repeat(3", html)
         self.assertIn("aspect-ratio:3/4", html)
         self.assertIn("/api/github-weekly", html)
-        self.assertIn("出图模型", html)
-        self.assertIn("用于出图", html)
+        # D8: the image-model configuration surface is torn out, not hidden.
+        self.assertNotIn("出图模型", html)
+        self.assertNotIn("用于出图", html)
+        self.assertNotIn("endpoint-use-image", html)
+        self.assertNotIn("image_provider", html)
+        self.assertNotIn("image_llm", html)
         self.assertNotIn("请选 qwen-image / wan", html)
-        self.assertIn("9:16", html)
+        # D8: no image-model aspect-ratio copy survives; the 9:16 that remains is
+        # the Xiaohongshu paper card, not an image model.
+        self.assertNotIn("9:16", html)
         self.assertIn("aspect-ratio:9/16", html)
         self.assertIn("本周新建", html)
         self.assertIn("/api/leaderboard/model", html)
@@ -1968,7 +2041,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.2.9", html)
+        self.assertIn("1.4.0", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2373,8 +2446,14 @@ class IndexPageContractTests(unittest.TestCase):
         html = self._index()
         self.assertNotIn("top-secret", html)
         self.assertNotIn("s3cr3t", html)
-        self.assertNotIn("placeholder", html)
         self.assertNotIn('name="app_secret" value', html)
+        # The skill paste box and the token box carry user-facing hint text, so
+        # the bare word `placeholder` is no longer a usable proxy for "an example
+        # secret leaked into the markup". Assert the intent directly: no
+        # credential input is declared with a value attribute.
+        self.assertNotRegex(html, r'id="skill-github-token"[^>]*value=')
+        self.assertNotRegex(html, r'name="app_secret"[^>]*value=')
+        self.assertNotRegex(html, r'name="x_bearer_token"[^>]*value=')
 
     def test_favorites_button_drawer_multiselect_and_reflow_contract(self) -> None:
         html = self._index()
@@ -2430,9 +2509,80 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("classList.remove", clear_js)
         self.assertIn('"selected"', clear_js)
         self.assertIn('typeof renderPickedDock === "function"', clear_js)
-        title_click = html[html.index('title.addEventListener("click"') : html.index("button.appendChild(title)")]
-        self.assertIn("event.stopPropagation()", title_click)
-        self.assertIn("togglePicked(item.item_id)", title_click)
+        # D2: clicking the title must equal clicking the card (enter 焦点),
+        # so the hotspot card's title carries no click hijack of its own.
+        hotspots_js = html.split("function renderHotspots(")[1].split("\nfunction ")[0]
+        self.assertNotIn('title.addEventListener("click"', hotspots_js)
+        self.assertIn(
+            'button.addEventListener("click", function () { selectHotspot(item, button); });',
+            hotspots_js,
+        )
+        # ...and the explicit multi-select checkbox lives on the card instead.
+        self.assertIn("pickToggle(item)", hotspots_js)
+        self.assertIn("function pickToggle(item)", html)
+        self.assertIn('togglePicked(item.item_id);', html)
+
+    def test_render_picked_dock_shows_focus_and_picks_together(self) -> None:
+        """A2: 焦点 and 已选 N are two independent groups and must coexist."""
+        html = self._index()
+        dock_js = html.split("function renderPickedDock(")[1].split("\nfunction ")[0]
+        self.assertIn('el("span", "picked-dock-label", "焦点")', dock_js)
+        self.assertIn('el("span", "picked-dock-label", "已选 " + ids.length)', dock_js)
+        self.assertIn('el("span", "picked-dock-chip-label", state.item.title || "")', dock_js)
+        # The old early-return that hid the focus group whenever picks existed is gone.
+        self.assertNotIn("dock.appendChild(chip);\n    });\n    return;\n  }\n  if (state.newsFocus)", dock_js)
+        # Only the focus chip is inert; picked chips must stay clickable.
+        self.assertIn("picked-dock-chip is-static", dock_js)
+        static_css = html.split(".picked-dock-chip.is-static{")[1].split("}")[0]
+        self.assertIn("pointer-events:none", static_css)
+        self.assertNotIn("#picked-dock.is-focus .picked-dock-chip{", html)
+
+    def test_hotspot_card_has_explicit_pick_checkbox(self) -> None:
+        """A2: 已选 is driven by a visible checkbox, not by a hidden title gesture."""
+        html = self._index()
+        pick_js = html.split("function pickToggle(item)")[1].split("\nfunction ")[0]
+        self.assertIn('el("button", "ht-pick"', pick_js)
+        self.assertIn('setAttribute("role", "checkbox")', pick_js)
+        self.assertIn("aria-checked", pick_js)
+        self.assertIn('setAttribute("data-item-id", item.item_id)', pick_js)
+        self.assertIn("event.stopPropagation()", pick_js)
+        self.assertIn("togglePicked(item.item_id)", pick_js)
+        self.assertIn(".ht-pick{", html)
+        # The pick control must not reuse the focus styling.
+        pick_css = html.split(".ht-pick{")[1].split("}")[0]
+        self.assertNotIn("box-shadow:inset", pick_css)
+
+    def test_generate_clears_focus_only_after_a_successful_response(self) -> None:
+        """A1: 成功返回后清空焦点；失败分支保留焦点上下文。"""
+        html = self._index()
+        helper = html.split("function clearFocusAfterGenerate()")[1].split("\nfunction ")[0]
+        self.assertIn("state.item = null", helper)
+        self.assertIn("state.newsFocus = null", helper)
+        self.assertIn("renderPickedDock()", helper)
+        # Must not disturb the article panel, the draft, the hooks or the multi-select set.
+        self.assertNotIn("resetArticle()", helper)
+        self.assertNotIn("state.draft", helper)
+        self.assertNotIn("clearHooks()", helper)
+        self.assertNotIn("state.pickedIds", helper)
+        self.assertNotIn("storeGeneratedArticle", helper)
+
+        generate_js = html.split("function generate()")[1].split("\nfunction persistArticle(")[0]
+        success = generate_js.split('waitApi("generate", "/api/articles", payload).then(')[1]
+        success_body = success.split("}).catch(")[0]
+        failure = generate_js.split("}).catch(function (error) {")[1]
+        failure_body = failure.split("}).then(")[0]
+        self.assertIn("clearFocusAfterGenerate();", success_body)
+        self.assertNotIn("clearFocusAfterGenerate()", failure_body)
+        # Payload assembly happens first; clearing the focus comes after it.
+        self.assertLess(
+            generate_js.index("payload.item_ids = picked;"),
+            generate_js.index("clearFocusAfterGenerate();"),
+        )
+        self.assertLess(
+            generate_js.index("payload.item_id = state.item.item_id;"),
+            generate_js.index("clearFocusAfterGenerate();"),
+        )
+        self.assertIn("storeGeneratedArticle(requestKey, data, requestItem);", success_body)
 
     def test_generate_still_sends_item_ids_from_picked_id_list_when_picks_exist(self) -> None:
         html = self._index()
@@ -2569,15 +2719,24 @@ class IndexPageContractTests(unittest.TestCase):
             r'\$\("open-original-btn"\)\.addEventListener\("click", function \(\) \{ openOriginal\(\); \}\);',
         )
 
-    def test_favorites_title_click_still_toggles_picked(self) -> None:
+    def test_favorites_use_the_same_explicit_checkbox_as_hotspot_cards(self) -> None:
+        """A2, extended to the drawer that feeds the same 已选 set.
+
+        The drawer used to hide the multi-select gesture on the title. It now
+        carries the same visible checkbox as a hotspot card, so no surface owns a
+        secret gesture.
+        """
         html = self._index()
         favorites_js = html.split("function renderFavorites(")[1].split("\nfunction ")[0]
-        title_at = favorites_js.index('title.addEventListener("click"')
-        title_handler = favorites_js[title_at : title_at + 280]
-        self.assertIn("event.stopPropagation()", title_handler)
-        self.assertIn("togglePicked(item.item_id)", title_handler)
-        self.assertNotIn("openOriginal", title_handler)
+        self.assertNotIn('title.addEventListener("click"', favorites_js)
+        self.assertIn("pickToggle(item)", favorites_js)
         self.assertIn('el("span", "ht-title"', favorites_js)
+        # The checkbox state must be synced on this surface too.
+        sync_js = html.split("function syncPickedHighlights(")[1].split("\nfunction ")[0]
+        self.assertIn("#favorites-list .ht-pick", sync_js)
+        # Its own controls must survive the change.
+        self.assertIn("openOriginal", favorites_js)
+        self.assertIn("starButton(item)", favorites_js)
 
 
 if __name__ == "__main__":

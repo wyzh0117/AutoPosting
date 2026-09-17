@@ -9,10 +9,9 @@
 - Content Schema：这一页要展示什么（纯数据）
 - Rendering Rules：数据和布局冲突时怎么退让
 - HTML / CSS：精确排字、间距、对齐
-- 浏览器截图：输出 9:16 PNG
-- 图像模型（可选）：只生成主视觉 / 插画 / 图标，作为 asset 插入页面
+- 浏览器截图：输出 3:4 PNG（1080×1440）
 
-`cover.md` / `poster.md` 仍给图像模型用，继续被 `{style}` 拼进周榜出图任务。它们不再承担整页中文排版。
+出图只有这一条路径：**HTML / CSS + 浏览器截图**。GitHub 周榜封面与内页、skill 查找结果包全部走同一条路。这里不再有图像模型 prompt，`{style}` 也不再被插值进任何出图任务；`build_weekly_render_plan()` 只产出页面清单（id / kind / rank / title），不产出 prompt。
 
 ## 五个核心层级
 
@@ -27,21 +26,19 @@
 5. **Rendering Rules** — `rendering/`  
    溢出、裁切、数字格式、最多条数。
 
-## STYLE.md 如何被拆分
+两条 lane 共用这套层级，差别只由数据决定：`ranking_from_repos()` / `project_from_repo()` 接受 `brand` / `series` / `issue` / `source` / `footer` / `kicker` / `metric_label`，skill lane 用空字符串关掉「第 N 周」与 GitHub 周榜的默认字样。
+
+## STYLE.md 的去向
 
 原文件完整保存在 `legacy/STYLE.original.md`。
 
-活着的 `STYLE.md` 只保留**图像模型资产生成**需要的风格、画布、禁止项（仍被 `image_gen.py` 以 `{style}` 读入）。
-
-其余内容按职责迁到五层，见 `STYLE_MIGRATION_REPORT.md`。没有整文件复制。
+`docs/image_prompts/` 根下的 `STYLE.md`、`cover.md`、`poster.md`、`skill_cover.md` 已删除：它们描述的是图像模型整页排版与资产 prompt，已被 HTML 页面彻底取代。风格、画布、禁止项按职责迁到五层，见 `STYLE_MIGRATION_REPORT.md`；没有整文件复制。
 
 ## 目录
 
 ```
 docs/image_prompts/
   README.md
-  STYLE.md                         # 图像模型 style bible
-  cover.md / poster.md             # 仍是资产 Prompt，不是整页排版
   design-system/  DESIGN_SYSTEM.md  tokens.json
   components/     COMPONENTS.md     components.schema.json
   page-schemas/   ranking-overview.md  project-detail.md
@@ -49,10 +46,11 @@ docs/image_prompts/
   rendering/      RENDERING_RULES.md  rules.json
   templates/      ranking-overview/   project-detail/
   examples/       ranking.example.json project.example.json
+  copy.md                            # 文本 LLM 的文案 prompt，与出图无关
   legacy/         STYLE.original.md
   STYLE_MIGRATION_REPORT.md
 
-src/autoposting/visual/            # stdlib 渲染器
+src/autoposting/visual/            # stdlib 渲染器（页面、CSS、截图）
 ```
 
 代码放在现有包 `autoposting.visual` 下，不另起前端工程。运行时仍是 Python 3.11 标准库；截图优先 Playwright（若已安装），否则用本机 Chrome/Chromium headless。不把 Playwright 写进 `pyproject.toml` 依赖。
@@ -69,10 +67,10 @@ External Content
   → Apply Design System + Rendering Rules
   → HTML / CSS
   → Chrome / Playwright
-  → PNG 1080×1920
+  → PNG 1080×1440（3:4）
 ```
 
-GitHub 仓库字典可先经 `autoposting.visual.adapter.ranking_from_repos` / `project_from_repo` 进入 Content Schema。第一阶段未改工作台「抓取周榜」按钮，避免和工作台模型出图抢路径。
+GitHub 仓库字典可先经 `autoposting.visual.adapter.ranking_from_repos` / `project_from_repo` 进入 Content Schema。工作台「抓取周榜」后的渲染走 `POST /api/github-weekly/render`（`theme` + `palette`），图片清单由 `autoposting.image_gen.build_weekly_render_plan` 给出，不经过任何图像模型。
 
 ## 如何添加一个新组件
 
@@ -120,11 +118,9 @@ PYTHONPATH=src python3 -m autoposting.cli visual-render --example --out output/v
 
 复制或改 `tokens.json` 的 color / typography / radius。不要改组件函数里的文案。BrandHeader 读 Content 的 `brand` 字段，换品牌只换数据。
 
-## 如何未来接入 Image Model
+## 不再接入图像模型
 
-1. 用 `STYLE.md` + 专用资产 prompt 生成主视觉 / logo / 背景 PNG。
-2. 把路径写入 Content 的 `heroVisual` / `logo`。
-3. 组件按 `object-fit` 规则插入。不要再让模型输出带大量中文的整页海报。
+不要再加图像模型调用点：GitHub 周榜与 skill 查找两条 lane 都只走 HTML/CSS + 浏览器截图。需要主视觉或图标时，用 `design-system/` 的 token 与 `components/` 的 SVG 组件（`marks.py` / `icons.py`）在页面里画出来，或把现成图片放进 `examples/`、`templates/`、`assets/` 作为数据引用，而不是让模型生成整页海报。
 
 ## 技术约束
 

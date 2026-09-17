@@ -1,3 +1,3 @@
 """Local-first AI news collection and drafting pipeline."""
 
-__version__ = "1.2.9"
+__version__ = "1.4.0"

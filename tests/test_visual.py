@@ -93,6 +93,25 @@ class ContentSchemaTests(unittest.TestCase):
         with self.assertRaises(ContentValidationError):
             validate_content("ranking", payload)
 
+    def test_blank_lane_text_renders_but_missing_title_still_fails(self) -> None:
+        from autoposting.visual.adapter import ranking_from_repos
+        from autoposting.visual.pipeline import render_page
+
+        payload = ranking_from_repos(
+            [{"rank": 1, "name": "alpha", "summary": "s"}],
+            brand="",
+            series="",
+            issue="",
+            title="",
+            subtitle="",
+        )
+        html = render_page(payload, screenshot=False)["html_text"]
+        self.assertIn("c-ranking-item", html)
+        broken = dict(payload)
+        broken.pop("title")
+        with self.assertRaises(ContentValidationError):
+            render_page(broken, screenshot=False)
+
 
 class RenderingRuleTests(unittest.TestCase):
     def test_compact_number_and_progress(self) -> None:
@@ -712,7 +731,7 @@ Then you run the agent.
 
 
 class ExamplePngTests(unittest.TestCase):
-    def test_examples_write_html_and_9_by_16_png(self) -> None:
+    def test_examples_write_html_and_3_by_4_png(self) -> None:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         results = render_examples(Path(temp.name), screenshot=True)
@@ -727,17 +746,195 @@ class ExamplePngTests(unittest.TestCase):
             self.assertEqual((PNG_WIDTH, PNG_HEIGHT), (width, height))
 
 
-class StyleBibleCompatTests(unittest.TestCase):
-    def test_style_md_still_feeds_image_model_jobs(self) -> None:
-        from autoposting.image_gen import build_weekly_image_jobs, load_image_prompt
+class WeeklyRenderPlanTests(unittest.TestCase):
+    def test_render_plan_keeps_cover_and_poster_job_contract(self) -> None:
+        from autoposting.image_gen import _safe_name, build_weekly_render_plan
 
-        style = load_image_prompt("style")
-        self.assertIn("9:16", style)
-        self.assertIn("Dark Technology", style)
-        jobs = build_weekly_image_jobs(
-            [{"rank": 1, "name": "demo", "summary": "s", "does": "d", "scene": "sc", "kind": "CLI"}]
+        repos = [
+            {"rank": index, "name": f"owner/tool-{index}", "summary": f"s{index}", "stars": index}
+            for index in range(1, 13)
+        ]
+        plan = build_weekly_render_plan(repos)
+        self.assertEqual(len(repos[:10]) + 1, len(plan))
+        cover = plan[0]
+        self.assertEqual("cover", cover["kind"])
+        self.assertEqual("cover", cover["id"])
+        self.assertEqual("本周爆火ai工具", cover["title"])
+        self.assertEqual(0, cover["rank"])
+        for repo, job in zip(repos[:10], plan[1:]):
+            self.assertEqual("poster", job["kind"])
+            self.assertEqual(repo["rank"], job["rank"])
+            self.assertEqual(repo["name"], job["title"])
+            self.assertEqual(f"{repo['rank']:02d}-{_safe_name(repo['name'])}", job["id"])
+
+    def test_render_plan_carries_no_image_model_prompt(self) -> None:
+        from autoposting.image_gen import build_weekly_render_plan
+
+        plan = build_weekly_render_plan(
+            [
+                {
+                    "rank": 1,
+                    "name": "foo/bar",
+                    "summary": "s",
+                    "does": "d",
+                    "scene": "sc",
+                    "kind": "CLI",
+                }
+            ]
         )
-        self.assertTrue(all(style in job["prompt"] for job in jobs))
+        self.assertEqual(2, len(plan))
+        for job in plan:
+            self.assertNotIn("prompt", job)
+        self.assertEqual(
+            {"id", "kind", "rank", "title", "url", "file", "selected"},
+            set(plan[0]),
+        )
+        self.assertEqual(set(plan[0]), set(plan[1]))
+
+    def test_render_plan_handles_missing_rank_and_empty_repos(self) -> None:
+        from autoposting.image_gen import build_weekly_render_plan
+
+        self.assertEqual(1, len(build_weekly_render_plan([])))
+        self.assertEqual("cover", build_weekly_render_plan([])[0]["kind"])
+        plan = build_weekly_render_plan([{"name": "no-rank"}])
+        self.assertEqual(2, len(plan))
+        self.assertEqual(1, plan[1]["rank"])
+        self.assertEqual("01-no-rank", plan[1]["id"])
+
+
+class LaneParameterTests(unittest.TestCase):
+    def test_lane_text_reaches_cover_and_poster_payloads(self) -> None:
+        from autoposting.visual.adapter import project_from_repo, ranking_from_repos
+
+        repos = [{"rank": 1, "name": "alpha", "kind": "CLI", "summary": "s", "stars": 7}]
+        ranking = ranking_from_repos(
+            repos,
+            brand="",
+            series="Skill 覆盖榜",
+            issue="",
+            kicker="SKILL FINDER",
+            title="Skills",
+            subtitle="按阶段整理",
+            source="",
+            footer="Skill 查找器",
+            metric_label="安装量",
+        )
+        self.assertEqual("", ranking["brand"])
+        self.assertEqual("Skill 覆盖榜", ranking["series"])
+        self.assertEqual("", ranking["issue"])
+        self.assertEqual("SKILL FINDER", ranking["kicker"])
+        self.assertEqual("Skills", ranking["title"])
+        self.assertEqual("按阶段整理", ranking["subtitle"])
+        self.assertEqual("", ranking["source"])
+        self.assertEqual("Skill 查找器", ranking["footer"])
+        self.assertEqual("", ranking["avatar"])
+        self.assertEqual("安装量", ranking["items"][0]["metric"]["label"])
+        self.assertEqual(7, ranking["items"][0]["metric"]["value"])
+
+        project = project_from_repo(repos[0], brand="", issue="", source="", footer="")
+        self.assertEqual("", project["issue"])
+        self.assertEqual("", project["source"])
+        self.assertEqual("", project["footer"])
+        self.assertEqual("", project["avatar"])
+
+    def test_none_keeps_the_github_weekly_defaults(self) -> None:
+        from autoposting.visual.adapter import ranking_from_repos
+
+        repos = [{"rank": 1, "name": "alpha", "kind": "CLI", "summary": "s", "stars": 7}]
+        weekly = ranking_from_repos(repos)
+        self.assertEqual("GitHub", weekly["source"])
+        self.assertEqual("WEEKLY RANKING", weekly["kicker"])
+        self.assertEqual("GitHub", weekly["title"])
+        self.assertEqual("本周爆火 AI 项目榜", weekly["subtitle"])
+        self.assertEqual("Stars", weekly["items"][0]["metric"]["label"])
+        self.assertEqual("EE_萤飞", weekly["brand"])
+        self.assertTrue(weekly["issue"])
+        self.assertIn("data:image/png;base64,", weekly["avatar"])
+
+
+class SmartCoverGuardTests(unittest.TestCase):
+    def test_cover_renders_kicker_and_real_page_total(self) -> None:
+        from autoposting.github_weekly import iso_week_issue
+        from autoposting.visual.weekly import render_weekly_visual
+
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
+        repos = [
+            {
+                "rank": index,
+                "name": f"skill-{index}",
+                "kind": "CLI",
+                "summary": "s",
+                "stars": index,
+                "url": f"https://github.com/acme/skill-{index}",
+            }
+            for index in range(1, 4)
+        ]
+        render_weekly_visual(
+            repos,
+            [
+                {
+                    "id": "cover",
+                    "kind": "cover",
+                    "rank": 0,
+                    "visual_title": "Skill 查找结果",
+                    "visual_subtitle": "覆盖阶段",
+                    "visual_kicker": "SKILL FINDER",
+                    "visual_footer": "Skill 查找器 · 按覆盖阶段整理",
+                },
+                {"id": "01-skill-1", "kind": "poster", "rank": 1, "title": "skill-1"},
+            ],
+            temp,
+            screenshot=False,
+            brand="",
+            series="",
+            issue="",
+            source="",
+            footer="Skill 查找器 · 按覆盖阶段整理",
+            kicker="SKILL FINDER",
+        )
+        cover = (temp / "cover.html").read_text(encoding="utf-8")
+        poster = (temp / "01-skill-1.html").read_text(encoding="utf-8")
+        self.assertIn('class="c-smart-cover-kicker">SKILL FINDER</p>', cover)
+        self.assertIn("Skill 查找结果", cover)
+        self.assertIn(".c-smart-cover-heading .c-smart-cover-kicker {", cover)
+        self.assertIn("01 / 04", cover)
+        self.assertNotIn("01 / 11", cover)
+        self.assertNotIn(iso_week_issue(), cover)
+        self.assertNotIn("EE_萤飞", cover)
+        self.assertNotIn("GitHub", cover)
+        self.assertIn("02 / 04", poster)
+        self.assertNotIn("01 / 11", poster)
+
+    def test_weekly_cover_still_uses_github_branding_and_iso_week(self) -> None:
+        from autoposting.github_weekly import iso_week_issue
+        from autoposting.visual.weekly import render_weekly_visual
+
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
+        repos = [
+            {"rank": index, "name": f"repo-{index}", "kind": "CLI", "summary": "s", "stars": index}
+            for index in range(1, 4)
+        ]
+        render_weekly_visual(repos, [{"id": "cover", "kind": "cover", "rank": 0}], temp, screenshot=False)
+        cover = (temp / "cover.html").read_text(encoding="utf-8")
+        self.assertIn("EE_萤飞", cover)
+        self.assertIn(iso_week_issue(), cover)
+        self.assertIn("WEEKLY RANKING", cover)
+        self.assertIn("01 / 04", cover)
+        self.assertNotIn("01 / 11", cover)
+
+    def test_ranking_overview_page_number_uses_real_item_count(self) -> None:
+        from autoposting.visual.adapter import ranking_from_repos
+        from autoposting.visual.pipeline import render_page
+
+        payload = ranking_from_repos(
+            [{"rank": index, "name": f"n{index}", "kind": "CLI", "summary": "s"} for index in range(1, 5)],
+            issue="",
+        )
+        html = render_page(payload, screenshot=False)["html_text"]
+        self.assertIn("01 / 05", html)
+        self.assertNotIn("01 / 11", html)
 
 
 def _png_size(path: Path) -> tuple[int, int]:

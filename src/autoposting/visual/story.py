@@ -88,39 +88,6 @@ def embed_story_images(beats: list[dict[str, str]]) -> list[dict[str, str]]:
     return embedded
 
 
-def generate_missing_images(
-    beats: list[dict[str, str]],
-    generate_image: Callable[[str], bytes] | None,
-    *,
-    name: str = "",
-) -> list[dict[str, str]]:
-    if generate_image is None:
-        return beats
-    filled: list[dict[str, str]] = []
-    generated = 0
-    for beat in beats:
-        row = dict(beat)
-        if row.get("image") or generated >= MAX_BEATS:
-            filled.append(row)
-            continue
-        caption = str(row.get("caption") or name or "product step")
-        prompt = (
-            f"Single 16:9 editorial product screenshot illustration for '{name}'. "
-            f"Scene: {caption}. Rounded 3D UI, no walls of Chinese text, one clear step."
-        )
-        try:
-            payload = generate_image(prompt)
-        except Exception:
-            payload = b""
-        if payload:
-            import base64
-
-            row["image"] = "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
-            generated += 1
-        filled.append(row)
-    return filled
-
-
 def load_readme(owner: str, repo: str, fetcher: FetchBytes | None) -> str:
     if fetcher is None or not owner or not repo:
         return ""

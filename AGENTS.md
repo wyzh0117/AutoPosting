@@ -19,9 +19,9 @@ Article-model instructions live in `docs/ARTICLE_BASE_PROMPT.md` and `docs/artic
 
 ## Image prompting
 
-GitHub weekly **model-image** prompts live in `docs/image_prompts/`: `STYLE.md` (asset style bible), `cover.md`, `poster.md`. Placeholders: `{style}`, `{ranking}`, `{name}`, `{rank}`, `{rank02}`, `{summary}`, `{does}`, `{scene}`, `{kind}`. Jobs are built from these files before any image API call. Do not put new 出图调教 copy in `image_gen.py`.
+Both image lanes — GitHub weekly (`render_weekly_visual`) and skill finder (`render_skill_package`) — render through **HTML/CSS + browser screenshot only**. **No new image-model call site may be added**; the model-image prompt layer (`STYLE.md`, `cover.md`, `poster.md`, `skill_cover.md`, `skill_cover.py`, `load_image_prompt` / `render_weekly_images`) is deleted, and `image_gen.py` only builds the page plan (`id` / `kind` / `rank` / `title` — no `prompt` field).
 
-The HTML visual publishing system (ranking-overview / project-detail) also lives under `docs/image_prompts/` (design-system, components, page-schemas, content-schemas, rendering) and `src/autoposting/visual/`. Workbench GitHub weekly: fetch is `POST /api/github-weekly`, render is `POST /api/github-weekly/render` with `theme` and `palette` (main/secondary/accent). Edit tokens and schemas there; do not stuff page layout back into `STYLE.md`. Original STYLE text is `docs/image_prompts/legacy/STYLE.original.md`.
+`docs/image_prompts/` holds the HTML visual system (design-system, components, page-schemas, content-schemas, rendering) plus example/template assets, and `src/autoposting/visual/` holds the stdlib renderer. Edit tokens in `docs/image_prompts/design-system/tokens.json` and content contracts in `docs/image_prompts/content-schemas/*.schema.json`; do not stuff page layout back into a prompt .md. Workbench GitHub weekly: fetch is `POST /api/github-weekly`, render is `POST /api/github-weekly/render` with `theme` and `palette` (main/secondary/accent). Original STYLE text is `docs/image_prompts/legacy/STYLE.original.md`.
 
 ## Functional acceptance
 

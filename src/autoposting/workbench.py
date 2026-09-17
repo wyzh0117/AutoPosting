@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
 import re
 import urllib.error
 import urllib.request
@@ -36,8 +37,14 @@ from .images import (
 )
 from .title_poster import render_title_poster
 from .background import (
+    RELATED_SEARCH_CAUSE_NO_RESULT,
+    RELATED_SEARCH_CAUSE_TRANSPORT,
+    RelatedSearchError,
+    derive_related_query,
     gather_background,
+    redact_related_detail,
     related_article_context,
+    related_search_reason,
     search_related_news,
     search_web,
 )
@@ -47,6 +54,8 @@ from .llm import ARTICLE_PROMPT_VERSION, LLMError, LLMService
 from .pipeline import collect_sources
 from .publishing import PublicationError
 from .models import Source
+
+LOGGER = logging.getLogger(__name__)
 
 HOTSPOT_HOUR_PRESETS = (4, 6, 24, 72, 168, 720)
 HOTSPOT_HOURS = HOTSPOT_HOUR_PRESETS
@@ -496,12 +505,39 @@ class Workbench:
     ) -> dict[str, object]:
         draft = self.database.get_draft(draft_id)
         related_article_context(str(draft["body"]), selection, selection_start, selection_end)
+        # The raw selection stays the source of truth for context; only the
+        # query handed to the search engines is derived and bounded.
+        derived = derive_related_query(selection)
         try:
             search_fetcher = None if self.page_fetcher is default_page_fetcher else self.page_fetcher
             query, results = search_related_news(selection, fetcher=search_fetcher, limit=1)
-        except Exception:
+        except RelatedSearchError as exc:
+            # Full cause (including the upstream exception text) stays in the
+            # server log; the API only ever sees the graded Chinese reason.
+            # Every logged detail goes through _redact_related_detail(), the
+            # single boundary that keeps credentials out of the log.
+            LOGGER.warning(
+                "related search failed: cause=%s sources=%s detail=%s",
+                exc.cause_code,
+                ",".join(exc.sources) or "-",
+                redact_related_detail(exc.detail),
+            )
             raise LLMError(
-                "related_search_failed", "相关新闻检索失败", cause_code="search_failed"
+                "related_search_failed",
+                exc.reason,
+                cause_code=exc.cause_code,
+            ) from None
+        except Exception as exc:
+            # Same boundary as above: the crash text is logged only redacted.
+            LOGGER.warning(
+                "related search crashed: %s: %s",
+                type(exc).__name__,
+                redact_related_detail(str(exc)),
+            )
+            raise LLMError(
+                "related_search_failed",
+                related_search_reason(RELATED_SEARCH_CAUSE_TRANSPORT),
+                cause_code=RELATED_SEARCH_CAUSE_TRANSPORT,
             ) from None
         items: list[dict[str, str]] = []
         seen_urls: set[str] = set()
@@ -517,11 +553,18 @@ class Workbench:
                     "snippet": str(result.get("snippet") or "").strip()[:280],
                 }
             )
+        # A reachable search that qualified nothing is a success with an empty
+        # result set, not a failure: the caller keeps search_status="empty".
+        cause_code = "" if items else RELATED_SEARCH_CAUSE_NO_RESULT
         return {
             "ok": True,
             "query": query,
             "items": items[:1],
             "search_status": "ok" if items else "empty",
+            "cause_code": cause_code,
+            "query_degraded": bool(derived.degraded),
+            "query_strategy": derived.strategy,
+            "query_source_chars": len(derived.selection or selection),
         }
 
     def generate_article(

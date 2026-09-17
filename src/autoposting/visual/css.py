@@ -694,6 +694,19 @@ html, body {{
   white-space: nowrap;
   text-overflow: ellipsis;
 }}
+.c-smart-cover-heading .c-smart-cover-kicker {{
+  margin: 0 0 {space["sm"]}px;
+  color: {template_accent};
+  font-size: {type_["caption"]["size"]}px;
+  font-weight: {type_["caption"]["weight"]};
+  line-height: 1;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  max-width: 820px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}}
 .c-smart-cover-list {{
   position: absolute;
   left: 56px;

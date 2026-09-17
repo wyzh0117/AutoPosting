@@ -58,6 +58,9 @@ def smart_cover(payload: dict[str, Any]) -> str:
         for tag in (data.get("tags") or [])
         if str(tag).strip()
     )
+    page_number = str(data.get("pageNumber") or f"01 / {len(items) + 1:02d}")
+    kicker = str(data.get("kicker") or "")
+    kicker_block = f'<p class="c-smart-cover-kicker">{escape(kicker)}</p>' if kicker else ""
     return (
         '<div class="c-smart-cover-shell">'
         '<div class="c-smart-cover-topline">'
@@ -65,6 +68,7 @@ def smart_cover(payload: dict[str, Any]) -> str:
         f"<span>{escape(str(data.get('issue') or ''))}</span>"
         "</div>"
         '<div class="c-smart-cover-heading">'
+        f"{kicker_block}"
         f"<h1>{escape(str(data.get('title') or ''))}</h1>"
         f"<p>{escape(str(data.get('subtitle') or ''))}</p>"
         "</div>"
@@ -72,7 +76,7 @@ def smart_cover(payload: dict[str, Any]) -> str:
         f'<div class="c-smart-cover-tags">{tags}</div>'
         '<div class="c-smart-cover-footer">'
         f"<span>{escape(str(data.get('footer') or data.get('source') or ''))}</span>"
-        "<span>01 / 11</span>"
+        f"<span>{escape(page_number)}</span>"
         "</div>"
         "</div>"
     )
@@ -124,6 +128,8 @@ def _poster_values(data: dict[str, Any], key: str) -> list[str]:
 
 def ranking_overview(payload: dict[str, Any]) -> str:
     data = apply_ranking_rules(payload)
+    items = [item for item in (data.get("items") or []) if isinstance(item, dict)]
+    page_number = str(data.get("pageNumber") or f"01 / {len(items) + 1:02d}")
     return "".join(
         [
             c.brand_header(
@@ -139,7 +145,7 @@ def ranking_overview(payload: dict[str, Any]) -> str:
             ),
             c.ranking_list(data.get("items") or []),
             c.topic_tags(data.get("tags") or []),
-            c.footer(str(data.get("footer") or data.get("source") or ""), "01 / 11"),
+            c.footer(str(data.get("footer") or data.get("source") or ""), page_number),
         ]
     )
 

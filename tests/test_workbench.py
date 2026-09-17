@@ -1,13 +1,16 @@
 import json
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
+from autoposting.background import derive_related_query
 from autoposting.content import FactValidationError
 from autoposting.db import Database
 from autoposting.llm import LLMError, LLMService
@@ -493,6 +496,216 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(payload["title"])
         self.assertIn("lab_blog", result["source_ids"])
         self.assertEqual(1, len(model.calls))
+
+
+    def _related_draft(self, body: str, draft_id: str = "draft-related-search") -> str:
+        """Insert one event/draft pair directly; related search only needs the body."""
+        now = datetime.now(timezone.utc).isoformat()
+        event_id = f"event-{draft_id}"
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, topic, name, trigger_type, window_start, triggered_at,
+                    current_count, independent_sources, baseline_mean, baseline_stddev,
+                    statistical_threshold, evidence_json, rule_version, fact_list_json,
+                    status, created_at
+                ) VALUES (?, 'related', 'related', 'HOTSPOT_ITEM', ?, ?, 1, 1, 0, 0, 0, '{}',
+                          'v1', '{}', 'DRAFTED', ?)
+                """,
+                (event_id, now, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO drafts (
+                    draft_id, event_id, platform, title, body, tags_json, assets_json,
+                    source_ids_json, generator, processing_version, status, validation_json,
+                    content_hash, created_at, updated_at
+                ) VALUES (?, ?, 'wechat', ?, ?, '[]', '[]', '[]', 'test', 'draft-v1',
+                          'DRAFTED', '{}', 'hash', ?, ?)
+                """,
+                (draft_id, event_id, "相关检索草稿", body, now, now),
+            )
+        return draft_id
+
+    def test_related_search_returns_derived_query_and_items(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        html = (
+            '<a class="result__a" href="https://news.example/chip">英伟达 AI 芯片新进展</a>'
+            '<div class="result__snippet">英伟达新一代芯片报道</div>'
+        ).encode("utf-8")
+
+        def fetcher(url: str) -> bytes:
+            return html if "duckduckgo.com/html" in url else b""
+
+        result = Workbench(self.db, page_fetcher=fetcher).related_search(
+            draft_id, selection, 0, len(selection)
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("ok", result["search_status"])
+        self.assertEqual(derive_related_query(selection).text, result["query"])
+        self.assertEqual("https://news.example/chip", result["items"][0]["url"])
+        self.assertEqual("", result["cause_code"])
+        self.assertFalse(result["query_degraded"])
+        self.assertEqual(len(selection), result["query_source_chars"])
+
+    def test_related_search_empty_result_is_success_not_failure(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        empty_feed = b"<rss><channel><title>no items</title></channel></rss>"
+
+        result = Workbench(self.db, page_fetcher=lambda _url: empty_feed).related_search(
+            draft_id, selection, 0, len(selection)
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("empty", result["search_status"])
+        self.assertEqual("no_qualified_result", result["cause_code"])
+        self.assertEqual([], result["items"])
+
+    def test_related_search_maps_graded_failures_to_cause_codes(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+
+        def unreachable(_url: str) -> bytes:
+            raise OSError("dns lookup failed")
+
+        def unparsable(_url: str) -> bytes:
+            return b'{"error": "rate limited"}'
+
+        for cause, fetcher, expected_reason in (
+            ("transport_unavailable", unreachable, "网络不可达"),
+            ("parse_error", unparsable, "解析失败"),
+        ):
+            with self.subTest(cause):
+                workbench = Workbench(self.db, page_fetcher=fetcher)
+                with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
+                    with self.assertRaises(LLMError) as raised:
+                        workbench.related_search(draft_id, selection, 0, len(selection))
+                # The top-level API code must never change.
+                self.assertEqual("related_search_failed", str(raised.exception))
+                self.assertEqual(cause, raised.exception.cause_code)
+                self.assertIn(expected_reason, raised.exception.reason)
+                self.assertIn(cause, "\n".join(logs.output))
+
+    def test_related_search_timeout_is_graded_and_logged(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+
+        def slow(_url: str) -> bytes:
+            time.sleep(0.2)
+            return b"<rss><channel /></rss>"
+
+        workbench = Workbench(self.db, page_fetcher=slow)
+        with patch("autoposting.background._RELATED_SEARCH_BUDGET_SECONDS", 0.05):
+            with self.assertLogs("autoposting.workbench", level="WARNING"):
+                with self.assertRaises(LLMError) as raised:
+                    workbench.related_search(draft_id, selection, 0, len(selection))
+
+        self.assertEqual("related_search_failed", str(raised.exception))
+        self.assertEqual("timeout", raised.exception.cause_code)
+        self.assertIn("检索超时", raised.exception.reason)
+
+    def test_related_search_reason_does_not_leak_upstream_text(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        secret = "secret upstream failure"
+
+        def fetcher(_url: str) -> bytes:
+            raise RuntimeError(secret)
+
+        workbench = Workbench(self.db, page_fetcher=fetcher)
+        with self.assertLogs("autoposting.workbench", level="WARNING"):
+            with self.assertRaises(LLMError) as raised:
+                workbench.related_search(draft_id, selection, 0, len(selection))
+
+        self.assertNotIn(secret, raised.exception.reason)
+        self.assertIn("网络不可达", raised.exception.reason)
+
+    def test_related_search_failure_log_never_carries_credentials(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        secret = "SUPERSECRETVALUE"
+        # The verifier's reproduced upstream text, credential and all.
+        upstream = (
+            "ddg: ConnectionRefusedError: SECRET-UPSTREAM-BODY-"
+            f"http://internal.example/token={secret}"
+        )
+
+        def fetcher(_url: str) -> bytes:
+            raise ConnectionRefusedError(upstream)
+
+        workbench = Workbench(self.db, page_fetcher=fetcher)
+        with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
+            with self.assertRaises(LLMError) as raised:
+                workbench.related_search(draft_id, selection, 0, len(selection))
+
+        logged = "\n".join(logs.output)
+        self.assertIn("related search failed", logged)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("SECRET-UPSTREAM-BODY", logged)
+        self.assertIn("token=***", logged)
+        self.assertIn("internal.example", logged)
+        # The HTTP-facing error stays the graded Chinese reason.
+        self.assertEqual("related_search_failed", str(raised.exception))
+        self.assertEqual("transport_unavailable", raised.exception.cause_code)
+        self.assertNotIn(secret, raised.exception.reason)
+        self.assertNotIn("SECRET-UPSTREAM-BODY", raised.exception.reason)
+
+    def test_related_search_crash_log_never_carries_credentials(self) -> None:
+        selection = "英伟达发布新一代AI芯片"
+        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
+        secret = "SUPERSECRETVALUE"
+
+        workbench = Workbench(self.db, page_fetcher=lambda _url: b"")
+        with patch(
+            "autoposting.workbench.search_related_news",
+            side_effect=RuntimeError(
+                f"upstream said https://api.example/v1?api_key={secret}"
+            ),
+        ):
+            with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
+                with self.assertRaises(LLMError) as raised:
+                    workbench.related_search(draft_id, selection, 0, len(selection))
+
+        logged = "\n".join(logs.output)
+        self.assertIn("related search crashed", logged)
+        self.assertNotIn(secret, logged)
+        self.assertIn("api_key=***", logged)
+        self.assertEqual("related_search_failed", str(raised.exception))
+        self.assertNotIn(secret, raised.exception.reason)
+
+    def test_related_search_reports_degraded_long_selection_query(self) -> None:
+        paragraph = (
+            "英伟达在大会上发布了新一代AI芯片，这款芯片采用了全新的架构设计，"
+            "在推理性能上比上一代产品提升了两倍以上。分析师认为，随着数据中心对算力的需求持续增长，"
+            "这款芯片预计将推动公司下一季度的营收增长。与此同时，竞争对手也在加快自研芯片的节奏，"
+            "整个行业的竞争格局正在发生变化，供应链厂商同样受到关注。业内普遍预计，"
+            "未来几个季度相关产品的出货量还会继续攀升，下游客户也在调整采购计划，"
+            "多家机构上调了行业增速预期，但同时也提醒投资者关注供需波动带来的风险。"
+        )
+        draft_id = self._related_draft(paragraph)
+        rss = (
+            "<rss><channel><item>"
+            "<title>英伟达发布新一代AI芯片</title>"
+            "<link>https://news.example/ai-chip</link>"
+            "<description>英伟达 AI 芯片报道</description>"
+            "</item></channel></rss>"
+        ).encode("utf-8")
+
+        result = Workbench(self.db, page_fetcher=lambda _url: rss).related_search(
+            draft_id, paragraph, 0, len(paragraph)
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["query_degraded"])
+        self.assertEqual("degraded_leading_clause", result["query_strategy"])
+        self.assertEqual(len(paragraph), result["query_source_chars"])
+        self.assertLess(len(result["query"]), len(paragraph))
+        self.assertIn("英伟达", result["query"])
+        self.assertEqual("https://news.example/ai-chip", result["items"][0]["url"])
 
 
 class WorkbenchLlmTests(unittest.TestCase):

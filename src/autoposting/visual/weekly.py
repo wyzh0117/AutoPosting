@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from autoposting.github_weekly import iso_week_issue, week_window_start
+from autoposting.github_weekly import week_window_start
 
 from .adapter import project_from_repo, ranking_from_repos
 from .components import AUTHOR_BRAND, author_avatar_data_uri
@@ -14,8 +14,6 @@ from .pipeline import render_page
 from .story import find_readme_logo, load_readme
 from .tokens import default_weekly_palette, resolve_tokens
 
-GenerateImage = Callable[[str], bytes]
-
 
 def render_weekly_visual(
     repos: list[dict[str, Any]],
@@ -24,16 +22,22 @@ def render_weekly_visual(
     theme: str = "dark",
     palette: dict[str, str] | None = None,
     screenshot: bool = True,
-    generate_image: GenerateImage | None = None,
     screenshot_fn: Callable[..., Path] | None = None,
+    *,
+    brand: str | None = None,
+    series: str | None = None,
+    source: str | None = None,
+    footer: str | None = None,
+    kicker: str | None = None,
+    issue: str | None = None,
 ) -> list[dict[str, Any]]:
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
     catalog_dir = target.parent / "visual-marks"
     date_range = week_window_start()
-    issue = iso_week_issue()
-    avatar = author_avatar_data_uri()
-    total = max(len(repos), 1)
+    resolved_brand = AUTHOR_BRAND if brand is None else brand
+    avatar = author_avatar_data_uri() if resolved_brand == AUTHOR_BRAND else ""
+    total = max(min(len(repos), 10), 1)
     rendered: list[dict[str, Any]] = []
     for job in jobs:
         kind = str(job.get("kind") or "")
@@ -42,10 +46,14 @@ def render_weekly_visual(
         if kind == "cover":
             payload = ranking_from_repos(
                 repos,
-                brand=AUTHOR_BRAND,
+                brand=brand,
+                series=series,
                 issue=issue,
                 date_range=date_range,
                 avatar=avatar,
+                source=source,
+                footer=footer,
+                kicker=kicker,
             )
             if job.get("visual_title"):
                 payload["title"] = str(job["visual_title"])
@@ -66,10 +74,13 @@ def render_weekly_visual(
             render_rank = int(repo.get("rank") or 1)
             payload = project_from_repo(
                 repo,
-                brand=AUTHOR_BRAND,
+                brand=brand,
+                series=series,
                 issue=issue,
                 page_number=f"{render_rank + 1:02d} / {total + 1:02d}",
                 avatar=avatar,
+                source=source,
+                footer=footer,
             )
             _apply_project_mark(payload, repo, catalog_dir)
         weekly_palette = default_weekly_palette(theme)

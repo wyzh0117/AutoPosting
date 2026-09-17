@@ -7,7 +7,6 @@ data; the model is never allowed to execute instructions embedded in content.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -31,7 +30,7 @@ from .article_prompt import (
     load_article_style_prompt,
 )
 from .hooks import EXTRACT_CANDIDATES_PROMPT
-from .leaderboard_prompt import load_leaderboard_copy_prompt
+from .leaderboard_prompt import load_leaderboard_copy_prompt, load_skill_copy_prompt
 from .normalize import contains_source_id, content_hash
 from .xhs_cards import fill_xhs_caption
 
@@ -40,7 +39,7 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/1.2.9"
+HTTP_USER_AGENT = "AutoPosting/1.4.0"
 LLM_TIMEOUT_SECONDS = 90
 LEADERBOARD_ENRICH_SECONDS = 25
 MAX_OUTPUT_CHARS = 100_000
@@ -395,170 +394,6 @@ def _article_fields(parsed: object, *, depth: int = 0) -> dict[str, str] | None:
     return None
 
 
-def _looks_dashscope(base_url: str) -> bool:
-    parsed = urlsplit(base_url)
-    host = (parsed.hostname or "").lower()
-    path = (parsed.path or "").lower()
-    return "dashscope" in host or host.endswith(".aliyuncs.com") or "compatible-mode" in path
-
-
-def _dashscope_multimodal_url(base_url: str) -> str:
-    parsed = urlsplit(base_url)
-    scheme = parsed.scheme or "https"
-    host = parsed.netloc or "dashscope.aliyuncs.com"
-    return f"{scheme}://{host}/api/v1/services/aigc/multimodal-generation/generation"
-
-
-IMAGE_ASPECT_RATIO = "9:16"
-IMAGE_SIZE_9X16 = "928*1664"
-_IMAGE_SIZE_FALLBACKS = (
-    "928*1664",
-    "720*1280",
-    "864*1536",
-    "810*1440",
-)
-
-
-def _canon_image_size(size: str) -> str:
-    return size.strip().replace("x", "*").replace("×", "*")
-
-
-def _parse_image_wh(size: str) -> tuple[int, int] | None:
-    text = _canon_image_size(size)
-    if "*" not in text:
-        return None
-    left, right = text.split("*", 1)
-    if not left.isdigit() or not right.isdigit():
-        return None
-    width, height = int(left), int(right)
-    if width <= 0 or height <= 0:
-        return None
-    return width, height
-
-
-def resolve_image_size(model: str, size: str | None = None) -> str:
-    requested = _canon_image_size(size) if size else ""
-    parsed = _parse_image_wh(requested)
-    if parsed is not None:
-        width, height = parsed
-        if abs((width / height) - (9 / 16)) < 0.03:
-            return f"{width}*{height}"
-    return IMAGE_SIZE_9X16
-
-
-def image_size_candidates(model: str, size: str | None = None) -> list[str]:
-    primary = resolve_image_size(model, size)
-    ordered: list[str] = []
-    for item in (primary, *_IMAGE_SIZE_FALLBACKS):
-        if item not in ordered:
-            ordered.append(item)
-    return ordered
-
-
-def _is_illegal_image_size(exc: LLMError) -> bool:
-    reason = exc.reason or ""
-    blob = reason.lower()
-    if "size" not in blob:
-        return False
-    return (
-        "不合法" in reason
-        or "invalid" in blob
-        or "illegal" in blob
-        or "not supported" in blob
-        or "unsupported" in blob
-    )
-
-
-def _http_error_detail(exc: urllib.error.HTTPError) -> str:
-    try:
-        raw = exc.read().decode("utf-8", errors="replace")
-    except Exception:
-        raw = ""
-    message = ""
-    if raw:
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            err = parsed.get("error")
-            if isinstance(err, dict) and isinstance(err.get("message"), str):
-                message = err["message"]
-            elif isinstance(parsed.get("message"), str):
-                message = str(parsed["message"])
-        if not message:
-            message = raw[:240]
-    return f"HTTP {exc.code}" + (f"：{message.strip()}" if message.strip() else "")
-
-
-def _decode_b64_image(raw: str) -> bytes:
-    blob = raw.strip()
-    if "base64," in blob:
-        blob = blob.split("base64,", 1)[1]
-    try:
-        data = base64.b64decode(blob)
-    except (ValueError, TypeError) as exc:
-        raise LLMError("llm_invalid_output", "出图 API 的 base64 无效") from exc
-    if not data:
-        raise LLMError("llm_invalid_output", "出图 API 的 base64 为空")
-    return data
-
-
-def _collect_image_refs(value: object, into: list[str]) -> None:
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith(("data:image", "http://", "https://")):
-            into.append(stripped)
-        elif len(stripped) > 80 and " " not in stripped[:40]:
-            into.append(stripped)
-        return
-    if isinstance(value, dict):
-        for key in ("b64_json", "image"):
-            raw = value.get(key)
-            if isinstance(raw, str) and raw.strip():
-                into.append(raw.strip())
-        url = value.get("url")
-        if isinstance(url, str) and url.strip():
-            into.append(url.strip())
-        image_url = value.get("image_url")
-        if isinstance(image_url, dict):
-            nested = image_url.get("url")
-            if isinstance(nested, str) and nested.strip():
-                into.append(nested.strip())
-        elif isinstance(image_url, str) and image_url.strip():
-            into.append(image_url.strip())
-        for key in ("content", "message", "output"):
-            nested = value.get(key)
-            if nested is not None:
-                _collect_image_refs(nested, into)
-        for key in ("choices", "data", "results"):
-            nested = value.get(key)
-            if isinstance(nested, list):
-                _collect_image_refs(nested, into)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _collect_image_refs(item, into)
-
-
-def _image_from_reference(value: str, timeout: int) -> bytes | None:
-    if value.startswith("data:image") and "base64," in value:
-        return _decode_b64_image(value)
-    if value.startswith(("http://", "https://")):
-        try:
-            with urllib.request.urlopen(value, timeout=timeout) as response:
-                payload = response.read()
-        except (OSError, TimeoutError, urllib.error.URLError):
-            return None
-        return payload or None
-    if len(value) > 80 and " " not in value[:40]:
-        try:
-            return _decode_b64_image(value)
-        except LLMError:
-            return None
-    return None
-
-
 class HermesRunner:
     def __init__(
         self,
@@ -750,129 +585,6 @@ class HermesRunner:
             raise LLMError("llm_output_too_large", f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符")
         return output
 
-    def generate_image(
-        self, prompt: str, settings: LLMSettings, size: str | None = None
-    ) -> bytes:
-        last_error: LLMError | None = None
-        for candidate in image_size_candidates(settings.model, size):
-            try:
-                return self._generate_image_with_size(prompt, settings, candidate)
-            except LLMError as exc:
-                last_error = exc
-                if _is_illegal_image_size(exc):
-                    continue
-                break
-        try:
-            return self._generate_image_via_chat(prompt, settings)
-        except LLMError as exc:
-            if last_error is None:
-                raise
-            raise LLMError(
-                "llm_api_failed",
-                f"{exc.reason}（出图接口：{last_error.reason}）",
-                cause_code=exc.cause_code or exc.code,
-            ) from None
-
-    def _generate_image_with_size(
-        self, prompt: str, settings: LLMSettings, size: str | None
-    ) -> bytes:
-        compatible_url = f"{settings.base_url.rstrip('/')}/images/generations"
-        compatible_body: dict[str, object] = {
-            "model": settings.model,
-            "prompt": prompt,
-            "n": 1,
-        }
-        if size:
-            compatible_body["size"] = size
-        first_error: LLMError | None = None
-        try:
-            parsed = self._post_json(compatible_url, settings, compatible_body)
-            return self._decode_image_payload(parsed, settings)
-        except LLMError as exc:
-            first_error = exc
-            if not _looks_dashscope(settings.base_url):
-                raise
-        native_url = _dashscope_multimodal_url(settings.base_url)
-        parameters: dict[str, object] = {"n": 1, "watermark": False}
-        if size:
-            parameters["size"] = size
-        native_body = {
-            "model": settings.model,
-            "input": {
-                "messages": [{"role": "user", "content": [{"text": prompt}]}]
-            },
-            "parameters": parameters,
-        }
-        try:
-            parsed = self._post_json(native_url, settings, native_body)
-            return self._decode_image_payload(parsed, settings)
-        except LLMError as exc:
-            detail = exc.reason or exc.code
-            prior = first_error.reason if first_error is not None else ""
-            raise LLMError(
-                "llm_api_failed",
-                f"出图失败：{detail}" + (f"（兼容接口：{prior}）" if prior else ""),
-                cause_code=exc.cause_code or exc.code,
-            ) from None
-
-    def _generate_image_via_chat(self, prompt: str, settings: LLMSettings) -> bytes:
-        parsed = self._post_json(
-            f"{settings.base_url.rstrip('/')}/chat/completions",
-            settings,
-            {
-                "model": settings.model,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        return self._decode_image_payload(parsed, settings)
-
-    def _post_json(
-        self, url: str, settings: LLMSettings, body: dict[str, object]
-    ) -> dict[str, object]:
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {settings.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": HTTP_USER_AGENT,
-            },
-            method="POST",
-        )
-        timeout = max(self.timeout, 120)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
-                parsed = json.loads(raw)
-        except TimeoutError as exc:
-            raise LLMError("llm_timeout", f"出图请求超过 {timeout} 秒未返回") from exc
-        except urllib.error.HTTPError as exc:
-            detail = _http_error_detail(exc)
-            raise LLMError("llm_api_failed", f"出图 API 失败 {detail}") from exc
-        except (OSError, urllib.error.URLError) as exc:
-            raise LLMError("llm_api_failed", "出图 API 请求失败") from exc
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise LLMError("llm_invalid_output", "出图 API 返回了无效 JSON") from exc
-        if not isinstance(parsed, dict):
-            raise LLMError("llm_invalid_output", "出图 API 响应不是 JSON 对象")
-        return parsed
-
-    def _decode_image_payload(
-        self, parsed: dict[str, object], settings: LLMSettings
-    ) -> bytes:
-        candidates: list[str] = []
-        _collect_image_refs(parsed, candidates)
-        seen: set[str] = set()
-        for item in candidates:
-            if item in seen:
-                continue
-            seen.add(item)
-            decoded = _image_from_reference(item, timeout=max(self.timeout, 120))
-            if decoded:
-                return decoded
-        raise LLMError("llm_invalid_output", "出图 API 没有返回图片")
-
 
 class LLMService:
     """Cached LLM calls behind a per-process lock; failures degrade, never crash."""
@@ -966,22 +678,6 @@ class LLMService:
         self._settings = candidate
         return candidate
 
-    def configure_verified_image(
-        self,
-        model: object,
-        base_url: object,
-        api_key: object,
-    ) -> LLMSettings:
-        candidate = validate_llm_settings(model, LLM_PROVIDER, "none", base_url, api_key)
-        if not candidate.base_url:
-            raise ValueError("base_url, api_key, and model are required")
-        self._settings = candidate
-        return candidate
-
-    def generate_image(self, prompt: str) -> bytes:
-        if not hasattr(self.runner, "generate_image"):
-            raise LLMError("llm_api_failed", "当前运行器不支持出图")
-        return self.runner.generate_image(prompt, self.settings)
 
     def chat(self, messages: list[dict[str, str]], model: str | None = None) -> str:
         """Send a native chat history to the independently configured chat model."""
@@ -1308,6 +1004,50 @@ class LLMService:
         items = parsed.get("items") if isinstance(parsed, dict) else None
         if not isinstance(items, list):
             raise LLMError("llm_invalid_output", "榜单结果缺少 items 数组")
+        return apply_leaderboard_copy(repos, [item for item in items if isinstance(item, dict)])
+
+    def enrich_skill_repos(self, repos: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Skills share the weekly copy pipeline: same fields, skill-lane prompt.
+
+        Names, install counts, URLs, stages and ranking stay template-owned; only
+        summary/does/scene/how/audience are rewritten.
+        """
+        from .github_weekly import apply_leaderboard_copy
+
+        if not repos:
+            return repos
+        settings = self.resolve_settings()
+        if settings.model == LLM_MODEL:
+            return repos
+        run_settings = settings
+        if self._injected_command_runner:
+            run_settings = validate_llm_settings(
+                settings.model, settings.provider, settings.effort, "", ""
+            )
+        elif not settings.base_url:
+            return repos
+        payload = [
+            {
+                "full_name": repo.get("full_name") or repo.get("name") or "",
+                "name": repo.get("name") or "",
+                "description": repo.get("description") or "",
+                "stage": repo.get("stage_name") or "",
+                "kind": repo.get("kind") or "",
+                "installs": int(repo.get("installs") or repo.get("stars") or 0),
+                "excerpt": str(repo.get("skill_excerpt") or "")[:600],
+            }
+            for repo in repos
+        ]
+        prompt = (
+            f"{load_skill_copy_prompt()}\n"
+            f"数据：\n{json.dumps(payload, ensure_ascii=False)}"
+        )
+        parsed = parse_model_json(
+            self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
+        )
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list):
+            raise LLMError("llm_invalid_output", "skill 文案结果缺少 items 数组")
         return apply_leaderboard_copy(repos, [item for item in items if isinstance(item, dict)])
 
     def generate_article(

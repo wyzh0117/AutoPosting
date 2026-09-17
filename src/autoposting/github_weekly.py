@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import os
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -230,10 +233,23 @@ def fallback_copy(repo: dict[str, object]) -> dict[str, object]:
 
     kind = str(repo.get("kind") or "AI 工具")
     description = str(repo.get("description") or "").strip()
-    does_items = to_bullets(description) or list(KIND_DOES.get(kind) or ["先看能干什么"])
-    how_items = list(KIND_HOW.get(kind) or ["按自己的任务试一遍", "看能不能省事"])
-    scene_items = list(KIND_SCENE.get(kind) or ["先拿一个真实小任务试"])
-    audience_items = list(KIND_AUDIENCE.get(kind) or ["想先看懂再决定要不要用的人"])
+    # A caller may already own real per-item copy (the skill lane derives it from
+    # the skill's own text). Only fall back to kind-level boilerplate when a field
+    # is actually empty, otherwise every poster in a lane reads identically.
+    does_items = (
+        to_bullets(repo.get("does") or "")
+        or to_bullets(description)
+        or list(KIND_DOES.get(kind) or ["先看能干什么"])
+    )
+    how_items = to_bullets(repo.get("how") or "") or list(
+        KIND_HOW.get(kind) or ["按自己的任务试一遍", "看能不能省事"]
+    )
+    scene_items = to_bullets(repo.get("scene") or "") or list(
+        KIND_SCENE.get(kind) or ["先拿一个真实小任务试"]
+    )
+    audience_items = to_bullets(repo.get("audience") or "") or list(
+        KIND_AUDIENCE.get(kind) or ["想先看懂再决定要不要用的人"]
+    )
     return {
         "summary": capability_line(repo),
         "does": "\n".join(does_items),
@@ -303,22 +319,177 @@ def _search_url(week_start: str, per_page: int) -> str:
     )
 
 
-def default_github_get(url: str, timeout: float = 20) -> object:
+GITHUB_TOKEN_ENV = "AUTOPOSTING_GITHUB_TOKEN"
+GITHUB_TOKEN_FALLBACK_ENV = "GITHUB_TOKEN"
+_TOKEN_OVERRIDE: str | None = None
+_RATE_STATE: dict[str, object] | None = None
+
+
+class GitHubFetchError(RuntimeError):
+    """A GitHub HTTP call failed; ``kind`` says why."""
+
+    kind: str
+    status: int | None
+    url: str
+    reset_at: float | None
+
+    def __init__(
+        self,
+        kind: str,
+        url: str,
+        status: int | None = None,
+        reset_at: float | None = None,
+        *,
+        message: str | None = None,
+    ) -> None:
+        self.kind = str(kind)
+        self.url = str(url)
+        self.status = int(status) if status is not None else None
+        self.reset_at = float(reset_at) if reset_at is not None else None
+        super().__init__(message or _failure_message(self.kind, self.url, self.status))
+
+
+def _failure_message(kind: str, url: str, status: int | None) -> str:
+    """Wording other modules string-match on; the token never reaches it."""
+    if kind == "rate_limited":
+        quota = f" ({status})" if status is not None else ""
+        return f"github_fetch_failed:rate limit exceeded{quota}:{url}"
+    return f"github_fetch_failed:{url}"
+
+
+def set_github_token(token: str | None) -> None:
+    """Override the process-wide token; ``None`` falls back to the environment."""
+    global _TOKEN_OVERRIDE
+    _TOKEN_OVERRIDE = None if token is None else str(token).strip()
+
+
+def github_token() -> str:
+    """Resolve the token to send: override, then AUTOPOSTING_GITHUB_TOKEN, then GITHUB_TOKEN."""
+    if _TOKEN_OVERRIDE is not None:
+        return _TOKEN_OVERRIDE
+    for name in (GITHUB_TOKEN_ENV, GITHUB_TOKEN_FALLBACK_ENV):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def github_rate_state() -> dict[str, object] | None:
+    """Latest X-RateLimit-* headers as a fresh dict, or None before any call."""
+    return dict(_RATE_STATE) if _RATE_STATE is not None else None
+
+
+def _header_text(headers: object, name: str) -> str:
+    """Read one response header, tolerating mocks and non-string values."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return ""
+    try:
+        value = getter(name)
+    except (AttributeError, KeyError, TypeError):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _header_number(headers: object, name: str) -> float | None:
+    try:
+        return float(_header_text(headers, name))
+    except ValueError:
+        return None
+
+
+def _record_rate_headers(headers: object) -> None:
+    """Remember the newest quota headers; responses without them keep the old state."""
+    global _RATE_STATE
+    limit = _header_number(headers, "X-RateLimit-Limit")
+    remaining = _header_number(headers, "X-RateLimit-Remaining")
+    reset = _header_number(headers, "X-RateLimit-Reset")
+    resource = _header_text(headers, "X-RateLimit-Resource")
+    if limit is None and remaining is None and reset is None and not resource:
+        return
+    previous = _RATE_STATE or {}
+    _RATE_STATE = {
+        "limit": int(limit) if limit is not None else int(previous.get("limit") or 0),
+        "remaining": int(remaining)
+        if remaining is not None
+        else int(previous.get("remaining") or 0),
+        "reset": float(reset) if reset is not None else float(previous.get("reset") or 0.0),
+        "resource": resource or str(previous.get("resource") or ""),
+    }
+
+
+def _rate_limit_marked(status: int | None, body: str, headers: object) -> bool:
+    """A 403 is a quota answer only when the response says so; a 429 always is."""
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    # "secondary rate limit" also contains "rate limit".
+    if "rate limit" in body.lower():
+        return True
+    return _header_text(headers, "X-RateLimit-Remaining") == "0"
+
+
+def _http_fetch_error(exc: urllib.error.HTTPError, url: str) -> GitHubFetchError:
+    """Classify an HTTP failure; the response body never enters the message."""
+    status = getattr(exc, "code", None)
+    status = int(status) if status is not None else None
+    headers = getattr(exc, "headers", None)
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:  # an unreadable body must not hide the HTTP status
+        body = ""
+    if _rate_limit_marked(status, body, headers):
+        kind = "rate_limited"
+    elif status in (401, 403):
+        kind = "forbidden"
+    elif status == 404:
+        kind = "not_found"
+    elif status is not None and 500 <= status < 600:
+        kind = "server_error"
+    else:
+        kind = "http_error"
+    return GitHubFetchError(
+        kind, url, status=status, reset_at=_header_number(headers, "X-RateLimit-Reset")
+    )
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    text = str(reason if reason is not None else exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
+def _network_fetch_error(exc: BaseException, url: str) -> GitHubFetchError:
+    return GitHubFetchError("timeout" if _is_timeout(exc) else "unreachable", url)
+
+
+def default_github_get(url: str, timeout: float = 20, token: str | None = None) -> object:
     from .llm import HTTP_USER_AGENT
 
     global _GITHUB_NOW
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": HTTP_USER_AGENT,
-            "Accept": "application/vnd.github+json, text/html"
-            if "api.github.com" in url
-            else "text/html,application/xhtml+xml",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    headers = {
+        "User-Agent": HTTP_USER_AGENT,
+        "Accept": "application/vnd.github+json, text/html"
+        if "api.github.com" in url
+        else "text/html,application/xhtml+xml",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    credential = github_token() if token is None else str(token).strip()
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            _record_rate_headers(getattr(response, "headers", None))
             header_date = response.headers.get("Date")
             if header_date:
                 try:
@@ -329,13 +500,20 @@ def default_github_get(url: str, timeout: float = 20) -> object:
                 except (TypeError, ValueError, IndexError):
                     pass
             raw = response.read().decode("utf-8", errors="replace")
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-        raise RuntimeError(f"github_fetch_failed:{url}") from exc
+    except urllib.error.HTTPError as exc:
+        _record_rate_headers(getattr(exc, "headers", None))
+        raise _http_fetch_error(exc, url) from exc
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        # URLError and socket.timeout are OSError subclasses; the classifier
+        # separates a timeout from a plain network failure.
+        raise _network_fetch_error(exc, url) from exc
     if "api.github.com" in url:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("github_search_invalid_json") from exc
+            raise GitHubFetchError(
+                "bad_json", url, message="github_search_invalid_json"
+            ) from exc
         return parsed
     return raw
 

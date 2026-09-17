@@ -1,21 +1,34 @@
+import http.client
+import io
 import json
+import os
+import socket
 import tempfile
 import types
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
+from autoposting import github_weekly
 from autoposting.db import Database
 from autoposting.github_weekly import (
     XHS_TITLE,
+    GitHubFetchError,
     apply_leaderboard_copy,
     build_xhs_copy,
+    default_github_get,
     fetch_weekly_ai_repos,
     format_stars,
+    github_rate_state,
+    github_token,
     infer_kind,
     parse_github_search,
     parse_trending_html,
+    set_github_token,
     week_window_start,
 )
 from autoposting.llm import LLMService
@@ -352,3 +365,299 @@ class GitHubWeeklyTests(unittest.TestCase):
     def test_week_window_is_rolling_seven_days(self) -> None:
         start = week_window_start(datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc))
         self.assertEqual("2026-08-22", start)
+
+
+API_URL = "https://api.github.com/search/repositories?q=topic%3Aai"
+QUOTA_HEADERS = {
+    "X-RateLimit-Limit": "60",
+    "X-RateLimit-Remaining": "0",
+    "X-RateLimit-Reset": "1800000000",
+    "X-RateLimit-Resource": "core",
+}
+
+
+class _FakeResponse:
+    """Minimal urlopen() context manager for the HTTP-layer tests."""
+
+    def __init__(self, payload: bytes, headers: dict[str, str] | None = None) -> None:
+        self._payload = payload
+        self.headers = dict(headers or {})
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
+def _http_error(
+    status: int, *, body: bytes = b"", headers: dict[str, str] | None = None
+) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        API_URL, status, f"HTTP {status}", dict(headers or {}), io.BytesIO(body)
+    )
+
+
+def _request_headers(request: urllib.request.Request) -> dict[str, str]:
+    """Header names are capitalized by Request, so compare case-insensitively."""
+    return {name.lower(): value for name, value in request.header_items()}
+
+
+class GitHubHttpLayerTests(unittest.TestCase):
+    """Failure classification, optional token, and quota visibility."""
+
+    def setUp(self) -> None:
+        set_github_token(None)
+        patcher = mock.patch.object(github_weekly, "_RATE_STATE", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(set_github_token, None)
+
+    def _patched_urlopen(self, outcome: object) -> list[urllib.request.Request]:
+        """Patch the network seam; an exception outcome is raised instead of answered."""
+        sent: list[urllib.request.Request] = []
+
+        def fake_urlopen(
+            request: urllib.request.Request, timeout: float | None = None
+        ) -> object:
+            sent.append(request)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        patcher = mock.patch.object(github_weekly.urllib.request, "urlopen", fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sent
+
+    def _failure(self, outcome: object) -> GitHubFetchError:
+        self._patched_urlopen(outcome)
+        with self.assertRaises(GitHubFetchError) as ctx:
+            default_github_get(API_URL)
+        return ctx.exception
+
+    def test_success_with_token_sends_bearer_and_returns_json(self) -> None:
+        payload = {"items": [{"full_name": "acme/llm-cli"}]}
+        sent = self._patched_urlopen(
+            _FakeResponse(
+                json.dumps(payload).encode("utf-8"),
+                {"X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "59"},
+            )
+        )
+        result = default_github_get(API_URL, token="  ghp-token-123  ")
+        self.assertEqual(payload, result)
+        headers = _request_headers(sent[0])
+        self.assertEqual("Bearer ghp-token-123", headers["authorization"])
+        self.assertTrue(headers["user-agent"])
+        self.assertIn("application/vnd.github+json", headers["accept"])
+        self.assertEqual("2022-11-28", headers["x-github-api-version"])
+
+    def test_success_without_token_omits_authorization(self) -> None:
+        sent = self._patched_urlopen(_FakeResponse(b'{"items": []}'))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual("", github_token())
+            self.assertEqual({"items": []}, default_github_get(API_URL))
+        self.assertNotIn("authorization", _request_headers(sent[0]))
+
+    def test_env_tokens_are_used_when_no_override_is_set(self) -> None:
+        sent = self._patched_urlopen(_FakeResponse(b'{"items": []}'))
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOPOSTING_GITHUB_TOKEN": " primary-token ", "GITHUB_TOKEN": "fallback"},
+            clear=True,
+        ):
+            self.assertEqual("primary-token", github_token())
+            default_github_get(API_URL)
+        self.assertEqual("Bearer primary-token", _request_headers(sent[0])["authorization"])
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": " fallback-token "}, clear=True):
+            self.assertEqual("fallback-token", github_token())
+            default_github_get(API_URL)
+        self.assertEqual("Bearer fallback-token", _request_headers(sent[1])["authorization"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOPOSTING_GITHUB_TOKEN": "   ", "GITHUB_TOKEN": "fallback-token"},
+            clear=True,
+        ):
+            self.assertEqual("fallback-token", github_token())
+
+    def test_override_and_explicit_token_win_over_env(self) -> None:
+        sent = self._patched_urlopen(_FakeResponse(b'{"items": []}'))
+        with mock.patch.dict(os.environ, {"AUTOPOSTING_GITHUB_TOKEN": "env-token"}, clear=True):
+            default_github_get(API_URL)
+            self.assertEqual("Bearer env-token", _request_headers(sent[0])["authorization"])
+            set_github_token("override-token")
+            self.assertEqual("override-token", github_token())
+            default_github_get(API_URL)
+            self.assertEqual("Bearer override-token", _request_headers(sent[1])["authorization"])
+            default_github_get(API_URL, token=" explicit-token ")
+            self.assertEqual("Bearer explicit-token", _request_headers(sent[2])["authorization"])
+            default_github_get(API_URL, token="")
+            self.assertNotIn("authorization", _request_headers(sent[3]))
+
+    def test_403_with_rate_limit_body_is_rate_limited(self) -> None:
+        self._patched_urlopen(
+            _http_error(
+                403,
+                body=b'{"message":"API rate limit exceeded for 1.2.3.4."}',
+                headers=QUOTA_HEADERS,
+            )
+        )
+        with self.assertRaises(GitHubFetchError) as ctx:
+            default_github_get(API_URL)
+        error = ctx.exception
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual("rate_limited", error.kind)
+        self.assertEqual(403, error.status)
+        self.assertEqual(API_URL, error.url)
+        self.assertEqual(
+            f"github_fetch_failed:rate limit exceeded (403):{API_URL}", str(error)
+        )
+        self.assertIn("rate limit", str(error))
+        self.assertIn("403", str(error))
+        self.assertEqual(1800000000.0, error.reset_at)
+        self.assertIsInstance(error.__cause__, urllib.error.HTTPError)
+        self.assertEqual(
+            {"limit": 60, "remaining": 0, "reset": 1800000000.0, "resource": "core"},
+            github_rate_state(),
+        )
+
+    def test_403_rate_limit_markers_body_header_and_429(self) -> None:
+        secondary = self._failure(
+            _http_error(403, body=b"You have exceeded a secondary rate limit.")
+        )
+        self.assertEqual("rate_limited", secondary.kind)
+        header_only = self._failure(
+            _http_error(403, body=b"nope", headers={"X-RateLimit-Remaining": "0"})
+        )
+        self.assertEqual("rate_limited", header_only.kind)
+        self.assertIsNone(header_only.reset_at)
+        too_many = self._failure(_http_error(429, body=b'{"message":"slow down"}'))
+        self.assertEqual("rate_limited", too_many.kind)
+        self.assertEqual(429, too_many.status)
+        self.assertIn("rate limit", str(too_many))
+
+    def test_http_status_kinds(self) -> None:
+        cases = (
+            (401, "forbidden"),
+            (403, "forbidden"),
+            (404, "not_found"),
+            (500, "server_error"),
+            (503, "server_error"),
+            (418, "http_error"),
+            (429, "rate_limited"),
+        )
+        for status, kind in cases:
+            with self.subTest(status=status):
+                error = self._failure(_http_error(status, body=b'{"message":"nope"}'))
+                self.assertEqual(kind, error.kind)
+                self.assertEqual(status, error.status)
+                self.assertEqual(API_URL, error.url)
+                if kind == "rate_limited":
+                    self.assertIn("rate limit", str(error))
+                    self.assertIn(str(status), str(error))
+                else:
+                    self.assertEqual(f"github_fetch_failed:{API_URL}", str(error))
+                self.assertIsInstance(error.__cause__, urllib.error.HTTPError)
+
+    def test_timeout_and_unreachable_kinds(self) -> None:
+        cases = (
+            (socket.timeout("timed out"), "timeout"),
+            (TimeoutError("timed out"), "timeout"),
+            (urllib.error.URLError(socket.timeout("timed out")), "timeout"),
+            (urllib.error.URLError("name resolution"), "unreachable"),
+            (ConnectionResetError(54, "Connection reset by peer"), "unreachable"),
+            (http.client.IncompleteRead(b"half a body"), "unreachable"),
+        )
+        for outcome, kind in cases:
+            with self.subTest(outcome=repr(outcome)):
+                error = self._failure(outcome)
+                self.assertEqual(kind, error.kind)
+                self.assertIsNone(error.status)
+                self.assertIsNone(error.reset_at)
+                self.assertEqual(f"github_fetch_failed:{API_URL}", str(error))
+                self.assertIs(error.__cause__, outcome)
+
+    def test_invalid_json_on_api_host_is_bad_json(self) -> None:
+        self._patched_urlopen(_FakeResponse(b"<html>not json</html>"))
+        with self.assertRaises(GitHubFetchError) as ctx:
+            default_github_get(API_URL)
+        error = ctx.exception
+        self.assertEqual("bad_json", error.kind)
+        self.assertEqual("github_search_invalid_json", str(error))
+        self.assertEqual(API_URL, error.url)
+        self.assertIsNone(error.status)
+        self.assertIsInstance(error.__cause__, json.JSONDecodeError)
+
+    def test_non_api_url_still_returns_raw_text(self) -> None:
+        self._patched_urlopen(_FakeResponse(b"<html>trending</html>"))
+        self.assertEqual(
+            "<html>trending</html>", default_github_get("https://github.com/trending?since=weekly")
+        )
+
+    def test_rate_state_is_none_until_a_response_carries_quota_headers(self) -> None:
+        self.assertIsNone(github_rate_state())
+        self._patched_urlopen(_FakeResponse(b'{"items": []}'))
+        default_github_get(API_URL)
+        self.assertIsNone(github_rate_state())
+
+    def test_rate_state_is_a_read_only_copy(self) -> None:
+        sent = self._patched_urlopen(
+            _FakeResponse(
+                b'{"items": []}',
+                {
+                    "X-RateLimit-Limit": "60",
+                    "X-RateLimit-Remaining": "14",
+                    "X-RateLimit-Reset": "1800000000",
+                    "X-RateLimit-Resource": "core",
+                },
+            )
+        )
+        default_github_get(API_URL)
+        self.assertTrue(sent)
+        state = github_rate_state()
+        self.assertEqual(
+            {"limit": 60, "remaining": 14, "reset": 1800000000.0, "resource": "core"},
+            state,
+        )
+        state["remaining"] = 999
+        state["resource"] = "hacked"
+        self.assertEqual(14, github_rate_state()["remaining"])
+        self.assertEqual("core", github_rate_state()["resource"])
+
+    def test_token_never_reaches_messages_or_rate_state(self) -> None:
+        token = "ghp_do_not_leak_me_0123456789"
+        set_github_token(token)
+        outcomes = (
+            _http_error(
+                403, body=b'{"message":"API rate limit exceeded"}', headers=QUOTA_HEADERS
+            ),
+            _http_error(404, body=b'{"message":"Not Found"}'),
+            TimeoutError("timed out"),
+            _FakeResponse(b"<html>not json</html>"),
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=repr(outcome)):
+                sent = self._patched_urlopen(outcome)
+                with self.assertRaises(GitHubFetchError) as ctx:
+                    default_github_get(API_URL)
+                self.assertEqual(
+                    f"Bearer {token}", _request_headers(sent[0])["authorization"]
+                )
+                rendered = repr(ctx.exception) + str(ctx.exception) + repr(ctx.exception.args)
+                self.assertNotIn(token, rendered)
+                self.assertNotIn(token, repr(github_rate_state()))
+                self.assertNotIn(token, repr(ctx.exception.__cause__))
+
+    def test_fetch_weekly_ai_repos_still_swallows_github_fetch_error(self) -> None:
+        def getter(url: str) -> object:
+            raise GitHubFetchError("rate_limited", url, status=403, reset_at=1.0)
+
+        repos = fetch_weekly_ai_repos(
+            getter=getter, now=datetime(2026, 8, 29, tzinfo=timezone.utc), limit=3
+        )
+        self.assertEqual([], repos)

@@ -10,6 +10,13 @@ KIND_BY_PAGE = {
     "project-detail": "project",
 }
 
+# Lane text: fields a non-weekly lane may intentionally blank because it does not
+# want GitHub weekly branding (``issue=""`` suppresses the ISO week label). An
+# empty string stays legal for these keys only; missing keys still fail
+# ``required``, and every other string field keeps enforcing ``minLength``.
+# See ``adapter._lane_text``.
+BLANKABLE_LANE_KEYS = frozenset({"brand", "series", "issue", "dateRange", "title", "subtitle"})
+
 
 class ContentValidationError(ValueError):
     pass
@@ -36,7 +43,7 @@ def infer_kind(payload: dict[str, Any]) -> str:
     return KIND_BY_PAGE[page]
 
 
-def _check(value: Any, schema: dict[str, Any], root: dict[str, Any], path: str) -> None:
+def _check(value: Any, schema: dict[str, Any], root: dict[str, Any], path: str, key: str = "") -> None:
     schema = _resolve(schema, root)
     if "const" in schema and value != schema["const"]:
         raise ContentValidationError(f"{path}: expected {schema['const']!r}")
@@ -46,13 +53,13 @@ def _check(value: Any, schema: dict[str, Any], root: dict[str, Any], path: str) 
     if expected == "object" or (isinstance(value, dict) and "properties" in schema):
         if not isinstance(value, dict):
             raise ContentValidationError(f"{path}: expected object")
-        for key in schema.get("required") or []:
-            if key not in value:
-                raise ContentValidationError(f"{path}: missing {key}")
+        for key_name in schema.get("required") or []:
+            if key_name not in value:
+                raise ContentValidationError(f"{path}: missing {key_name}")
         properties = schema.get("properties") or {}
-        for key, child in value.items():
-            if key in properties:
-                _check(child, properties[key], root, f"{path}.{key}")
+        for key_name, child in value.items():
+            if key_name in properties:
+                _check(child, properties[key_name], root, f"{path}.{key_name}", key_name)
     if expected == "array" or "items" in schema:
         if not isinstance(value, list):
             if expected == "array":
@@ -65,6 +72,8 @@ def _check(value: Any, schema: dict[str, Any], root: dict[str, Any], path: str) 
             for index, item in enumerate(value):
                 _check(item, item_schema, root, f"{path}[{index}]")
     if isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
+        if value == "" and key in BLANKABLE_LANE_KEYS:
+            return
         raise ContentValidationError(f"{path}: minLength {schema['minLength']}")
     if isinstance(value, (int, float)) and "minimum" in schema and value < schema["minimum"]:
         raise ContentValidationError(f"{path}: minimum {schema['minimum']}")
