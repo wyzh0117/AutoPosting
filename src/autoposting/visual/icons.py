@@ -57,54 +57,6 @@ def _icon_svg(path: str, seed: str) -> str:
 </svg>"""
 
 
-def function_schematic(steps: list[str], seed: str = "flow") -> str:
-    nodes = [item.strip() for item in steps if str(item).strip()][:5]
-    if not nodes:
-        nodes = ["输入", "处理", "输出"]
-    uid = svg_id("flow", seed)
-    count = len(nodes)
-    width = 1000
-    height = 520
-    gap = 28
-    node_w = min(168, (width - 80 - gap * (count - 1)) / count)
-    node_h = 72
-    start_x = (width - (node_w * count + gap * (count - 1))) / 2
-    y = 220
-    parts = [
-        f'<svg class="c-function-diagram" viewBox="0 0 {width} {height}" role="img">',
-        f'<defs><linearGradient id="{uid}-panel" x1="0" y1="0" x2="1" y2="1">',
-        '<stop offset="0%" stop-color="currentColor" stop-opacity="0.14"/>',
-        '<stop offset="100%" stop-color="currentColor" stop-opacity="0.04"/>',
-        "</linearGradient></defs>",
-        f'<rect x="36" y="36" width="{width - 72}" height="{height - 72}" rx="32" fill="url(#{uid}-panel)"/>',
-        f'<text x="64" y="88" fill="currentColor" font-size="22" font-weight="600" opacity="0.7">功能示意</text>',
-    ]
-    for index, label in enumerate(nodes):
-        x = start_x + index * (node_w + gap)
-        text = escape(label[:8])
-        parts.append(
-            f'<rect x="{x}" y="{y}" width="{node_w}" height="{node_h}" rx="18" '
-            f'fill="currentColor" opacity="0.16"/>'
-        )
-        parts.append(
-            f'<rect x="{x}" y="{y}" width="{node_w}" height="{node_h}" rx="18" '
-            f'fill="none" stroke="currentColor" stroke-width="2" opacity="0.55"/>'
-        )
-        parts.append(
-            f'<text x="{x + node_w / 2}" y="{y + 44}" text-anchor="middle" fill="currentColor" '
-            f'font-size="20" font-weight="600">{text}</text>'
-        )
-        if index < count - 1:
-            ax = x + node_w + 4
-            parts.append(
-                f'<path d="M{ax} {y + node_h / 2} H{ax + gap - 8} L{ax + gap - 16} {y + node_h / 2 - 7} '
-                f'M{ax + gap - 8} {y + node_h / 2} L{ax + gap - 16} {y + node_h / 2 + 7}" '
-                f'fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>'
-            )
-    parts.append("</svg>")
-    return "".join(parts)
-
-
 _STROKE = 'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"'
 
 _GLYPHS = {

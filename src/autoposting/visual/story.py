@@ -4,8 +4,6 @@ import re
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
-from .media import fetch_data_uri
-
 MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 HTML_IMAGE_RE = re.compile(r"<img[^>]+src=['\"]([^'\"]+)['\"]", re.I)
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.M)
@@ -68,24 +66,6 @@ def extract_story_beats(readme: str, *, owner: str = "", repo: str = "") -> list
         if len(beats) >= MAX_BEATS:
             break
     return beats
-
-
-def text_beats(readme: str, fallback: list[str]) -> list[dict[str, str]]:
-    headings = [line.strip() for _, line in HEADING_RE.findall(readme or "") if line.strip()]
-    captions = headings[1: MAX_BEATS + 1] or [item for item in fallback if item][:MAX_BEATS]
-    return [{"caption": caption, "image": ""} for caption in captions[:MAX_BEATS]]
-
-
-def embed_story_images(beats: list[dict[str, str]]) -> list[dict[str, str]]:
-    embedded: list[dict[str, str]] = []
-    for beat in beats:
-        row = dict(beat)
-        image = str(row.get("image") or "")
-        if image and not image.startswith("data:"):
-            data = fetch_data_uri(image)
-            row["image"] = data
-        embedded.append(row)
-    return embedded
 
 
 def load_readme(owner: str, repo: str, fetcher: FetchBytes | None) -> str:

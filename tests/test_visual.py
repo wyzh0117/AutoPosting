@@ -300,9 +300,8 @@ class BrandAndIssueTests(unittest.TestCase):
         self.assertIn("c-smart-cover-list", cover)
         self.assertEqual(len(repos), cover.count('class="c-smart-cover-item"'))
         self.assertIn(".c-smart-cover-metric { text-align: right; color: #f3f0e8;", cover)
-        self.assertIn("c-poster-a-lines", odd)
-        self.assertNotIn("c-poster-a-lines", odd.split("<body>", 1)[-1])
-        self.assertNotIn("c-poster-b-info", even.split("<body>", 1)[-1])
+        self.assertNotIn("c-poster-a-lines", odd)
+        self.assertNotIn("c-poster-b-info", even)
 
     def test_weekly_visual_uses_repo_rank_for_stale_or_missing_job_rank(self) -> None:
         from autoposting.visual.weekly import render_weekly_visual

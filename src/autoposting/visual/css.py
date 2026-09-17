@@ -11,8 +11,8 @@ def stylesheet(tokens: dict | None = None) -> str:
     canvas = tokens["canvas"]
     safe = tokens["safeArea"]
     color = tokens["color"]
-    # Weekly geometric templates use a compact three-color vocabulary. Keep
-    # their layers derived from resolved tokens so the picker changes pixels.
+    # Cover/poster chrome uses a compact three-color vocabulary. Keep
+    # those layers derived from resolved tokens so the picker changes pixels.
     template_main = str(color["background"]).lower()
     template_secondary = str(color["surface"]).lower()
     template_accent = str(color["primary"]).lower()
@@ -450,74 +450,6 @@ html, body {{
   align-items: center;
   justify-content: center;
 }}
-.c-hero-visual {{
-  margin-top: {space["lg"]}px;
-  height: 360px;
-  border-radius: {radius["card"]}px;
-  border: 1px solid {color["border"]};
-  background:
-    radial-gradient(circle at 30% 30%, {color["glow"]}, transparent 42%),
-    radial-gradient(circle at 80% 70%, rgba(232, 213, 163, 0.16), transparent 36%),
-    {color["surface"]};
-  overflow: hidden;
-  position: relative;
-}}
-.c-hero-visual img {{ width: 100%; height: 100%; object-fit: cover; }}
-.c-hero-visual .c-function-diagram {{
-  width: 100%;
-  height: 100%;
-  color: {color["primary"]};
-  display: block;
-}}
-.c-story {{
-  display: flex;
-  flex-direction: column;
-  gap: {space["md"]}px;
-  padding: {space["md"]}px;
-  min-height: 0;
-}}
-.c-story-row {{
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: {space["md"]}px;
-  flex: 1;
-  min-height: 0;
-}}
-.c-story-beat {{
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  border-radius: {radius["card"]}px;
-  background: {color["surfaceRaised"]};
-  overflow: hidden;
-}}
-.c-story-media {{
-  flex: 1;
-  min-height: 118px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: {color["primary"]};
-}}
-.c-story-media img {{ width: 100%; height: 100%; object-fit: cover; }}
-.c-story-media .c-feature-icon {{ width: 56px; height: 56px; flex-basis: 56px; }}
-.c-story-caption {{
-  margin: 0;
-  padding: {space["sm"]}px {space["md"]}px {space["md"]}px;
-  font-size: {type_["body"]["size"]}px;
-  line-height: 1.35;
-  color: {color["text"]["primary"]};
-}}
-.c-hero-visual .c-hero-caption {{
-  position: absolute;
-  left: {space["lg"]}px;
-  bottom: {space["lg"]}px;
-  color: {color["text"]["secondary"]};
-  font-size: 13px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}}
 .c-quote-card {{
   margin-top: {space["lg"]}px;
   padding: {space["lg"]}px;
@@ -558,25 +490,6 @@ html, body {{
   font-size: {type_["body"]["size"] + 2}px;
   -webkit-line-clamp: 4;
 }}
-.c-metric-panel .c-metric-grid {{
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: {space["md"]}px;
-}}
-.c-metric-cell .c-metric-value {{
-  text-align: left;
-  font-size: {type_["h2"]["size"] - 10}px;
-}}
-.c-metric-cell .c-metric-label {{
-  text-align: left;
-}}
-.c-split {{
-  margin-top: {space["lg"]}px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: {space["md"]}px;
-  min-height: 0;
-}}
 .c-panel {{
   padding: {space["lg"]}px;
   border-radius: {radius["card"]}px;
@@ -613,35 +526,6 @@ html, body {{
   color: {color["primary"]};
   display: block;
 }}
-.c-workflow {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}}
-.c-workflow span {{
-  padding: 8px 10px;
-  border-radius: {radius["sm"]}px;
-  background: {color["surfaceRaised"]};
-  border: 1px solid {color["border"]};
-  font-size: 14px;
-  color: {color["text"]["secondary"]};
-}}
-.c-audience-card, .c-url-card {{
-  margin-top: {space["md"]}px;
-}}
-.c-audience-card p, .c-url-card p {{
-  margin: 0;
-  font-size: 18px;
-  line-height: 1.45;
-  color: {color["text"]["secondary"]};
-}}
-.c-url-card p {{
-  font-family: {type_["fontFamily"]["latin"]};
-  color: {color["metric"]};
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}}
 .template-cover,
 .template-poster-a,
 .template-poster-b {{
@@ -649,8 +533,7 @@ html, body {{
   background: {template_main};
   color: {template_ink};
 }}
-.c-smart-cover-shell,
-.c-geometric-poster {{
+.c-smart-cover-shell {{
   position: relative;
   width: 100%;
   height: 100%;
@@ -742,124 +625,4 @@ html, body {{
   overflow: hidden;
 }}
 .c-smart-cover-tags span {{ color: {template_muted}; font-size: 15px; border-bottom: 1px solid {template_border}; padding-bottom: 5px; }}
-.c-poster-a-shell {{ padding: 64px 56px 48px; }}
-.c-poster-a-number {{ position: absolute; left: 56px; top: 54px; color: {template_accent}; font-size: 92px; line-height: 1; font-weight: 300; letter-spacing: -.04em; }}
-.c-poster-a-title {{ position: absolute; left: 56px; top: 270px; width: 58%; }}
-.c-poster-a-title h1,
-.c-poster-b-title h1 {{
-  margin: 0;
-  color: {template_ink};
-  font-size: 58px;
-  line-height: 1.05;
-  letter-spacing: -.04em;
-  font-weight: 600;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}}
-.c-poster-a-title p,
-.c-poster-b-title p {{
-  margin: 22px 0 0;
-  color: {template_muted};
-  font-size: 24px;
-  line-height: 1.35;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-}}
-.c-poster-a-lines {{
-  position: absolute;
-  left: 56px;
-  right: 56px;
-  bottom: 158px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border-top: 1px solid {template_border};
-  max-height: 300px;
-  overflow: hidden;
-}}
-.c-poster-a-lines li {{
-  display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  gap: 16px;
-  align-items: center;
-  min-height: 68px;
-  padding: 8px 0;
-  border-bottom: 1px solid {template_border};
-}}
-.c-poster-a-lines li span {{ color: {template_muted}; font-size: 18px; }}
-.c-poster-a-lines li b {{
-  color: {template_ink};
-  font-size: 23px;
-  line-height: 1.2;
-  font-weight: 400;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 1;
-}}
-.c-poster-a-footer,
-.c-poster-b-footer {{ position: absolute; left: 56px; bottom: 48px; color: {template_muted}; font-size: 16px; letter-spacing: .08em; }}
-.c-poster-b-shell {{ padding: 64px 56px 48px; }}
-.c-poster-b-media {{
-  position: absolute;
-  left: 56px;
-  top: 310px;
-  width: 42%;
-  height: 390px;
-  border: 1px solid {template_border};
-  background: {template_surface_raised};
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}}
-.c-poster-b-media::after {{ content: ""; position: absolute; inset: 18px; border: 1px solid {template_border}; }}
-.c-poster-b-media span {{ position: relative; z-index: 1; color: {template_accent}; font-size: 72px; font-weight: 300; letter-spacing: -.06em; }}
-.c-poster-b-chevron {{
-  position: absolute;
-  right: 56px;
-  top: 55px;
-  width: 310px;
-  height: 62px;
-  opacity: .95;
-  background:
-    repeating-linear-gradient(135deg, {template_muted} 0 2px, transparent 2px 34px),
-    {template_secondary};
-  border-top: 1px solid {template_border};
-  clip-path: polygon(0 0, 76% 0, 62% 100%, 42% 100%, 56% 22%, 0 22%);
-}}
-.c-poster-b-title {{ position: absolute; left: 56px; top: 100px; width: 44%; }}
-.c-poster-b-info {{
-  position: absolute;
-  right: 56px;
-  top: 180px;
-  width: 42%;
-  height: 650px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}}
-.c-poster-b-info li {{
-  display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
-  gap: 14px;
-  min-height: 145px;
-  padding: 12px 0 18px;
-  border-bottom: 1px solid {template_border};
-}}
-.c-poster-b-info li span {{ color: {template_muted}; font-size: 17px; }}
-.c-poster-b-info li p {{
-  margin: 0;
-  color: {template_ink};
-  font-size: 22px;
-  line-height: 1.35;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-}}
-.c-poster-b-footer {{ left: auto; right: 56px; }}
 """.strip()

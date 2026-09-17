@@ -82,50 +82,6 @@ def smart_cover(payload: dict[str, Any]) -> str:
     )
 
 
-def geometric_poster(payload: dict[str, Any], variant: str) -> str:
-    data = apply_project_rules(payload)
-    features = _poster_values(data, "features")
-    how = _poster_values(data, "how")
-    audience = _poster_values(data, "audience")
-    scene = _poster_values(data, "scene")
-    name = escape(str(data.get("name") or ""))
-    rank = int(data.get("rank") or 0)
-    key_message = escape(str(data.get("keyMessage") or data.get("description") or ""))
-    if variant == "poster-a":
-        lines = "".join(
-            f'<li><span>{index:02d}</span><b>{escape(value)}</b></li>'
-            for index, value in enumerate((features + how)[:4], start=1)
-        )
-        return (
-            '<div class="c-geometric-poster c-poster-a-shell">'
-            f'<div class="c-poster-a-number">{rank:02d}</div>'
-            f'<div class="c-poster-a-title"><h1>{name}</h1><p>{key_message}</p></div>'
-            f'<ol class="c-poster-a-lines">{lines}</ol>'
-            f'<div class="c-poster-a-footer">{escape(str(data.get("pageNumber") or ""))}</div>'
-            "</div>"
-        )
-    info = features[:1] + how[:1] + audience[:1] + scene[:1]
-    rows = "".join(
-        f'<li><span>{index:02d}</span><p>{escape(value)}</p></li>'
-        for index, value in enumerate(info[:4], start=1)
-    )
-    mark = escape("".join(ch for ch in str(data.get("name") or "") if ch.isalnum())[:4])
-    return (
-        '<div class="c-geometric-poster c-poster-b-shell">'
-        f'<div class="c-poster-b-media"><span>{mark}</span></div>'
-        '<div class="c-poster-b-chevron" aria-hidden="true"></div>'
-        f'<div class="c-poster-b-title"><h1>{name}</h1><p>{key_message}</p></div>'
-        f'<ol class="c-poster-b-info">{rows}</ol>'
-        f'<div class="c-poster-b-footer">{escape(str(data.get("pageNumber") or ""))}</div>'
-        "</div>"
-    )
-
-
-def _poster_values(data: dict[str, Any], key: str) -> list[str]:
-    values = data.get(key) if isinstance(data.get(key), list) else []
-    return [str(value).strip() for value in values if str(value).strip()]
-
-
 def ranking_overview(payload: dict[str, Any]) -> str:
     data = apply_ranking_rules(payload)
     items = [item for item in (data.get("items") or []) if isinstance(item, dict)]

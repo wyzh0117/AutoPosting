@@ -5,7 +5,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Iterable
 
-from .icons import feature_icon, function_schematic, named_icon
+from .icons import feature_icon, named_icon
 from .marks import family_from_kind, is_author_avatar, themed_svg
 
 AUTHOR_BRAND = "EE_萤飞"
@@ -116,65 +116,12 @@ def rank_pill(rank: int) -> str:
     return f'<span class="c-rank-pill">NO.{int(rank):02d}</span>'
 
 
-def hero_visual(
-    src: str = "",
-    caption: str = "功能示意",
-    steps: Iterable[str] | None = None,
-    seed: str = "flow",
-    story: Iterable[dict[str, Any]] | None = None,
-) -> str:
-    beats = [beat for beat in (story or []) if isinstance(beat, dict)]
-    if beats:
-        return story_board(beats, seed)
-    if src:
-        inner = f'<img src="{escape(src, quote=True)}" alt="">'
-        return (
-            f'<div class="c-hero-visual">{inner}'
-            f'<div class="c-hero-caption">{escape(caption)}</div></div>'
-        )
-    inner = function_schematic(list(steps or []), seed)
-    return (
-        f'<div class="c-hero-visual">{inner}'
-        f'<div class="c-hero-caption">{escape(caption)}</div></div>'
-    )
-
-
-def story_board(beats: Iterable[dict[str, Any]], seed: str = "story") -> str:
-    from .story import snake_rows
-
-    items = [beat for beat in beats if beat.get("caption") or beat.get("image")]
-    rows = snake_rows(items)
-    body = []
-    for row_index, row in enumerate(rows):
-        klass = "c-story-row" + (" c-story-reverse" if row_index % 2 else "")
-        cells = "".join(_story_beat(beat, f"{seed}-{row_index}-{index}") for index, beat in enumerate(row))
-        body.append(f'<div class="{klass}">{cells}</div>')
-    return f'<section class="c-hero-visual c-story">{"".join(body)}</section>'
-
-
-def _story_beat(beat: dict[str, Any], seed: str) -> str:
-    caption = escape(str(beat.get("caption") or ""))
-    image = str(beat.get("image") or "")
-    if image:
-        media = f'<img src="{escape(image, quote=True)}" alt="">'
-    else:
-        media = feature_icon(str(beat.get("caption") or seed), seed)
-    return (
-        f'<article class="c-story-beat"><div class="c-story-media">{media}</div>'
-        f'<p class="c-story-caption">{caption}</p></article>'
-    )
-
-
 def quote_card(label: str, message: str, compact: bool = False) -> str:
     klass = "c-quote-card c-quote-lede" if compact else "c-quote-card"
     return (
         f'<section class="{klass}"><div class="label">{escape(label)}</div>'
         f"<p>{escape(message)}</p></section>"
     )
-
-
-def feature_list(items: Iterable[str]) -> str:
-    return bullet_panel("做什么？", items)
 
 
 def bullet_panel(
@@ -206,53 +153,6 @@ def bullet_panel(
     return (
         f'<section class="{klass}"><h3>{heading}</h3>'
         f'<ul class="c-feature-list">{"".join(rows)}</ul></section>'
-    )
-
-
-def workflow_diagram(steps: Iterable[str]) -> str:
-    chips = "".join(f"<span>{escape(step)}</span>" for step in steps if step)
-    return f'<section class="c-panel"><h3>工作流</h3><div class="c-workflow">{chips}</div></section>'
-
-
-def metric_panel(metrics: Iterable[dict[str, Any]], kind: str = "") -> str:
-    cells = []
-    for metric in metrics:
-        if not isinstance(metric, dict):
-            continue
-        label = escape(str(metric.get("label") or ""))
-        display = escape(str(metric.get("display") or metric.get("value") or ""))
-        if not label or not display:
-            continue
-        cells.append(
-            f'<div class="c-metric-cell"><div class="c-metric-value">{display}</div>'
-            f'<div class="c-metric-label">{label}</div></div>'
-        )
-    if kind:
-        cells.append(
-            f'<div class="c-metric-cell"><div class="c-metric-value">{escape(kind)}</div>'
-            f'<div class="c-metric-label">类型</div></div>'
-        )
-    if not cells:
-        cells.append('<div class="c-metric-cell"><div class="c-metric-value">—</div><div class="c-metric-label">数据</div></div>')
-    return (
-        f'<section class="c-panel c-metric-panel"><h3>核心指标</h3>'
-        f'<div class="c-metric-grid">{"".join(cells)}</div></section>'
-    )
-
-
-def audience_card(people: Iterable[str]) -> str:
-    text = "  ·  ".join(person for person in people if person)
-    return (
-        f'<section class="c-panel c-audience-card"><h3>适合人群</h3>'
-        f"<p>{escape(text)}</p></section>"
-    )
-
-
-def url_card(url: str, display: str = "") -> str:
-    shown = display or url
-    return (
-        f'<section class="c-panel c-url-card"><h3>项目地址</h3>'
-        f"<p>{escape(shown)}</p></section>"
     )
 
 
