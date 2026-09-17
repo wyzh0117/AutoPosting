@@ -13,13 +13,16 @@ def render_html(payload: dict[str, Any], tokens: dict[str, Any] | None = None) -
     resolved = tokens or load_tokens()
     meta = resolved.get("meta") if isinstance(resolved.get("meta"), dict) else {}
     variant = str(meta.get("template_variant") or "").strip()
+    poster_template = str(meta.get("poster_template") or "1").strip()
     page = payload.get("page")
     if page == "ranking-overview" and variant == "cover":
-        body = smart_cover(payload)
+        body = toc_cover(payload) if poster_template == "2" else smart_cover(payload)
         page_class = "page page-ranking"
     elif page == "project-detail" and variant in {"poster-a", "poster-b"}:
         # Keep the geometric outer plate, but use the complete, stable detail layout.
         body = project_detail(payload)
+        if poster_template == "2":
+            body = _toc_chrome(body)
         page_class = "page page-project"
     elif page == "ranking-overview":
         body = ranking_overview(payload)
@@ -29,11 +32,12 @@ def render_html(payload: dict[str, Any], tokens: dict[str, Any] | None = None) -
         page_class = "page page-project"
     else:
         raise ValueError(f"unsupported page: {page}")
+    skin = " skin-toc" if poster_template == "2" else ""
     return (
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         f"<meta name=\"viewport\" content=\"width={resolved['canvas']['width']}\">"
         f"<title>{_title(payload)}</title><style>{stylesheet(resolved)}</style></head>"
-        f"<body><div class=\"{page_class}{(' template-' + variant) if variant else ''}\">{body}</div></body></html>"
+        f"<body><div class=\"{page_class}{(' template-' + variant) if variant else ''}{skin}\">{body}</div></body></html>"
     )
 
 
@@ -151,6 +155,47 @@ def project_detail(payload: dict[str, Any]) -> str:
                 str(data.get("pageNumber") or ""),
             ),
         ]
+    )
+
+
+def toc_cover(payload: dict[str, Any]) -> str:
+    """Parchment directory cover: same 10 items, skill_directory_10 chrome."""
+    data = apply_ranking_rules(payload)
+    cards = []
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        cards.append(
+            "<article class=\"toc-item\">"
+            "<div class=\"toc-rule\"></div>"
+            f"<p class=\"toc-num\">{int(item.get('rank') or 0):02d}</p>"
+            f"<h2 class=\"toc-skill\">{escape(str(item.get('name') or ''))}</h2>"
+            f"<p class=\"toc-desc\">{escape(str(item.get('description') or ''))}</p>"
+            "</article>"
+        )
+    title = str(data.get("title") or data.get("subtitle") or "Directory")
+    inner = (
+        '<section class="toc-content">'
+        f'<h1 class="toc-title">{escape(title)}</h1>'
+        f'<div class="toc-grid">{"".join(cards)}</div>'
+        "</section>"
+    )
+    return _toc_chrome(inner)
+
+
+def _toc_chrome(inner: str) -> str:
+    """Double-line frame and corner plates from toc_background_only.html."""
+    return (
+        '<div class="toc-stage">'
+        '<div class="toc-frame h top-a"></div><div class="toc-frame h soft top-b"></div>'
+        '<div class="toc-frame h bottom-a"></div><div class="toc-frame h soft bottom-b"></div>'
+        '<div class="toc-frame v left-a"></div><div class="toc-frame v soft left-b"></div>'
+        '<div class="toc-frame v right-a"></div><div class="toc-frame v soft right-b"></div>'
+        '<div class="toc-inner-line"></div>'
+        '<div class="toc-corner tl"></div><div class="toc-corner tr"></div>'
+        '<div class="toc-corner bl"></div><div class="toc-corner br"></div>'
+        f"{inner}"
+        "</div>"
     )
 
 

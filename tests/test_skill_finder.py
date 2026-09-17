@@ -2674,7 +2674,7 @@ class SkillFinderApiTests(unittest.TestCase):
         ]
         self.assertIn("手动粘贴", source_fn)
         self.assertIn('"is-manual"', source_fn)
-        self.assertIn('label + " · " + counts[label]', source_fn)
+        self.assertIn('label + " " + counts[label]', source_fn)
         for label in ("GitHub", "skills.sh", "网页检索"):
             self.assertIn(label, source_fn)
         self.assertIn('id="skill-degraded-note"', html)
@@ -2849,7 +2849,7 @@ class SkillFinderApiTests(unittest.TestCase):
             }
         )
 
-        def exploding_renderer(repos, jobs, out_dir, theme="dark", palette=None):
+        def exploding_renderer(repos, jobs, out_dir, theme="dark", palette=None, **kwargs):
             raise RuntimeError("boom")
 
         self.app.visual_renderer = exploding_renderer
@@ -3053,7 +3053,7 @@ class SkillFinderApiTests(unittest.TestCase):
             png_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
             return png_path
 
-        def fake_render(repos, jobs, out_dir, theme="dark", palette=None):
+        def fake_render(repos, jobs, out_dir, theme="dark", palette=None, **kwargs):
             out_dir.mkdir(parents=True, exist_ok=True)
             rendered = []
             for job in jobs:

@@ -264,7 +264,7 @@ class WebApiTests(unittest.TestCase):
         )
         seen: dict[str, object] = {}
 
-        def fake_render(repos, jobs, out_dir, theme="dark", palette=None):
+        def fake_render(repos, jobs, out_dir, theme="dark", palette=None, **kwargs):
             seen["theme"] = theme
             seen["palette"] = palette
             seen["count"] = len(repos)
@@ -302,7 +302,7 @@ class WebApiTests(unittest.TestCase):
         )
         seen: dict[str, object] = {}
 
-        def fake_render(repos, jobs, out_dir, theme="dark", palette=None):
+        def fake_render(repos, jobs, out_dir, theme="dark", palette=None, **kwargs):
             seen["theme"] = theme
             seen["palette"] = palette
             seen["job_ids"] = [job["id"] for job in jobs]
@@ -348,7 +348,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.3", payload["version"])
+        self.assertEqual("1.4.4", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1966,7 +1966,7 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("exportGithubImages", html)
         self.assertIn("github-gallery", html)
         self.assertIn("github-select-all", html)
-        self.assertIn("github-gallery-prev", html)
+        self.assertIn("github-gallery-counter", html)
         self.assertIn("aspect-ratio:3/4", html)
         self.assertIn("/api/github-weekly", html)
         # D8: the image-model configuration surface is torn out, not hidden.
@@ -2044,7 +2044,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.3", html)
+        self.assertIn("1.4.4", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2440,23 +2440,11 @@ class IndexPageContractTests(unittest.TestCase):
     def test_patch_142_image_carousels(self) -> None:
         html = self._index()
         picker = html[html.index('id="image-picker"') : html.index('id="xhs-studio"')]
-        self.assertIn('id="image-picker-prev"', picker)
-        self.assertIn('id="image-picker-next"', picker)
         self.assertIn('id="image-picker-counter"', picker)
-        self.assertIn("上一张", picker)
-        self.assertIn("下一张", picker)
         github = html[html.index('id="github-studio"') : html.index('id="skills-studio"')]
-        self.assertIn('id="github-gallery-prev"', github)
-        self.assertIn('id="github-gallery-next"', github)
         self.assertIn('id="github-gallery-counter"', github)
-        self.assertIn("上一张", github)
-        self.assertIn("下一张", github)
         skills = html[html.index('id="skills-studio"') : html.index('id="article-view"')]
-        self.assertIn('id="skills-gallery-prev"', skills)
-        self.assertIn('id="skills-gallery-next"', skills)
         self.assertIn('id="skills-gallery-counter"', skills)
-        self.assertIn("上一张", skills)
-        self.assertIn("下一张", skills)
         self.assertIn("function clampCarouselIndex", html)
         self.assertIn("function paintCarouselNav", html)
         self.assertIn("function stepImagePicker", html)
@@ -2485,9 +2473,67 @@ class IndexPageContractTests(unittest.TestCase):
             html.index("function renderGithubWeeklyImages()") : html.index("function copyGithubXhs()")
         ]
         self.assertIn("state.githubGalleryIndex = index", render_fn)
-        self.assertIn('$("image-picker-prev").addEventListener("click"', html)
-        self.assertIn('$("github-gallery-prev").addEventListener("click"', html)
-        self.assertIn('$("skills-gallery-prev").addEventListener("click"', html)
+
+    def test_patch_144_lightbox_side_hits_keep_preview_buttons(self) -> None:
+        html = self._index()
+        lightbox = html[html.index('id="image-lightbox"') : html.index("<script>")]
+        self.assertIn('id="lightbox-prev"', lightbox)
+        self.assertIn('id="lightbox-next"', lightbox)
+        self.assertIn("上一张", lightbox)
+        self.assertIn("下一张", lightbox)
+        github = html[html.index('id="github-studio"') : html.index('id="skills-studio"')]
+        self.assertNotIn('id="github-gallery-prev"', github)
+        self.assertNotIn('id="github-gallery-next"', github)
+        self.assertNotIn("上一张", github)
+        skills = html[html.index('id="skills-studio"') : html.index('id="article-view"')]
+        self.assertNotIn('id="skills-gallery-prev"', skills)
+        self.assertNotIn('id="skills-gallery-next"', skills)
+        self.assertNotIn("上一张", skills)
+        picker = html[html.index('id="image-picker"') : html.index('id="xhs-studio"')]
+        self.assertNotIn('id="image-picker-prev"', picker)
+        self.assertNotIn('id="image-picker-next"', picker)
+        self.assertIn("function hitLightboxSide", html)
+        self.assertIn("function onLightboxImageClick", html)
+        self.assertIn('event.key === "Escape"', html)
+        self.assertNotIn('$("lightbox-image").addEventListener("click", closeImageLightbox)', html)
+
+    def test_patch_144_skill_source_chips_toggle_and_pasted_links(self) -> None:
+        html = self._index()
+        self.assertIn("function collectedSkills", html)
+        self.assertIn("function toggleSkillsBySource", html)
+        self.assertIn("pack.manual_skills", html)
+        chips_fn = html[
+            html.index("function renderSkillSourceChips(") : html.index("function renderCrawlSources(")
+        ]
+        self.assertIn("toggleSkillsBySource", chips_fn)
+        self.assertIn("label + \" \" + counts[label]", chips_fn)
+        list_fn = html[
+            html.index("function renderSkillList(") : html.index("function toggleSkillIncluded(")
+        ]
+        self.assertIn("collectedSkills", html[html.index("function selectedSkills(") : html.index("function renderSkillList(")])
+        self.assertIn('type = "checkbox"', list_fn)
+        self.assertIn("skillPageUrl", list_fn)
+        pack_fn = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
+        self.assertIn("collectedSkills", pack_fn)
+
+    def test_patch_144_poster_template_picker(self) -> None:
+        html = self._index()
+        self.assertIn('id="poster-template-dock"', html)
+        self.assertIn("模版一", html)
+        self.assertIn("模版二", html)
+        self.assertIn("body.lane-github #poster-template-dock", html)
+        self.assertIn("body.lane-skills #poster-template-dock", html)
+        self.assertIn("posterTemplate", html)
+        self.assertIn("poster_template", html)
+        self.assertLess(html.index('id="poster-template-dock"'), html.index('id="hotspot-list"'))
+        render_fn = html[
+            html.index("function renderGithubWeeklyImages()") : html.index("function copyGithubXhs()")
+        ]
+        self.assertIn("poster_template", render_fn)
+        skill_fn = html[
+            html.index("function renderSkillImages()") : html.index("function exportSkillImages(")
+        ]
+        self.assertIn("poster_template", skill_fn)
 
     def test_patch_143_skill_selection_list(self) -> None:
         html = self._index()

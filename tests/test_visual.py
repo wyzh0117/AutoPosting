@@ -996,6 +996,103 @@ class SmartCoverGuardTests(unittest.TestCase):
         self.assertNotIn("01 / 11", html)
 
 
+class PosterTemplateSkinTests(unittest.TestCase):
+    def _repos(self) -> list[dict]:
+        return [
+            {
+                "rank": index,
+                "name": f"skill-{index}",
+                "kind": "CLI",
+                "summary": f"给想先看懂再动手的人，拿 skill-{index} 试的时候，先判断能不能省事。",
+                "description": "description",
+                "does": "把素材按脚本切成粗剪。\n把字幕对齐到画面。",
+                "how": "把材料放进约定目录。\n按说明跑一遍。",
+                "audience": "一个人管多个账号的内容创作者",
+                "scene": "手上素材堆着、成片交期又近的时候",
+                "url": f"https://github.com/acme/skill-{index}",
+            }
+            for index in range(1, 5)
+        ]
+
+    def test_template_two_cover_uses_directory_grid_and_keeps_canvas(self) -> None:
+        from autoposting.visual.weekly import render_weekly_visual
+
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
+        jobs = [
+            {"id": "cover", "kind": "cover", "rank": 0, "visual_title": "Skill Directory"},
+            {"id": "01-skill-1", "kind": "poster", "rank": 1},
+        ]
+        rendered = render_weekly_visual(
+            self._repos(), jobs, temp, screenshot=False, poster_template="2"
+        )
+        self.assertEqual(["cover", "01-skill-1"], [row["id"] for row in rendered])
+        cover = (temp / "cover.html").read_text(encoding="utf-8")
+        poster = (temp / "01-skill-1.html").read_text(encoding="utf-8")
+        self.assertIn("skin-toc", cover)
+        self.assertIn("toc-grid", cover)
+        self.assertIn("toc-item", cover)
+        self.assertIn("Skill Directory", cover)
+        self.assertIn("skill-1", cover)
+        self.assertIn("width: 1080px", cover)
+        self.assertIn("height: 1440px", cover)
+        self.assertNotIn("width: 1200px", cover)
+        self.assertIn("skin-toc", poster)
+        self.assertIn("c-project-shell", poster)
+        self.assertIn("一句话看懂", poster)
+        self.assertIn("做什么？", poster)
+        self.assertIn("如何实现？", poster)
+        self.assertIn("适合哪些人群", poster)
+        self.assertIn("使用场景", poster)
+        self.assertLess(poster.find("一句话看懂"), poster.find("做什么"))
+        self.assertLess(poster.find("做什么"), poster.find("如何实现"))
+        self.assertLess(poster.find("如何实现"), poster.find("适合哪些人群"))
+        self.assertLess(poster.find("适合哪些人群"), poster.find("使用场景"))
+        self.assertIn("width: 1080px", poster)
+        self.assertIn("height: 1440px", poster)
+
+    def test_template_one_stays_geometric_smart_cover(self) -> None:
+        from autoposting.visual.weekly import render_weekly_visual
+
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
+        jobs = [
+            {"id": "cover", "kind": "cover", "rank": 0},
+            {"id": "01-skill-1", "kind": "poster", "rank": 1},
+        ]
+        render_weekly_visual(self._repos(), jobs, temp, screenshot=False, poster_template="1")
+        cover = (temp / "cover.html").read_text(encoding="utf-8")
+        poster = (temp / "01-skill-1.html").read_text(encoding="utf-8")
+        cover_body = cover.split("<body>", 1)[-1]
+        poster_body = poster.split("<body>", 1)[-1]
+        self.assertIn("c-smart-cover-list", cover)
+        self.assertIn('class="page page-ranking template-cover"', cover_body)
+        self.assertNotIn("skin-toc", cover_body)
+        self.assertNotIn("toc-grid", cover_body)
+        self.assertIn("c-project-shell", poster)
+        self.assertNotIn("skin-toc", poster_body)
+
+    def test_template_switch_does_not_rewrite_copy_fields(self) -> None:
+        from autoposting.visual.adapter import project_from_repo
+        from autoposting.visual.weekly import render_weekly_visual
+
+        repo = self._repos()[0]
+        geometric = project_from_repo(repo)
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
+        render_weekly_visual(
+            [repo],
+            [{"id": "01-skill-1", "kind": "poster", "rank": 1}],
+            temp,
+            screenshot=False,
+            poster_template="2",
+        )
+        poster = (temp / "01-skill-1.html").read_text(encoding="utf-8")
+        self.assertIn(geometric["keyMessage"], poster)
+        self.assertIn(geometric["features"][0], poster)
+        self.assertEqual("把素材按脚本切成粗剪。", geometric["features"][0])
+
+
 def _png_size(path: Path) -> tuple[int, int]:
     data = path.read_bytes()
     if data[:8] != b"\x89PNG\r\n\x1a\n":

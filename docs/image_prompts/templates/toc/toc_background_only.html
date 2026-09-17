@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1200, initial-scale=1">
+<title>Background Only</title>
+<style>
+
+:root{
+  --paper:#ded3c0;
+  --paper-hi:#ebe3d3;
+  --paper-lo:#d5c8b1;
+  --line-dark:#9f7d4f;
+  --line-main:#b39163;
+  --line-soft:#ceb894;
+  --line-faint:#c6b08b;
+  --text:#4d3926;
+}
+*{box-sizing:border-box}
+html,body{
+  margin:0;
+  padding:0;
+  width:1200px;
+  height:642px;
+  overflow:hidden;
+  background:var(--paper);
+}
+body{
+  font-family:Georgia,"Times New Roman",serif;
+  color:var(--text);
+}
+.stage{
+  position:relative;
+  width:1200px;
+  height:642px;
+  overflow:hidden;
+  background:
+    radial-gradient(circle at 14% 22%, rgba(255,255,255,.22) 0 2px, transparent 2.1px),
+    radial-gradient(circle at 75% 28%, rgba(255,255,255,.16) 0 1.6px, transparent 1.7px),
+    radial-gradient(circle at 31% 68%, rgba(122,90,46,.08) 0 1.1px, transparent 1.2px),
+    radial-gradient(circle at 82% 74%, rgba(122,90,46,.06) 0 1px, transparent 1.1px),
+    linear-gradient(180deg, rgba(255,255,255,.08), rgba(0,0,0,.025)),
+    repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,.045) 0 2px, rgba(0,0,0,.02) 2px 4px),
+    var(--paper);
+  filter:saturate(.95);
+}
+.frame-line{position:absolute;pointer-events:none;}
+.frame-line.h{height:1px;background:var(--line-main);box-shadow:0 1px 0 rgba(255,255,255,.26), 0 0 0 1px rgba(159,125,79,.08);}
+.frame-line.v{width:1px;background:var(--line-main);box-shadow:1px 0 0 rgba(255,255,255,.24), 0 0 0 1px rgba(159,125,79,.08);}
+.frame-line.soft.h{background:var(--line-soft);box-shadow:0 1px 0 rgba(255,255,255,.2);}
+.frame-line.soft.v{background:var(--line-soft);box-shadow:1px 0 0 rgba(255,255,255,.2);}
+.top-a{left:17px;top:17px;width:1166px}.top-b{left:25px;top:24px;width:1150px}
+.bottom-a{left:17px;bottom:17px;width:1166px}.bottom-b{left:25px;bottom:24px;width:1150px}
+.left-a{left:17px;top:17px;height:608px}.left-b{left:25px;top:25px;height:592px}
+.right-a{right:17px;top:17px;height:608px}.right-b{right:25px;top:25px;height:592px}
+.inner{
+  position:absolute;
+  left:47px; top:47px;
+  width:1106px; height:548px;
+  border:1px solid rgba(177,149,110,.72);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.05);
+  pointer-events:none;
+}
+.corner{
+  position:absolute;
+  width:23px; height:23px;
+  background:transparent;
+  border:1px solid var(--line-main);
+  box-shadow:0 0 0 1px rgba(255,255,255,.14) inset, 0 0 0 1px rgba(159,125,79,.08);
+  z-index:3;
+  pointer-events:none;
+}
+.corner::before{
+  content:"";
+  position:absolute; inset:1px;
+  border:1px solid rgba(211,188,149,.42);
+}
+.corner.tl{left:6px;top:7px}
+.corner.tr{right:6px;top:7px}
+.corner.bl{left:6px;bottom:7px}
+.corner.br{right:6px;bottom:7px}
+
+</style>
+</head>
+<body>
+<main class="stage" aria-label="Background-only parchment page">
+  <div class="frame-line h top-a"></div><div class="frame-line h soft top-b"></div>
+  <div class="frame-line h bottom-a"></div><div class="frame-line h soft bottom-b"></div>
+  <div class="frame-line v left-a"></div><div class="frame-line v soft left-b"></div>
+  <div class="frame-line v right-a"></div><div class="frame-line v soft right-b"></div>
+  <div class="inner"></div>
+  <div class="corner tl"></div><div class="corner tr"></div><div class="corner bl"></div><div class="corner br"></div>
+</main>
+</body>
+</html>

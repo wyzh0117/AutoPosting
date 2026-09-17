@@ -40,7 +40,7 @@ from .skill_finder import (
     skill_identity,
 )
 from .skill_links import parse_skill_links
-from .visual.tokens import parse_palette
+from .visual.tokens import normalize_poster_template, parse_palette
 from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
 from .publishing import PublicationError, PublicationService
@@ -60,7 +60,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -763,7 +763,7 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
 .lightbox-toolbar button{height:32px; min-height:32px; padding:0 .75rem; font-size:.78rem;}
 #lightbox-image{
   max-width:min(92vw, 1100px); max-height:min(78vh, 900px);
-  object-fit:contain; border-radius:8px; background:#111; cursor:zoom-out;
+  object-fit:contain; border-radius:8px; background:#111; cursor:ew-resize;
 }
 #lightbox-caption{margin:0; font-size:.8rem; color:var(--text-muted); text-align:center; word-break:break-all; max-width:min(92vw, 1100px);}
 
@@ -862,11 +862,13 @@ body.lane-skills #skill-token-box{display:block; margin:0 0 .6rem;}
    question the user asks here — where did the collected skills come from. */
 #skill-source-bar{margin:.15rem 0 .55rem;}
 #skill-source-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0; padding:0; list-style:none;}
-#skill-source-chips li{
+#skill-source-chips li{margin:0; padding:0; list-style:none;}
+#skill-source-chips button{
   padding:.2rem .65rem; border-radius:99px; border:1px solid var(--border);
-  font-size:.72rem; color:var(--text-muted);
+  font-size:.72rem; color:var(--text-muted); background:var(--bg-card); cursor:pointer;
 }
-#skill-source-chips li.is-manual{border-style:dashed; color:var(--text-main);}
+#skill-source-chips button:hover{border-color:var(--accent); color:var(--text-main);}
+#skill-source-chips li.is-manual button{border-style:dashed; color:var(--text-main);}
 #skill-degraded-note{
   margin:.35rem 0 0; font-size:.78rem; line-height:1.5;
   color:var(--text-muted); word-break:break-word;
@@ -875,6 +877,31 @@ body.lane-skills #skill-token-box{display:block; margin:0 0 .6rem;}
 body.lane-skills #skill-source-bar:not([hidden]),
 body.lane-skills #skill-degraded-note:not([hidden]){display:block;}
 body.lane-skills #skill-source-bar{display:block;}
+#poster-template-dock{display:none; margin:0 0 .75rem;}
+body.lane-github #poster-template-dock,
+body.lane-skills #poster-template-dock{display:block;}
+.poster-template-cards{display:flex; gap:.7rem;}
+.poster-template-card{
+  flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:.4rem; align-items:center;
+  padding:.55rem .5rem .65rem; border:1px solid var(--border); border-radius:var(--radius-md);
+  background:var(--bg-card); color:var(--text-muted); cursor:pointer;
+}
+.poster-template-card.active{border-color:var(--accent); color:var(--text-main);}
+.poster-template-preview{
+  width:100%; aspect-ratio:3/4; border-radius:8px; overflow:hidden; position:relative;
+}
+.preview-geometric{
+  background:
+    linear-gradient(134deg, transparent 0 63%, #101F63 63% 100%),
+    linear-gradient(180deg, #101F63 0 8%, transparent 8% 100%),
+    #06155A;
+}
+.preview-toc{
+  background:
+    radial-gradient(circle at 14% 22%, rgba(255,255,255,.22) 0 2px, transparent 2.1px),
+    #ded3c0;
+  box-shadow:inset 0 0 0 2px #b39163, inset 0 0 0 10px rgba(177,149,110,.28);
+}
 body.lane-skills #skill-list:not([hidden]){
   display:flex; flex-direction:column; gap:.35rem;
   margin:.15rem 0 .55rem; padding:0; list-style:none;
@@ -1038,7 +1065,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.3 · 本地服务</span>
+  <span id="service-status">v1.4.4 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1114,6 +1141,19 @@ body.lane-skills #github-render-btn{display:none;}
       <button type="button" id="open-original-btn" disabled>打开原文</button>
     </div>
     <div id="hotspot-pane">
+      <div id="poster-template-dock">
+        <p class="panel-sub">海报模版。切换只改背景和风格，文案模块不变。</p>
+        <div class="poster-template-cards" role="list">
+          <button type="button" class="poster-template-card active" data-template="1" aria-pressed="true">
+            <span class="poster-template-preview preview-geometric" aria-hidden="true"></span>
+            <span>模版一</span>
+          </button>
+          <button type="button" class="poster-template-card" data-template="2" aria-pressed="false">
+            <span class="poster-template-preview preview-toc" aria-hidden="true"></span>
+            <span>模版二</span>
+          </button>
+        </div>
+      </div>
       <div id="skill-search-row">
         <input id="skill-query" type="text" maxlength="200" aria-label="Skill 查找关键词" placeholder="关键词，空格分隔多个：视频 剪辑 字幕">
         <button type="button" id="skill-search-btn">查找</button>
@@ -1175,9 +1215,7 @@ body.lane-skills #github-render-btn{display:none;}
       </div>
       <div id="github-gallery" class="gh-gallery"></div>
       <div class="image-carousel-nav" id="github-gallery-nav" hidden>
-        <button type="button" id="github-gallery-prev">上一张</button>
         <span id="github-gallery-counter" class="image-carousel-counter">0 / 0</span>
-        <button type="button" id="github-gallery-next">下一张</button>
       </div>
       <label class="article-field">小红书标题<input id="github-xhs-title" type="text" readonly value="本周值得关注的github ai项目前10"></label>
       <label class="article-field">小红书正文<textarea id="github-xhs-body" rows="12"></textarea></label>
@@ -1194,9 +1232,7 @@ body.lane-skills #github-render-btn{display:none;}
       </div>
       <div id="skills-gallery" class="gh-gallery"></div>
       <div class="image-carousel-nav" id="skills-gallery-nav" hidden>
-        <button type="button" id="skills-gallery-prev">上一张</button>
         <span id="skills-gallery-counter" class="image-carousel-counter">0 / 0</span>
-        <button type="button" id="skills-gallery-next">下一张</button>
       </div>
       <div id="skills-article">
         <h3 id="skills-title">介绍文</h3>
@@ -1208,14 +1244,12 @@ body.lane-skills #github-render-btn{display:none;}
         <label class="article-field">标题<input id="article-title" type="text"></label>
         <div id="image-picker" hidden>
           <div class="image-picker-head">
-            <p class="panel-sub">原文配图。上一张 / 下一张切换；点击预览可看大图；勾选封面和正文。默认只勾选封面，正文图需另行勾选。</p>
+            <p class="panel-sub">原文配图。点击预览可看大图；放大后点照片左侧上一张、右侧下一张，Esc 退出。勾选封面和正文。默认只勾选封面，正文图需另行勾选。</p>
             <button type="button" id="image-rescan">重新扫描</button>
           </div>
           <div id="image-picker-list"></div>
           <div class="image-carousel-nav" id="image-picker-nav" hidden>
-            <button type="button" id="image-picker-prev">上一张</button>
             <span id="image-picker-counter" class="image-carousel-counter">0 / 0</span>
-            <button type="button" id="image-picker-next">下一张</button>
           </div>
           <p id="image-picker-status" role="status"></p>
         </div>
@@ -1433,6 +1467,7 @@ var state = {
   imagePickerIndex: 0,
   githubGalleryIndex: 0,
   skillsGalleryIndex: 0,
+  posterTemplate: "1",
   creatorUrl: "",
   pendingPublish: false,
   articleDirty: false,
@@ -3292,6 +3327,16 @@ function closeImageLightbox() {
   var preview = $("lightbox-image");
   if (preview) { preview.removeAttribute("src"); }
 }
+function hitLightboxSide(event) {
+  var node = event.currentTarget;
+  var rect = node.getBoundingClientRect();
+  return (event.clientX - rect.left) < rect.width / 2 ? -1 : 1;
+}
+function onLightboxImageClick(event) {
+  event.stopPropagation();
+  if (currentLightboxImages().length < 2) { return; }
+  stepImageLightbox(hitLightboxSide(event));
+}
 
 var articleInputAnchor = null;
 
@@ -3892,6 +3937,7 @@ function renderGithubWeekly(payload) {
   if (savedPalette.main && $("gh-color-main")) { $("gh-color-main").value = savedPalette.main; }
   if (savedPalette.secondary && $("gh-color-secondary")) { $("gh-color-secondary").value = savedPalette.secondary; }
   if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
+  if (visual.poster_template) { setPosterTemplate(visual.poster_template, true); }
   var repos = state.githubWeekly.repos || [];
   var list = $("github-list");
   list.textContent = "";
@@ -4048,6 +4094,26 @@ function githubThemeDefaults(theme) {
     ? {main: "#F3EFE4", secondary: "#FFFCF6", accent: "#5C4FD6"}
     : {main: "#06155A", secondary: "#101F63", accent: "#F3F0E8"};
 }
+function templatePaletteDefaults(template, theme) {
+  if (String(template) === "2") {
+    return {main: "#DED3C0", secondary: "#EBE3D3", accent: "#9F7D4F"};
+  }
+  return githubThemeDefaults(theme);
+}
+function setPosterTemplate(id, keepPalette) {
+  state.posterTemplate = String(id) === "2" ? "2" : "1";
+  document.querySelectorAll("[data-template]").forEach(function (node) {
+    var on = node.getAttribute("data-template") === state.posterTemplate;
+    node.classList.toggle("active", on);
+    node.setAttribute("aria-pressed", String(on));
+  });
+  if (!keepPalette) {
+    var defaults = templatePaletteDefaults(state.posterTemplate, state.githubTheme || "dark");
+    if ($("gh-color-main")) { $("gh-color-main").value = defaults.main; }
+    if ($("gh-color-secondary")) { $("gh-color-secondary").value = defaults.secondary; }
+    if ($("gh-color-accent")) { $("gh-color-accent").value = defaults.accent; }
+  }
+}
 function visualPalette() {
   return {
     main: $("gh-color-main").value,
@@ -4059,7 +4125,7 @@ function setGithubTheme(theme) {
   state.githubTheme = theme === "light" ? "light" : "dark";
   if ($("gh-theme-dark")) { $("gh-theme-dark").classList.toggle("active", state.githubTheme === "dark"); }
   if ($("gh-theme-light")) { $("gh-theme-light").classList.toggle("active", state.githubTheme === "light"); }
-  var defaults = githubThemeDefaults(state.githubTheme);
+  var defaults = templatePaletteDefaults(state.posterTemplate || "1", state.githubTheme);
   if ($("gh-color-main")) { $("gh-color-main").value = defaults.main; }
   if ($("gh-color-secondary")) { $("gh-color-secondary").value = defaults.secondary; }
   if ($("gh-color-accent")) { $("gh-color-accent").value = defaults.accent; }
@@ -4125,7 +4191,7 @@ function renderGithubWeeklyImages() {
     }
     renderGithubGallery();
     // 逐张调用 /api/github-weekly/image；全量 /api/github-weekly/render 仍给脚本用
-    waitApi("github_render", "/api/github-weekly/image", {id: job.id, theme: theme, palette: palette}).then(function (data) {
+    waitApi("github_render", "/api/github-weekly/image", {id: job.id, theme: theme, palette: palette, poster_template: state.posterTemplate || "1"}).then(function (data) {
       if (waitCancelled("github_render")) {
         job.busy = false;
         finishRender();
@@ -4386,8 +4452,13 @@ function renderSkillSourceChips(skills) {
     return;
   }
   order.forEach(function (label) {
-    var chip = el("li", label === "手动粘贴" ? "is-manual" : "", label + " · " + counts[label]);
-    chip.title = "来自" + label + "的 " + counts[label] + " 个 skill";
+    var chip = el("li", label === "手动粘贴" ? "is-manual" : "");
+    var button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label + " " + counts[label];
+    button.title = "点击全选或取消来自" + label + "的 skill";
+    button.addEventListener("click", function () { toggleSkillsBySource(label); });
+    chip.appendChild(button);
     chips.appendChild(chip);
   });
 }
@@ -4436,10 +4507,37 @@ function skillPageUrl(skill) {
   if (sourceId.indexOf("/") >= 0) { return "https://github.com/" + sourceId; }
   return "";
 }
+function collectedSkills(pack) {
+  var rows = [];
+  var seen = {};
+  function add(skill) {
+    if (!skill || skill.gap) { return; }
+    var id = skillIdentity(skill);
+    if (!id || seen[id]) { return; }
+    seen[id] = true;
+    rows.push(skill);
+  }
+  ((pack && pack.skills) || []).forEach(add);
+  ((pack && pack.manual_skills) || []).forEach(add);
+  return rows;
+}
 function selectedSkills(pack) {
-  return ((pack && pack.skills) || []).filter(function (skill) {
-    return skill && !skill.gap && skill.selected !== false;
+  return collectedSkills(pack).filter(function (skill) {
+    return skill && skill.selected !== false;
   });
+}
+function toggleSkillsBySource(label) {
+  var pack = state.skillsPackage || {};
+  var rows = collectedSkills(pack).filter(function (skill) {
+    return skillSourceLabel(skill) === label;
+  });
+  if (!rows.length) { return; }
+  var allOn = rows.every(function (skill) { return skill.selected !== false; });
+  rows.forEach(function (skill) { skill.selected = allOn ? false : true; });
+  if (!(pack.images || []).some(function (image) { return image && image.url; })) {
+    pack.images = queuedSkillImages(pack);
+  }
+  renderSkillPackage(pack);
 }
 function renderSkillList(skills) {
   var list = $("skill-list");
@@ -4493,9 +4591,10 @@ function renderSkillPackage(payload) {
   if (savedPalette.main && $("gh-color-main")) { $("gh-color-main").value = savedPalette.main; }
   if (savedPalette.secondary && $("gh-color-secondary")) { $("gh-color-secondary").value = savedPalette.secondary; }
   if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
-  var skills = (pack.skills || []).filter(function (skill) { return skill && !skill.gap; });
+  var skills = collectedSkills(pack);
   pack.stages = (pack.stages || []).filter(function (stage) { return !!stage; });
   pack.skills = skills;
+  if (pack.visual && pack.visual.poster_template) { setPosterTemplate(pack.visual.poster_template, true); }
   renderSkillSourceChips(skills);
   renderCrawlSources(pack);
   // B1: a degraded source must be visible, not silent — GitHub results still
@@ -4918,14 +5017,14 @@ function searchSkills() {
 }
 function queueSkillImagesForRender() {
   var pack = state.skillsPackage || {};
-  if (!(pack.skills || []).length) { return; }
+  if (!collectedSkills(pack).length) { return; }
   if ((pack.images || []).length) { return; }
   pack.images = queuedSkillImages(pack);
   renderSkillsGallery();
 }
 function renderSkillImages() {
   var pack = state.skillsPackage || {};
-  if (!(pack.skills || []).length) {
+  if (!collectedSkills(pack).length) {
     status("hotspot-status", "还没有收录 skill：先输入关键词查找，或粘贴 skill 链接", "error");
     return;
   }
@@ -4952,6 +5051,7 @@ function renderSkillImages() {
   waitApi("skill_render", "/api/skills/render", {
     theme: state.githubTheme || "dark",
     palette: visualPalette(),
+    poster_template: state.posterTemplate || "1",
     title: String((($("skill-title") || {}).value) || "").trim(),
     selected_ids: selectedSkills(pack).map(skillIdentity)
   }).then(function (data) {
@@ -5177,16 +5277,10 @@ $("original-dialog").addEventListener("cancel", closeOriginal);
 $("generate-btn").addEventListener("click", generate);
 $("save-article-btn").addEventListener("click", saveArticle);
 $("image-rescan").addEventListener("click", rescanImages);
-$("image-picker-prev").addEventListener("click", function () { stepImagePicker(-1); });
-$("image-picker-next").addEventListener("click", function () { stepImagePicker(1); });
-$("github-gallery-prev").addEventListener("click", function () { stepGithubGallery(-1); });
-$("github-gallery-next").addEventListener("click", function () { stepGithubGallery(1); });
-$("skills-gallery-prev").addEventListener("click", function () { stepSkillsGallery(-1); });
-$("skills-gallery-next").addEventListener("click", function () { stepSkillsGallery(1); });
 $("lightbox-close").addEventListener("click", closeImageLightbox);
 $("lightbox-prev").addEventListener("click", function () { stepImageLightbox(-1); });
 $("lightbox-next").addEventListener("click", function () { stepImageLightbox(1); });
-$("lightbox-image").addEventListener("click", closeImageLightbox);
+$("lightbox-image").addEventListener("click", onLightboxImageClick);
 $("image-lightbox").addEventListener("click", function (event) {
   if (event.target === $("image-lightbox") || (event.target.classList && event.target.classList.contains("lightbox-stage"))) {
     closeImageLightbox();
@@ -5195,8 +5289,12 @@ $("image-lightbox").addEventListener("click", function (event) {
 $("image-lightbox").addEventListener("cancel", function () { closeImageLightbox(); });
 document.addEventListener("keydown", function (event) {
   if (!$("image-lightbox").open) { return; }
+  if (event.key === "Escape") { event.preventDefault(); closeImageLightbox(); }
   if (event.key === "ArrowLeft") { event.preventDefault(); stepImageLightbox(-1); }
   if (event.key === "ArrowRight") { event.preventDefault(); stepImageLightbox(1); }
+});
+document.querySelectorAll("[data-template]").forEach(function (node) {
+  node.addEventListener("click", function () { setPosterTemplate(node.getAttribute("data-template")); });
 });
 ["article-title", "article-body"].forEach(function (id) {
   if (id === "article-body") {
@@ -6142,6 +6240,7 @@ class WebApp:
         body = payload if isinstance(payload, dict) else {}
         theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
         palette = parse_palette(body.get("palette"))
+        poster_template = normalize_poster_template(body.get("poster_template"))
         repos = list(snapshot["repos"])
         jobs = list(snapshot.get("images") or []) or build_weekly_render_plan(repos)
         if self.visual_renderer is None:
@@ -6151,6 +6250,7 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
+                poster_template=poster_template,
             )
         else:
             images = self.visual_renderer(
@@ -6159,8 +6259,9 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
+                poster_template=poster_template,
             )
-        visual = {"theme": theme, "palette": palette}
+        visual = {"theme": theme, "palette": palette, "poster_template": poster_template}
         saved = self.database.save_github_weekly(
             str(snapshot["week_start"]),
             repos,
@@ -6630,6 +6731,12 @@ class WebApp:
         body = payload if isinstance(payload, dict) else {}
         theme = "light" if str(body.get("theme") or "").strip().lower() == "light" else "dark"
         palette = parse_palette(body.get("palette")) if body.get("palette") is not None else None
+        stored_visual = snapshot.get("visual") if isinstance(snapshot.get("visual"), dict) else {}
+        poster_template = normalize_poster_template(
+            body.get("poster_template")
+            if body.get("poster_template") is not None
+            else stored_visual.get("poster_template")
+        )
         # The title box travels with the render request so the cover cannot be
         # painted from a stale title the user already replaced.
         if isinstance(body.get("title"), str):
@@ -6700,6 +6807,7 @@ class WebApp:
                 visual_renderer=self.visual_renderer,
                 copy_writer=self._skill_copy_writer(),
                 on_image=on_image,
+                poster_template=poster_template,
             )
         except Exception as exc:
             # Never leave the package parked in "rendering": that phase is what
@@ -6728,7 +6836,11 @@ class WebApp:
             revision,
             {
                 "images": images,
-                "visual": {"theme": theme, "palette": palette or {}},
+                "visual": {
+                    "theme": theme,
+                    "palette": palette or {},
+                    "poster_template": poster_template,
+                },
                 "render_error": "",
             },
             expected_phase="done",
@@ -6746,6 +6858,11 @@ class WebApp:
             raise KeyError(image_id)
         body = payload if isinstance(payload, dict) else {}
         visual = snapshot.get("visual") if isinstance(snapshot.get("visual"), dict) else {}
+        poster_template = normalize_poster_template(
+            body.get("poster_template")
+            if body.get("poster_template") is not None
+            else visual.get("poster_template")
+        )
         if body.get("theme") is not None or body.get("palette") is not None:
             theme = (
                 "light"
@@ -6755,10 +6872,12 @@ class WebApp:
             palette = parse_palette(
                 body.get("palette") if body.get("palette") is not None else visual.get("palette")
             )
-            visual = {"theme": theme, "palette": palette}
+            visual = {"theme": theme, "palette": palette, "poster_template": poster_template}
         else:
             theme = "light" if str(visual.get("theme") or "").strip().lower() == "light" else "dark"
             palette = parse_palette(visual.get("palette"))
+            visual = dict(visual)
+            visual["poster_template"] = poster_template
         if self.visual_renderer is None:
             rendered = render_weekly_visual(
                 list(snapshot["repos"]),
@@ -6766,6 +6885,7 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
+                poster_template=poster_template,
             )
         else:
             rendered = self.visual_renderer(
@@ -6774,6 +6894,7 @@ class WebApp:
                 self.packages_dir / "github-weekly",
                 theme=theme,
                 palette=palette,
+                poster_template=poster_template,
             )
         if not rendered:
             raise ValueError("image_generation_failed")

@@ -52,6 +52,14 @@ def parse_palette(raw: object) -> dict[str, str]:
     return palette
 
 
+def normalize_poster_template(value: object) -> str:
+    """``1`` is the shipped geometric skin; ``2`` is the parchment TOC skin."""
+    text = str(value or "1").strip().lower()
+    if text in {"2", "toc", "template-2", "b"}:
+        return "2"
+    return "1"
+
+
 def resolve_tokens(theme: str = "dark", palette: dict[str, str] | None = None) -> dict[str, Any]:
     tokens = copy.deepcopy(load_tokens())
     name = "light" if str(theme).strip().lower() == "light" else "dark"

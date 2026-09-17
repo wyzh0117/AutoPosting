@@ -2490,6 +2490,7 @@ def render_skill_package(
     visual_renderer: Callable[..., list[dict[str, object]]] | None = None,
     copy_writer: Callable[[list[dict[str, object]]], list[dict[str, object]]] | None = None,
     on_image: Callable[[dict[str, object]], None] | None = None,
+    poster_template: str = "1",
 ) -> list[dict[str, object]]:
     from .visual.weekly import render_weekly_visual
 
@@ -2554,8 +2555,11 @@ def render_skill_package(
                 theme=theme,
                 palette=palette,
                 screenshot_fn=screenshot_fn,
+                poster_template=poster_template,
             )
-        cards = visual_renderer(repos, jobs, images_dir, theme=theme, palette=palette)
+        cards = visual_renderer(
+            repos, jobs, images_dir, theme=theme, palette=palette, poster_template=poster_template
+        )
     else:
         cards = render_weekly_visual(
             repos,
@@ -2571,6 +2575,7 @@ def render_skill_package(
             source="skill 查找器",
             footer="skill 查找器 · 按覆盖阶段整理",
             kicker="SKILL FINDER",
+            poster_template=poster_template,
         )
     images: list[dict[str, object]] = []
     for row in cards:

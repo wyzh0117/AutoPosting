@@ -12,7 +12,7 @@ from .marks import is_author_avatar, resolve_mark
 from .media import fetch_bytes, fetch_data_uri
 from .pipeline import render_page
 from .story import find_readme_logo, load_readme
-from .tokens import default_weekly_palette, resolve_tokens
+from .tokens import default_weekly_palette, normalize_poster_template, resolve_tokens
 
 
 def render_weekly_visual(
@@ -30,6 +30,7 @@ def render_weekly_visual(
     footer: str | None = None,
     kicker: str | None = None,
     issue: str | None = None,
+    poster_template: str = "1",
 ) -> list[dict[str, Any]]:
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,7 @@ def render_weekly_visual(
             job_tokens["canvas"] = {"width": 1080, "height": 1440, "aspect": "3:4"}
         job_tokens["meta"] = dict(job_tokens.get("meta") or {})
         job_tokens["meta"]["template_variant"] = variant
+        job_tokens["meta"]["poster_template"] = normalize_poster_template(poster_template)
         result = render_page(
             payload,
             out_dir=target,
