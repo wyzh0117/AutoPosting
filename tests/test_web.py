@@ -348,7 +348,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.2", payload["version"])
+        self.assertEqual("1.4.3", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1825,14 +1825,14 @@ class IndexPageContractTests(unittest.TestCase):
     def test_skill_result_notes_are_scoped_to_the_skills_lane(self) -> None:
         """The source block and degraded note live in the shared pane, so CSS owns the lane."""
         html = self._index()
-        # 1.4.0 merged the stage chips + gap note into one source block, and the
-        # skill list module is gone entirely.
+        # 1.4.0 merged the stage chips + gap note into one source block.
+        # 1.4.3 puts the collected-skill list back, with checkboxes, below it.
         self.assertIn('id="skill-source-bar"', html)
         self.assertIn('id="skill-source-chips"', html)
         self.assertIn('id="skill-degraded-note"', html)
         self.assertNotIn('id="skill-stage-chips"', html)
         self.assertNotIn('id="skill-gap-note"', html)
-        self.assertNotIn('id="skill-list"', html)
+        self.assertIn('id="skill-list"', html)
         style = html.split("</style>", 1)[0]
         # The whole block is off by default, like every other skill-only block.
         self.assertRegex(
@@ -2044,7 +2044,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.2", html)
+        self.assertIn("1.4.3", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2488,6 +2488,28 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('$("image-picker-prev").addEventListener("click"', html)
         self.assertIn('$("github-gallery-prev").addEventListener("click"', html)
         self.assertIn('$("skills-gallery-prev").addEventListener("click"', html)
+
+    def test_patch_143_skill_selection_list(self) -> None:
+        html = self._index()
+        self.assertLess(html.index('id="skill-source-bar"'), html.index('id="skill-list"'))
+        self.assertLess(html.index('id="skill-list"'), html.index('id="hotspot-list"'))
+        self.assertIn("function renderSkillList", html)
+        self.assertIn("function skillPageUrl", html)
+        self.assertIn("function selectedSkills", html)
+        self.assertIn("function skillIdentity", html)
+        self.assertIn("function toggleSkillIncluded", html)
+        self.assertIn("body.lane-skills #skill-list", html)
+        list_fn = html[html.index("function renderSkillList(") : html.index("function toggleSkillIncluded(")]
+        self.assertIn('type = "checkbox"', list_fn)
+        self.assertIn('target = "_blank"', list_fn)
+        self.assertIn("skillPageUrl", list_fn)
+        queued = html[html.index("function queuedSkillImages(") : html.index("function renderSkillsGallery(")]
+        self.assertIn("selectedSkills", queued)
+        render_fn = html[html.index("function renderSkillImages()") : html.index("function exportSkillImages(")]
+        self.assertIn("selected_ids", render_fn)
+        self.assertIn("selectedSkills", render_fn)
+        pack_fn = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
+        self.assertIn("renderSkillList", pack_fn)
 
     def test_responsive_and_no_external_resources(self) -> None:
         html = self._index()

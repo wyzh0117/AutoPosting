@@ -31,11 +31,13 @@ from .github_weekly import (
 from .image_gen import build_weekly_render_plan
 from .skill_finder import (
     aggregate_skills,
+    apply_skill_selection,
     crawl_sources,
     fetch_manual_hits,
     find_skills,
     merge_manual_hits,
     render_skill_package,
+    skill_identity,
 )
 from .skill_links import parse_skill_links
 from .visual.tokens import parse_palette
@@ -58,7 +60,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -813,7 +815,7 @@ body.lane-skills #article-view,
 body.lane-skills #hook-list{display:none !important;}
 body.lane-github #picked-dock, body.lane-skills #picked-dock { display:none !important; }
 #github-list,#github-studio,#skill-search-row,#skill-source-bar,#skill-source-toggle,#skill-crawl-sources,#skills-studio,
-#skill-degraded-note,#skill-paste-row,#skill-paste-hint,#skill-paste-status,#skill-token-box{display:none;}
+#skill-degraded-note,#skill-paste-row,#skill-paste-hint,#skill-paste-status,#skill-token-box,#skill-list{display:none;}
 body.lane-github #github-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
 body.lane-github #github-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
 body.lane-skills #skill-search-row{display:flex; gap:.5rem; align-items:center; width:100%; margin:.35rem 0 .55rem;}
@@ -873,6 +875,25 @@ body.lane-skills #skill-token-box{display:block; margin:0 0 .6rem;}
 body.lane-skills #skill-source-bar:not([hidden]),
 body.lane-skills #skill-degraded-note:not([hidden]){display:block;}
 body.lane-skills #skill-source-bar{display:block;}
+body.lane-skills #skill-list:not([hidden]){
+  display:flex; flex-direction:column; gap:.35rem;
+  margin:.15rem 0 .55rem; padding:0; list-style:none;
+  max-height:16rem; overflow-y:auto; overscroll-behavior:contain;
+}
+body.lane-skills #skill-list[hidden]{display:none;}
+#skill-list li{
+  display:flex; align-items:center; gap:.55rem;
+  padding:.4rem .65rem;
+  border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--bg-card);
+}
+#skill-list li.is-selected{border-color:rgba(196, 164, 106, 0.45);}
+#skill-list input[type=checkbox]{
+  margin:0; accent-color:var(--accent); width:1rem; height:1rem; flex:0 0 auto;
+}
+#skill-list a{color:var(--accent); font-weight:600; text-decoration:none; min-width:0; word-break:break-word;}
+#skill-list a:hover{text-decoration:underline;}
+#skill-list .skill-source{margin-left:auto; color:var(--text-muted); font-size:.72rem; white-space:nowrap;}
 /* Clicking the shared status line expands the list of configured crawlers. */
 body.lane-skills #skill-source-toggle{
   display:block; width:100%; text-align:left; cursor:pointer;
@@ -1017,7 +1038,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.2 · 本地服务</span>
+  <span id="service-status">v1.4.3 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1117,6 +1138,7 @@ body.lane-skills #github-render-btn{display:none;}
         <ul id="skill-source-chips" aria-label="已收录 skill 的来源"></ul>
         <p id="skill-degraded-note" role="status" hidden></p>
       </div>
+      <ul id="skill-list" hidden aria-label="已收录的 skill"></ul>
       <ul id="hotspot-list"></ul>
       <ul id="github-list"></ul>
       <p id="hotspot-status" role="status" aria-live="polite"></p>
@@ -4399,6 +4421,69 @@ function toggleCrawlSources() {
   state.crawlSourcesOpen = !state.crawlSourcesOpen;
   renderCrawlSources(state.skillsPackage || {});
 }
+function skillIdentity(skill) {
+  var key = String((skill && (skill.source_id || skill.full_name || skill.name)) || "").toLowerCase();
+  var slot = String((skill && (skill.skill_path || skill.name)) || "").toLowerCase();
+  return key + "|" + slot;
+}
+function skillPageUrl(skill) {
+  var explicit = String((skill && (skill.url || skill.html_url)) || "").trim();
+  if (/^https?:\/\//.test(explicit)) { return explicit; }
+  var sourceId = String((skill && (skill.source_id || skill.full_name || skill.name)) || "");
+  if (String((skill && skill.source) || "") === "skills.sh" && sourceId) {
+    return "https://skills.sh/" + sourceId;
+  }
+  if (sourceId.indexOf("/") >= 0) { return "https://github.com/" + sourceId; }
+  return "";
+}
+function selectedSkills(pack) {
+  return ((pack && pack.skills) || []).filter(function (skill) {
+    return skill && !skill.gap && skill.selected !== false;
+  });
+}
+function renderSkillList(skills) {
+  var list = $("skill-list");
+  if (!list) { return; }
+  list.textContent = "";
+  var rows = (skills || []).filter(function (skill) { return skill && !skill.gap; });
+  if (!rows.length) {
+    list.hidden = true;
+    return;
+  }
+  list.hidden = false;
+  rows.forEach(function (skill) {
+    var row = el("li", skill.selected === false ? "" : "is-selected");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = skill.selected !== false;
+    box.setAttribute("aria-label", "选中后生成图片");
+    box.addEventListener("change", function () { toggleSkillIncluded(skill, box.checked); });
+    row.appendChild(box);
+    var url = skillPageUrl(skill);
+    var name = skill.name || skill.source_id || "未命名";
+    if (url) {
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = name;
+      row.appendChild(link);
+    } else {
+      row.appendChild(el("span", "", name));
+    }
+    var source = skillSourceLabel(skill);
+    if (source) { row.appendChild(el("span", "skill-source", source)); }
+    list.appendChild(row);
+  });
+}
+function toggleSkillIncluded(skill, on) {
+  skill.selected = !!on;
+  var pack = state.skillsPackage || {};
+  if (!(pack.images || []).some(function (image) { return image && image.url; })) {
+    pack.images = queuedSkillImages(pack);
+  }
+  renderSkillPackage(pack);
+}
 function renderSkillPackage(payload) {
   state.skillsPackage = payload || state.skillsPackage || {};
   var pack = state.skillsPackage;
@@ -4435,18 +4520,19 @@ function renderSkillPackage(payload) {
   $("skills-title").textContent = userTitle || articleTitle || "介绍文";
   $("skills-body").textContent = articleBody || "查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。";
   $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
+  renderSkillList(skills);
   renderSkillsGallery();
   var images = skillImages();
   $("skills-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
   $("skills-select-all").disabled = !images.length;
-  $("skills-render-btn").disabled = !skills.length;
+  $("skills-render-btn").disabled = !selectedSkills(pack).length;
   renderGithubTokenState(pack);
   if (waitRunning("skill_search")) { paintWait(); }
 }
 function queuedSkillImages(pack) {
   var coverTitle = (pack && (pack.user_title || pack.title)) || "Skill 查找结果";
   var tiles = [{id: "cover", kind: "cover", title: coverTitle, queued: true, selected: true, url: "", file: "cover.png"}];
-  ((pack && pack.skills) || []).forEach(function (skill, index) {
+  selectedSkills(pack).forEach(function (skill, index) {
     var rank = index + 1;
     var name = skill.name || skill.source_id || ("skill-" + rank);
     tiles.push({
@@ -4843,6 +4929,10 @@ function renderSkillImages() {
     status("hotspot-status", "还没有收录 skill：先输入关键词查找，或粘贴 skill 链接", "error");
     return;
   }
+  if (!selectedSkills(pack).length) {
+    status("hotspot-status", "请先勾选要出图的 skill", "error");
+    return;
+  }
   if (waitRunning("skill_render")) { return; }
   var button = $("skills-render-btn");
   if (button) { busy(button, true); }
@@ -4862,7 +4952,8 @@ function renderSkillImages() {
   waitApi("skill_render", "/api/skills/render", {
     theme: state.githubTheme || "dark",
     palette: visualPalette(),
-    title: String((($("skill-title") || {}).value) || "").trim()
+    title: String((($("skill-title") || {}).value) || "").trim(),
+    selected_ids: selectedSkills(pack).map(skillIdentity)
   }).then(function (data) {
     if (waitCancelled("skill_render")) { return; }
     renderSkillPackage(data);
@@ -6548,12 +6639,21 @@ class WebApp:
                 current["user_title"] = title
                 snapshot = self.database.save_skill_finder(current)
         # One aggregate for the whole sheet: searched + pasted, ordered as one
-        # workflow, so the cover and the individual posters describe the same set.
+        # workflow. 生成图片 only receives the rows the user checked.
         aggregated = aggregate_skills(snapshot)
         if not aggregated:
             raise ValueError("skill_package_empty")
+        selected_ids = body.get("selected_ids") if isinstance(body.get("selected_ids"), list) else None
+        chosen = apply_skill_selection(aggregated, selected_ids)
+        if not chosen:
+            raise ValueError("skill_none_selected" if selected_ids is not None else "skill_package_empty")
+        if selected_ids is not None:
+            chosen_ids = {skill_identity(row) for row in chosen}
+            for row in aggregated:
+                row["selected"] = skill_identity(row) in chosen_ids
         snapshot = dict(snapshot)
-        snapshot["skills"] = aggregated
+        snapshot["skills"] = chosen
+        snapshot["manual_skills"] = []
         package_path = Path(str(snapshot.get("package_path") or self.packages_dir.parent / "skills" / "latest"))
         images_dir = package_path / "images"
         http_dir = self.packages_dir / "skills"

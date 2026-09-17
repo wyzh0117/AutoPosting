@@ -32,6 +32,7 @@ from autoposting.skill_finder import (
     _keyword_stage_id,
     _url_path,
     aggregate_skills,
+    apply_skill_selection,
     crawl_sources,
     extract_keywords,
     find_skills,
@@ -39,6 +40,7 @@ from autoposting.skill_finder import (
     fetch_manual_hits,
     render_skill_package,
     reset_skill_finder_state,
+    skill_identity,
     workflow_stages,
 )
 from autoposting.visual import weekly as weekly_visual
@@ -296,6 +298,34 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual([1, 2, 3], [row["rank"] for row in rows])
         self.assertEqual("topic-radar", rows[0]["name"])
 
+    def test_omitted_selection_keeps_every_skill(self) -> None:
+        rows = [
+            {"name": "keep-me", "source_id": "acme/keep-me"},
+            {"name": "also", "source_id": "acme/also", "selected": True},
+        ]
+        picked = apply_skill_selection(rows, None)
+        self.assertEqual(["keep-me", "also"], [row["name"] for row in picked])
+
+    def test_explicit_false_is_dropped_when_ids_omitted(self) -> None:
+        rows = [
+            {"name": "keep-me", "source_id": "acme/keep-me"},
+            {"name": "skip", "source_id": "acme/skip", "selected": False},
+        ]
+        picked = apply_skill_selection(rows, None)
+        self.assertEqual(["keep-me"], [row["name"] for row in picked])
+
+    def test_selected_ids_keep_only_matching_rows(self) -> None:
+        rows = [
+            {"name": "keep-me", "source_id": "acme/keep-me", "skill_path": "SKILL.md"},
+            {"name": "skip", "source_id": "acme/skip", "skill_path": "SKILL.md"},
+        ]
+        picked = apply_skill_selection(rows, [skill_identity(rows[0])])
+        self.assertEqual(["keep-me"], [row["name"] for row in picked])
+
+    def test_empty_selected_ids_returns_nothing(self) -> None:
+        rows = [{"name": "keep-me", "source_id": "acme/keep-me"}]
+        self.assertEqual([], apply_skill_selection(rows, []))
+
     def test_a_pasted_skill_replaces_its_searched_twin(self) -> None:
         snapshot = {
             "skills": [
@@ -459,6 +489,50 @@ class SkillPackageApiTests(unittest.TestCase):
         status, body = self._raw(images[1]["url"])
         self.assertEqual(200, status)
         self.assertTrue(body.startswith(b"\x89PNG"), msg="海报必须能真的下载回来")
+
+    def test_render_honors_selected_ids(self) -> None:
+        status, pasted = self._request(
+            "POST",
+            "/api/skills/paste",
+            {
+                "links": (
+                    "https://skills.sh/genmedia-labs/skills/video-edit\n"
+                    "https://skills.sh/genmedia-labs/skills/ai-image-generation\n"
+                )
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, pasted["count"])
+        chosen = pasted["skills"][0]
+        skipped = pasted["skills"][1]
+        with _OfflineMarks():
+            status, rendered = self._request(
+                "POST",
+                "/api/skills/render",
+                {"theme": "dark", "selected_ids": [skill_identity(chosen)]},
+            )
+        self.assertEqual(200, status, msg=str(rendered))
+        images = rendered["images"]
+        self.assertEqual("cover", images[0]["kind"])
+        self.assertEqual(2, len(images), msg="封面 + 只给勾选的 skill 一张海报")
+        titles = [str(image.get("title") or image.get("id") or "") for image in images]
+        self.assertTrue(any(str(chosen["name"]) in title for title in titles))
+        self.assertFalse(any(str(skipped["name"]) in title for title in titles[1:]))
+        saved_names = [row["name"] for row in rendered["skills"]]
+        self.assertEqual(2, len(saved_names), msg="未勾选的 skill 仍留在列表里，只是不出图")
+
+    def test_render_rejects_empty_selected_ids(self) -> None:
+        status, pasted = self._request(
+            "POST",
+            "/api/skills/paste",
+            {"links": "https://skills.sh/genmedia-labs/skills/video-edit\n"},
+        )
+        self.assertEqual(200, status)
+        status, rendered = self._request(
+            "POST", "/api/skills/render", {"theme": "dark", "selected_ids": []}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("skill_none_selected", rendered.get("error"))
 
     def test_search_endpoint_works_without_a_model(self) -> None:
         status, payload = self._request("POST", "/api/skills/search", {"query": "视频 剪辑"})
@@ -764,12 +838,13 @@ class StageFilingTests(unittest.TestCase):
 class LaneMarkupTests(unittest.TestCase):
     """R3/R4/R6/R7/R8 as they appear in the served page."""
 
-    def test_no_skill_list_module_and_merged_source_block(self) -> None:
-        self.assertNotIn('id="skill-list"', INDEX_HTML)
+    def test_skill_list_and_merged_source_block(self) -> None:
+        self.assertIn('id="skill-list"', INDEX_HTML)
         self.assertNotIn('id="skill-stage-chips"', INDEX_HTML)
         self.assertNotIn('id="skill-gap-note"', INDEX_HTML)
         self.assertIn('id="skill-source-chips"', INDEX_HTML)
         self.assertIn("renderSkillSourceChips", INDEX_HTML)
+        self.assertIn("function renderSkillList", INDEX_HTML)
 
     def test_paste_box_is_a_growing_textarea(self) -> None:
         self.assertIn('<textarea id="skill-links" rows="3"', INDEX_HTML)

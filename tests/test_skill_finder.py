@@ -2661,11 +2661,11 @@ class SkillFinderApiTests(unittest.TestCase):
         self.assertIn('$("skill-paste-btn").addEventListener("click", pasteSkills)', html)
         self.assertIn('$("skill-token-save").addEventListener("click", saveGithubToken)', html)
         self.assertIn('$("skill-token-clear").addEventListener("click", clearGithubToken)', html)
-        # 1.4.0 删掉了 #skill-list / #skill-stage-chips / #skill-gap-note：技能栏现在
-        # 只回答「这些 skill 从哪来」，所以是一排来源 chip（手动粘贴的另带 is-manual
-        # 类），降级说明则挪进同一条来源栏里保留下来。
-        for gone in ('id="skill-list"', 'id="skill-stage-chips"', 'id="skill-gap-note"', "gapReason("):
+        # 1.4.0 删掉了 #skill-stage-chips / #skill-gap-note。1.4.3 把 skill 列表
+        # 加回来，用来勾选出图对象；来源 chip 仍回答「这些 skill 从哪来」。
+        for gone in ('id="skill-stage-chips"', 'id="skill-gap-note"', "gapReason("):
             self.assertNotIn(gone, html, msg=f"{gone} 已从技能栏移除")
+        self.assertIn('id="skill-list"', html)
         self.assertIn('id="skill-source-bar"', html)
         self.assertIn('<ul id="skill-source-chips"', html)
         self.assertIn("function renderSkillSourceChips(", html)

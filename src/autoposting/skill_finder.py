@@ -1353,6 +1353,40 @@ def aggregate_skills(snapshot: dict[str, object] | None) -> list[dict[str, objec
     return rows
 
 
+def skill_identity(skill: dict[str, object]) -> str:
+    """Stable id for the collected-skill checkbox: repo plus skill slot."""
+    return _manual_key(skill)
+
+
+def apply_skill_selection(
+    skills: list[dict[str, object]],
+    selected_ids: list[object] | None,
+) -> list[dict[str, object]]:
+    """Skills that should enter 生成图片.
+
+    ``selected_ids is None`` keeps every row unless it was stored
+    ``selected: False``. An explicit list — including empty — is the
+    current checkbox set and wins over stored flags.
+    """
+    rows = [row for row in skills if isinstance(row, dict)]
+    if selected_ids is None:
+        return [dict(row) for row in rows if row.get("selected") is not False]
+    wanted = {str(item).strip().lower() for item in selected_ids if str(item).strip()}
+    picked: list[dict[str, object]] = []
+    for row in rows:
+        keys = {
+            skill_identity(row),
+            str(row.get("name") or "").lower(),
+            str(row.get("source_id") or "").lower(),
+            str(row.get("full_name") or "").lower(),
+        }
+        if keys & wanted:
+            item = dict(row)
+            item["selected"] = True
+            picked.append(item)
+    return picked
+
+
 def cap_skills(
     skills: list[dict[str, object]],
     stages: list[dict[str, object]],
