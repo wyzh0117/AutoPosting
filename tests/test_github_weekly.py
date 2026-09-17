@@ -264,7 +264,7 @@ class GitHubWeeklyTests(unittest.TestCase):
         self.assertNotIn("主语用「它/你/这个工具」", doc)
         self.assertIn("禁止以「它」", doc)
         self.assertRegex(doc, r"how / scene / audience[^\n]*一条一行")
-        self.assertIn("禁止用省略号截断", doc)
+        self.assertIn("信息密度优先于文采", doc)
 
     def test_enrich_times_out_instead_of_hanging(self) -> None:
         import time
