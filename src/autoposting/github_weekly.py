@@ -1,4 +1,4 @@
-"""GitHub AI weekly ranking: fetch, normalize, and fill a fixed poster template."""
+"""GitHub AI weekly ranking: fetch and normalize repo facts for the poster pipeline."""
 
 from __future__ import annotations
 
@@ -216,87 +216,28 @@ def _repo_record(
         "topics": list(topics),
         "created_at": "",
         "fresh": False,
+        "summary": "",
+        "does": "",
+        "how": "",
+        "audience": "",
+        "scene": "",
+        "enriched": False,
     }
-    record.update(fallback_copy(record))
     return record
 
 
-def fallback_copy(repo: dict[str, object]) -> dict[str, object]:
-    from .visual.adapter import (
-        KIND_AUDIENCE,
-        KIND_DOES,
-        KIND_HOW,
-        KIND_SCENE,
-        capability_line,
-        to_bullets,
-    )
-
-    kind = str(repo.get("kind") or "AI 工具")
-    description = str(repo.get("description") or "").strip()
-    # A caller may already own real per-item copy (the skill lane derives it from
-    # the skill's own text). Only fall back to kind-level boilerplate when a field
-    # is actually empty, otherwise every poster in a lane reads identically.
-    does_items = (
-        to_bullets(repo.get("does") or "")
-        or to_bullets(description)
-        or list(KIND_DOES.get(kind) or ["先看能干什么"])
-    )
-    how_items = to_bullets(repo.get("how") or "") or list(
-        KIND_HOW.get(kind) or ["按自己的任务试一遍", "看能不能省事"]
-    )
-    scene_items = to_bullets(repo.get("scene") or "") or list(
-        KIND_SCENE.get(kind) or ["先拿一个真实小任务试"]
-    )
-    audience_items = to_bullets(repo.get("audience") or "") or list(
-        KIND_AUDIENCE.get(kind) or ["想先看懂再决定要不要用的人"]
-    )
-    return {
-        "summary": capability_line(repo),
-        "does": "\n".join(does_items),
-        "how": "\n".join(how_items),
-        "scene": "\n".join(scene_items),
-        "audience": "\n".join(audience_items),
-        "enriched": False,
-    }
-
-
-def _clip(text: str, limit: int) -> str:
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
-    joined = "\n".join(lines)
-    if limit < 1 or len(joined) <= limit:
-        return joined
-    kept: list[str] = []
-    size = 0
-    for line in lines:
-        extra = len(line) + (1 if kept else 0)
-        if size + extra > limit:
-            break
-        kept.append(line)
-        size += extra
-    return "\n".join(kept) if kept else lines[0]
-
-
 def apply_leaderboard_copy(
-    repos: list[dict[str, object]], items: list[dict[str, object]]
+    repos: list[dict[str, object]], items: object
 ) -> list[dict[str, object]]:
-    by_name = {
-        str(item.get("full_name") or ""): item
-        for item in items
-        if isinstance(item, dict) and item.get("full_name")
-    }
+    from .copy_validate import COPY_FIELDS, validate_copy_items
+
+    by_name = validate_copy_items(repos, items)
     updated: list[dict[str, object]] = []
     for repo in repos:
         copy = dict(repo)
-        incoming = by_name.get(str(repo["full_name"]))
-        if incoming is None:
-            updated.append(copy)
-            continue
-        for field in ("summary", "does", "scene", "how", "audience"):
-            value = incoming.get(field)
-            if isinstance(value, str) and value.strip():
-                copy[field] = _clip(value.strip(), 280 if field == "does" else 160)
+        incoming = by_name[str(repo["full_name"])]
+        for field in COPY_FIELDS:
+            copy[field] = str(incoming[field]).strip()
         copy["enriched"] = True
         updated.append(copy)
     return updated

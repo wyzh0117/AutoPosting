@@ -179,7 +179,7 @@ class GitHubWeeklyTests(unittest.TestCase):
         self.assertFalse(repos[1]["fresh"])
         self.assertFalse(repos[2]["fresh"])
 
-    def test_fallback_copy_and_xhs_layout(self) -> None:
+    def test_fetch_keeps_facts_and_xhs_layout_without_kind_copy(self) -> None:
         repos = fetch_weekly_ai_repos(
             getter=lambda url: TRENDING_HTML if "trending" in url else {"items": []},
             now=datetime(2026, 8, 29, tzinfo=timezone.utc),
@@ -189,18 +189,10 @@ class GitHubWeeklyTests(unittest.TestCase):
         self.assertEqual(XHS_TITLE, title)
         self.assertIn("llm-cli", body)
         self.assertIn("https://github.com/acme/llm-cli", body)
-        self.assertIn(repos[0]["summary"], body)
         self.assertFalse(repos[0]["enriched"])
-        self.assertTrue(repos[0]["summary"])
-        self.assertTrue(repos[0]["does"])
-        self.assertTrue(repos[0]["scene"])
-        self.assertTrue(repos[0]["how"])
-        self.assertNotIn("项目主页", repos[0]["how"])
-        self.assertNotIn("项目主页", repos[0]["summary"])
-        self.assertFalse(str(repos[0]["summary"]).startswith("它"))
-        self.assertIn("给", repos[0]["summary"])
-        self.assertNotIn("tiny LLM CLI", repos[0]["does"])
-        self.assertRegex(repos[0]["does"], r"[\u4e00-\u9fff]")
+        self.assertFalse(str(repos[0].get("summary") or "").strip())
+        self.assertFalse(str(repos[0].get("does") or "").strip())
+        self.assertIn("tiny LLM CLI", str(repos[0].get("description") or ""))
 
     def test_leaderboard_model_only_rewrites_copy_fields(self) -> None:
         repos = [
@@ -236,6 +228,7 @@ class GitHubWeeklyTests(unittest.TestCase):
                             "does": "在终端里直接问模型、跑脚本。",
                             "scene": "本地开发、快速试验提示词。",
                             "how": "clone 后按 README 装好，对着仓库说话。",
+                            "audience": "习惯开终端试验提示词的人。",
                         }
                     ]
                 },
@@ -326,6 +319,7 @@ class GitHubWeeklyTests(unittest.TestCase):
                     "does": "新能力",
                     "scene": "新场景",
                     "how": "新用法",
+                    "audience": "新人群",
                     "url": "https://evil.example",
                     "stars": 1,
                 }
@@ -349,6 +343,9 @@ class GitHubWeeklyTests(unittest.TestCase):
             [
                 {
                     "full_name": "acme/llm-cli",
+                    "summary": "把多个助手按职责排成一条流水线。",
+                    "does": "组织角色一起协作。",
+                    "how": "先定职责再串任务。",
                     "audience": "做架构设计的人\n写技术文档的人\n要快速上手的人",
                     "scene": "本地把开发、内容和运营串成一条流水线\n先用一个真实任务看完整协作",
                 }

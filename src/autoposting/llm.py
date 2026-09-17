@@ -39,7 +39,7 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/1.4.4"
+HTTP_USER_AGENT = "AutoPosting/1.4.5"
 LLM_TIMEOUT_SECONDS = 90
 LEADERBOARD_ENRICH_SECONDS = 25
 MAX_OUTPUT_CHARS = 100_000
@@ -587,7 +587,11 @@ class HermesRunner:
 
 
 class LLMService:
-    """Cached LLM calls behind a per-process lock; failures degrade, never crash."""
+    """Cached LLM calls behind a per-process lock.
+
+    Poster copy and article generation fail fast with LLMError. Translation
+    records per-item status instead of aborting the candidate list.
+    """
 
     def __init__(
         self,
@@ -723,7 +727,11 @@ class LLMService:
         return text
 
     def extract_hook_candidates(self, excerpt: str) -> list[dict[str, str]]:
-        """Optional extra phrases from the article model; never raises."""
+        """Optional extra phrases from the article model.
+
+        Unconfigured models skip this step. A configured model that returns
+        unusable output raises instead of pretending there were no hooks.
+        """
         settings = self.resolve_settings()
         if settings.model == LLM_MODEL or not settings.base_url:
             return []
@@ -736,10 +744,14 @@ class LLMService:
             )
         try:
             parsed = parse_model_json(self._run(prompt, run_settings))
-        except LLMError:
-            return []
+        except LLMError as exc:
+            raise LLMError(
+                "llm_invalid_output",
+                f"LLM_HOOK_FAILED: {exc.reason}",
+                cause_code=exc.code,
+            ) from None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("candidates"), list):
-            return []
+            raise LLMError("llm_invalid_output", 'LLM_HOOK_FAILED: missing field "candidates"')
         allowed = {"org", "program", "person", "other"}
         found: list[dict[str, str]] = []
         for item in parsed["candidates"]:
@@ -967,22 +979,28 @@ class LLMService:
             "error_reason": "缓存中的翻译结果无效",
         }
 
+    def _require_copy_model(self) -> LLMSettings:
+        from .copy_validate import enrichment_error
+
+        settings = self.resolve_settings()
+        if settings.model == LLM_MODEL:
+            raise enrichment_error("model not configured")
+        if self._injected_command_runner:
+            return validate_llm_settings(
+                settings.model, settings.provider, settings.effort, "", ""
+            )
+        if not settings.base_url:
+            raise enrichment_error("model not configured")
+        return settings
+
     def enrich_github_repos(self, repos: list[dict[str, object]]) -> list[dict[str, object]]:
-        """Rewrite only summary/does/scene/how. Names, stars, URLs stay template-owned."""
+        """Rewrite only summary/does/scene/how/audience. Names, stars, URLs stay facts."""
+        from .copy_validate import enrichment_error
         from .github_weekly import apply_leaderboard_copy
 
         if not repos:
             return repos
-        settings = self.resolve_settings()
-        if settings.model == LLM_MODEL:
-            return repos
-        run_settings = settings
-        if self._injected_command_runner:
-            run_settings = validate_llm_settings(
-                settings.model, settings.provider, settings.effort, "", ""
-            )
-        elif not settings.base_url:
-            return repos
+        run_settings = self._require_copy_model()
         payload = [
             {
                 "full_name": repo["full_name"],
@@ -998,34 +1016,30 @@ class LLMService:
             f"{load_leaderboard_copy_prompt()}\n"
             f"数据：\n{json.dumps(payload, ensure_ascii=False)}"
         )
-        parsed = parse_model_json(
-            self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
-        )
-        items = parsed.get("items") if isinstance(parsed, dict) else None
-        if not isinstance(items, list):
-            raise LLMError("llm_invalid_output", "榜单结果缺少 items 数组")
-        return apply_leaderboard_copy(repos, [item for item in items if isinstance(item, dict)])
+        try:
+            parsed = parse_model_json(
+                self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
+            )
+        except LLMError as exc:
+            if exc.code == "llm_timeout":
+                raise
+            raise enrichment_error(exc.reason, cause_code=exc.code) from None
+        if not isinstance(parsed, dict):
+            raise enrichment_error("result is not a JSON object")
+        return apply_leaderboard_copy(repos, parsed.get("items"))
 
     def enrich_skill_repos(self, repos: list[dict[str, object]]) -> list[dict[str, object]]:
         """Skills share the weekly copy pipeline: same fields, skill-lane prompt.
 
-        Names, install counts, URLs, stages and ranking stay template-owned; only
-        summary/does/scene/how/audience are rewritten.
+        Names, install counts, URLs, stages and ranking stay facts; only
+        summary/does/scene/how/audience come from the model.
         """
+        from .copy_validate import enrichment_error
         from .github_weekly import apply_leaderboard_copy
 
         if not repos:
             return repos
-        settings = self.resolve_settings()
-        if settings.model == LLM_MODEL:
-            return repos
-        run_settings = settings
-        if self._injected_command_runner:
-            run_settings = validate_llm_settings(
-                settings.model, settings.provider, settings.effort, "", ""
-            )
-        elif not settings.base_url:
-            return repos
+        run_settings = self._require_copy_model()
         payload = [
             {
                 "full_name": repo.get("full_name") or repo.get("name") or "",
@@ -1042,13 +1056,17 @@ class LLMService:
             f"{load_skill_copy_prompt()}\n"
             f"数据：\n{json.dumps(payload, ensure_ascii=False)}"
         )
-        parsed = parse_model_json(
-            self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
-        )
-        items = parsed.get("items") if isinstance(parsed, dict) else None
-        if not isinstance(items, list):
-            raise LLMError("llm_invalid_output", "skill 文案结果缺少 items 数组")
-        return apply_leaderboard_copy(repos, [item for item in items if isinstance(item, dict)])
+        try:
+            parsed = parse_model_json(
+                self._run_deadline(prompt, run_settings, LEADERBOARD_ENRICH_SECONDS)
+            )
+        except LLMError as exc:
+            if exc.code == "llm_timeout":
+                raise
+            raise enrichment_error(exc.reason, cause_code=exc.code) from None
+        if not isinstance(parsed, dict):
+            raise enrichment_error("result is not a JSON object")
+        return apply_leaderboard_copy(repos, parsed.get("items"))
 
     def generate_article(
         self,

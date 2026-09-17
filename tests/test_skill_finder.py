@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from autoposting.db import Database
+from copy_fixtures import stub_copy_writer
 from autoposting.llm import LLMError
 from autoposting.models import Source
 from autoposting.skill_finder import (
@@ -2066,27 +2067,15 @@ class SkillPosterCopyTests(unittest.TestCase):
         self.assertIn("图像", kinds)
         self.assertEqual(len(set(kinds)), len(kinds))
 
-    def test_every_poster_board_is_pairwise_distinct(self) -> None:
-        from autoposting.visual.adapter import project_from_repo
-
-        payloads = [project_from_repo(row) for row in skills_as_repos(self.SKILLS)]
-        self.assertEqual(len(self.SKILLS), len(payloads))
-        for field in ("category", "keyMessage", "features", "how", "audience", "scene"):
-            values = [json.dumps(payload[field], ensure_ascii=False) for payload in payloads]
-            self.assertEqual(
-                len(values),
-                len(set(values)),
-                msg=f"{field} 在两个 skill 之间完全相同：{values}",
-            )
-        for payload in payloads:
-            self.assertTrue(str(payload["keyMessage"]).strip())
-            self.assertTrue(payload["features"])
-            self.assertTrue(payload["how"])
-            self.assertTrue(payload["audience"])
-            # No English may leak onto a Chinese poster.
-            for board in ("features", "how", "audience", "scene"):
-                for row in payload[board]:
-                    self.assertRegex(str(row), r"[\u4e00-\u9fff]", msg=f"{board} 出现非中文条目 {row!r}")
+    def test_facts_records_do_not_prefill_poster_boards(self) -> None:
+        rows = skills_as_repos(self.SKILLS)
+        self.assertEqual(len(self.SKILLS), len(rows))
+        kinds = [str(row["kind"]) for row in rows]
+        self.assertEqual(len(set(kinds)), len(kinds))
+        for row in rows:
+            self.assertFalse(row.get("enriched"))
+            self.assertFalse(str(row.get("summary") or "").strip())
+            self.assertFalse(str(row.get("does") or "").strip())
 
     def test_render_plan_carries_no_github_weekly_branding(self) -> None:
         import re
@@ -2108,7 +2097,9 @@ class SkillPosterCopyTests(unittest.TestCase):
                 ],
                 "skills": self.SKILLS[:2],
             }
-            cards = render_skill_package(snapshot, out, screenshot_fn=fake_shot)
+            cards = render_skill_package(
+                snapshot, out, screenshot_fn=fake_shot, copy_writer=stub_copy_writer
+            )
             self.assertEqual(len(self.SKILLS[:2]) + 1, len(cards))
             self.assertEqual("cover", cards[0]["kind"])
             for html_path in out.glob("*.html"):
@@ -2126,69 +2117,23 @@ class SkillPosterCopyTests(unittest.TestCase):
             # page number total is the real package size, not a hardcoded 11
             self.assertIn("02 / 03", poster)
 
-    def test_degenerate_inputs_still_produce_distinct_boards(self) -> None:
-        """Adversarial B5: a batch must never print the same board twice.
-
-        Real searches can return several skills with the same capability, the
-        same stage, or even the same source description. Every poster still has
-        to be tellable apart without inventing capabilities.
-        """
-        from autoposting.visual.adapter import project_from_repo
-
-        cases = {
-            "english-only same category": [
-                {
-                    "name": f"video-tool-{i}",
-                    "source_id": f"acme/video-tool-{i}",
-                    "installs": 100 + i,
-                    "stage_name": f"阶段{i}",
-                    "description": "video editing automation tool",
-                    "skill_excerpt": "Use this to edit videos.",
-                }
-                for i in range(1, 6)
-            ],
-            "no stage and no description": [
-                {"name": f"skill-{i}", "source_id": f"acme/skill-{i}", "installs": 10}
-                for i in range(1, 6)
-            ],
-            "identical description, different stages": [
-                {
-                    "name": f"dup-{i}",
-                    "source_id": f"acme/dup-{i}",
-                    "installs": 50,
-                    "stage_name": f"环节{i}",
-                    "description": "批量生成视频封面",
-                }
-                for i in range(1, 4)
-            ],
-            "identical description and stage": [
-                {
-                    "name": f"same-{i}",
-                    "source_id": f"acme/same-{i}",
-                    "installs": 50,
-                    "stage_name": "封面",
-                    "description": "批量生成视频封面",
-                }
-                for i in range(1, 6)
-            ],
-        }
-        for label, skills in cases.items():
-            with self.subTest(case=label):
-                payloads = [project_from_repo(row) for row in skills_as_repos(skills)]
-                self.assertEqual(len(skills), len(payloads))
-                for field in ("keyMessage", "features", "how", "audience", "scene"):
-                    values = [json.dumps(payload[field], ensure_ascii=False) for payload in payloads]
-                    self.assertEqual(
-                        len(values), len(set(values)), msg=f"{label}: {field} 重复 —— {values}"
-                    )
-                for payload in payloads:
-                    # Labels may be spliced in, but no label may stack twice.
-                    joined = " ".join(
-                        str(item) for board in ("features", "how", "audience", "scene")
-                        for item in payload[board]
-                    )
-                    self.assertNotIn("这一环，接手", joined)
-                    self.assertLessEqual(joined.count("这一步要用的材料备齐"), 1)
+    def test_degenerate_inputs_do_not_invent_template_boards(self) -> None:
+        skills = [
+            {
+                "name": f"same-{i}",
+                "source_id": f"acme/same-{i}",
+                "installs": 50,
+                "stage_name": "封面",
+                "description": "批量生成视频封面",
+            }
+            for i in range(1, 4)
+        ]
+        rows = skills_as_repos(skills)
+        self.assertEqual(3, len(rows))
+        for row in rows:
+            self.assertFalse(str(row.get("summary") or "").strip())
+            self.assertNotIn("接手", str(row.get("does") or ""))
+            self.assertNotIn("这一步要用的材料备齐", str(row.get("how") or ""))
 
     def test_install_count_is_the_popularity_signal(self) -> None:
         rows = skills_as_repos(self.SKILLS[:1])
@@ -2206,7 +2151,8 @@ class SkillPosterCopyTests(unittest.TestCase):
             return [
                 dict(repo, summary="给做短视频的人，要交片的时候，把粗剪先做出来。",
                      does="按脚本排好素材。\n切出可用片段。", how="把素材放进去跑一遍。",
-                     audience="一个人管多个账号的运营。", scene="素材堆着又要赶交期的时候。")
+                     audience="一个人管多个账号的运营。", scene="素材堆着又要赶交期的时候。",
+                     enriched=True)
                 for repo in repos
             ]
 
@@ -2252,6 +2198,7 @@ class SkillPosterCopyTests(unittest.TestCase):
                 },
                 out,
                 screenshot_fn=fake_shot,
+                copy_writer=stub_copy_writer,
             )
             self.assertEqual(4, len(first), msg="封面 + 3 张海报；gap 行不该出图")
             self.assertFalse(
@@ -2274,6 +2221,7 @@ class SkillPosterCopyTests(unittest.TestCase):
                 {"title": "t", "stages": [], "skills": self.SKILLS[:1]},
                 out,
                 screenshot_fn=fake_shot,
+                copy_writer=stub_copy_writer,
             )
             self.assertEqual(2, len(second))
             for stale_id in stale_ids:
@@ -2284,7 +2232,7 @@ class SkillPosterCopyTests(unittest.TestCase):
                 sorted(path.name for path in out.iterdir()),
             )
 
-    def test_copy_writer_failure_keeps_template_copy(self) -> None:
+    def test_copy_writer_failure_stops_render(self) -> None:
         import tempfile
 
         def boom(repos: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -2295,13 +2243,14 @@ class SkillPosterCopyTests(unittest.TestCase):
                 png_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
                 return png_path
 
-            cards = render_skill_package(
-                {"title": "t", "stages": [], "skills": self.SKILLS[:1]},
-                Path(raw),
-                screenshot_fn=fake_shot,
-                copy_writer=boom,
-            )
-        self.assertEqual(2, len(cards))
+            with self.assertRaises(LLMError) as raised:
+                render_skill_package(
+                    {"title": "t", "stages": [], "skills": self.SKILLS[:1]},
+                    Path(raw),
+                    screenshot_fn=fake_shot,
+                    copy_writer=boom,
+                )
+        self.assertEqual("llm_api_failed", raised.exception.code)
 
 
 class ManualSkillPasteTests(unittest.TestCase):
@@ -2433,7 +2382,9 @@ class ManualSkillPasteTests(unittest.TestCase):
             png_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
             return png_path
 
-        cards = render_skill_package(result, self.root, screenshot_fn=fake_shot)
+        cards = render_skill_package(
+            result, self.root, screenshot_fn=fake_shot, copy_writer=stub_copy_writer
+        )
         self.assertEqual(2, len(cards), msg="封面 + 每个收录 skill 一张项目卡")
         self.assertEqual("cover", cards[0]["kind"])
         self.assertEqual("poster", cards[1]["kind"])
@@ -2596,6 +2547,9 @@ class SkillFinderApiTests(unittest.TestCase):
             github_fetcher=github_get,
             credential_store=self.credentials,
         )
+        from copy_fixtures import attach_stub_poster_copy
+
+        attach_stub_poster_copy(self.app)
         self.server = create_server(self.app, "127.0.0.1", 0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

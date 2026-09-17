@@ -21,6 +21,7 @@ from .llm import (
     _has_cjk,
     validate_chat_messages,
 )
+from .copy_validate import enrichment_error, require_enriched_copy
 from .github_weekly import (
     XHS_TITLE,
     build_xhs_copy,
@@ -60,7 +61,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -1065,7 +1066,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.4 · 本地服务</span>
+  <span id="service-status">v1.4.5 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -6221,11 +6222,8 @@ class WebApp:
         repos = fetch_weekly_ai_repos(getter=self.github_fetcher)
         model_used = ""
         if self._leaderboard_model_configured:
-            try:
-                repos = self.leaderboard_service.enrich_github_repos(repos)
-                model_used = self.leaderboard_service.settings.model
-            except LLMError:
-                model_used = ""
+            repos = self.leaderboard_service.enrich_github_repos(repos)
+            model_used = self.leaderboard_service.settings.model
         title, body = build_xhs_copy(repos)
         images = build_weekly_render_plan(repos)
         saved = self.database.save_github_weekly(
@@ -6243,6 +6241,8 @@ class WebApp:
         poster_template = normalize_poster_template(body.get("poster_template"))
         repos = list(snapshot["repos"])
         jobs = list(snapshot.get("images") or []) or build_weekly_render_plan(repos)
+        if any(str(job.get("kind") or "") != "cover" for job in jobs):
+            require_enriched_copy(repos)
         if self.visual_renderer is None:
             images = render_weekly_visual(
                 repos,
@@ -6276,7 +6276,7 @@ class WebApp:
     def _skill_copy_writer(self):
         """B5: skill posters go through the same copy layer as the weekly lane."""
         if not self._leaderboard_model_configured:
-            return None
+            raise enrichment_error("model not configured")
         return self.leaderboard_service.enrich_skill_repos
 
     def _skill_llm(self):
@@ -6856,6 +6856,8 @@ class WebApp:
         match = next((item for item in images if str(item.get("id")) == image_id), None)
         if match is None:
             raise KeyError(image_id)
+        if str(match.get("kind") or "") != "cover":
+            require_enriched_copy(list(snapshot.get("repos") or []))
         body = payload if isinstance(payload, dict) else {}
         visual = snapshot.get("visual") if isinstance(snapshot.get("visual"), dict) else {}
         poster_template = normalize_poster_template(

@@ -23,6 +23,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import unquote
 
+from copy_fixtures import attach_stub_poster_copy, stub_copy_writer
 from autoposting.db import Database
 from autoposting.models import Source
 from autoposting.skill_finder import (
@@ -384,7 +385,12 @@ class AggregateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             out = Path(raw)
             with _OfflineMarks():
-                cards = render_skill_package(snapshot, out, screenshot_fn=_offline_render())
+                cards = render_skill_package(
+                    snapshot,
+                    out,
+                    screenshot_fn=_offline_render(),
+                    copy_writer=stub_copy_writer,
+                )
             kinds = [(card["id"], card["kind"]) for card in cards]
             self.assertEqual([("cover", "cover")], [row for row in kinds if row[1] == "cover"])
             self.assertEqual(2, len([row for row in kinds if row[1] == "poster"]))
@@ -422,6 +428,7 @@ class SkillPackageApiTests(unittest.TestCase):
             credential_store=_MemoryCredentialStore(),
         )
         self.app.skill_screenshot = _offline_render()
+        attach_stub_poster_copy(self.app)
         self.server = create_server(self.app, "127.0.0.1", 0)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"

@@ -23,8 +23,8 @@ _LOG = logging.getLogger(__name__)
 
 # Skill-domain capability categories, tried BEFORE the GitHub-weekly KIND_RULES
 # so a skill is classified by what it does rather than by where it was found.
-# The old code wrote ``kind = source``, which made every poster print "GitHub"
-# and made every KIND_* lookup miss, so all five text boards came out identical.
+# The old code wrote ``kind = source``, which collapsed every skill into one
+# category label. kind is a capability category, never the crawl source.
 SKILL_KIND_RULES: tuple[tuple[str, str], ...] = (
     # Compound intents first: a "video thumbnail" skill is an image tool.
     ("封面", "图像"), ("缩略图", "图像"), ("thumbnail", "图像"), ("配图", "图像"),
@@ -1629,20 +1629,6 @@ def write_package(
     return folder
 
 
-def _clip_bullet(text: str, limit: int) -> str:
-    value = " ".join((text or "").split())
-    if len(value) <= limit:
-        return value
-    return value[: limit - 1].rstrip() + "…"
-
-
-def _cjk_bullets(text: object, limit: int = 4) -> list[str]:
-    """Chinese bullets only — an English SKILL.md must not leak onto a poster."""
-    from .visual.adapter import to_bullets
-
-    return [piece for piece in to_bullets(text, limit=limit) if _has_cjk(piece)]
-
-
 def _skill_kind(record: dict[str, object]) -> str:
     # Deliberately excludes the coverage stage: "剪辑" is a pipeline position,
     # not evidence of what the skill does, and including it collapsed every
@@ -1661,68 +1647,6 @@ def _skill_kind(record: dict[str, object]) -> str:
     return infer_kind("", _as_str_list(record.get("topics")), blob)
 
 
-def _skill_boards(record: dict[str, object]) -> dict[str, str]:
-    """Fill 一句话看懂 / 做什么 / 如何实现 / 适合哪些人 / 使用场景.
-
-    A skill's own Chinese text always wins. When it has none (most GitHub skills
-    ship an English SKILL.md), the fallback is the *category* copy for what the
-    skill does, with the coverage stage spliced in so two skills in the same
-    category still read differently.
-    """
-    from .visual.adapter import KIND_AUDIENCE, KIND_HOW
-
-    kind = str(record.get("kind") or "")
-    stage = str(record.get("stage_name") or "")
-    # The stage is the natural label for "which step is this", but a record with
-    # no stage still has a unique name; without a marker every board would fall
-    # back to identical category copy.
-    where = stage or str(record.get("name") or "")
-    excerpt = str(record.get("skill_excerpt") or "")
-    description = str(record.get("description") or "")
-    own = _cjk_bullets(excerpt) or _cjk_bullets(description)
-
-    summary = _clip_bullet(str(record.get("summary") or ""), 72)
-    if not _has_cjk(summary) or len(summary) < 12:
-        audience_hint = next(iter(KIND_AUDIENCE.get(kind) or []), "")
-        owner = str(audience_hint) or (f"要自己做「{where}」的人" if where else "想把这一步做顺的人")
-        when = f"{where}这活要反复做" if where else "这一步要反复做"
-        summary = _clip_bullet(
-            f"给{owner}，{when}的时候，用 {record.get('name') or '它'} 把这一步先跑通。",
-            72,
-        )
-
-    from .visual.adapter import KIND_DOES
-
-    does = str(record.get("does") or "")
-    if not _cjk_bullets(does):
-        if own:
-            does = "\n".join(own[:4])
-        else:
-            rows = [str(item) for item in (KIND_DOES.get(kind) or [])]
-            if rows and where:
-                rows = [f"接手{where}这一环，{_strip_lead_verb(rows[0])}"] + rows[1:]
-            does = "\n".join(rows[:3])
-
-    how = str(record.get("how") or "")
-    if not _cjk_bullets(how):
-        rows = [str(item) for item in (KIND_HOW.get(kind) or [])]
-        if rows and where:
-            rows = [f"先把「{where}」这一步要用的材料备齐"] + rows[1:]
-        how = "\n".join(rows[:3])
-
-    audience = str(record.get("audience") or "")
-    if not _cjk_bullets(audience):
-        rows = [str(item) for item in (KIND_AUDIENCE.get(kind) or [])]
-        if rows and where:
-            rows = [f"{rows[0]}（正在补「{where}」这一环）"]
-        audience = "\n".join(rows[:2])
-
-    scene = where
-    if scene:
-        scene = f"在「{scene}」这一步要反复做的时候"
-    return {"summary": summary, "does": does, "how": how, "audience": audience, "scene": scene}
-
-
 def _skill_url(skill: dict[str, object], source_id: str) -> str:
     explicit = str(skill.get("url") or skill.get("html_url") or "").strip()
     if explicit.startswith(("http://", "https://")):
@@ -1734,69 +1658,13 @@ def _skill_url(skill: dict[str, object], source_id: str) -> str:
     return f"https://{SKILLS_SH_SOURCE}/"
 
 
-def _strip_lead_verb(text: str) -> str:
-    """Drop a leading 接手 so a spliced label cannot produce 「接手…这一环，接手…」."""
-    piece = (text or "").strip().rstrip("。")
-    return piece[2:].lstrip("，,") if piece.startswith("接手") else piece
-
-
-def _amend_board(record: dict[str, object], field: str, marker: str) -> None:
-    """Rewrite the first line of one board so it names where this skill belongs."""
-    lines = str(record.get(field) or "").splitlines()
-    if not lines:
-        return
-    first = lines[0]
-    # Idempotent: drop an earlier splice before adding this marker, so escalating
-    # from stage to name never stacks two labels on one line.
-    if field == "does":
-        if first.startswith("接手") and "这一环，" in first:
-            first = first.split("这一环，", 1)[1]
-        lines[0] = f"接手{marker}这一环，{_strip_lead_verb(first)}"
-    elif field == "how":
-        if first.startswith("先把「") and "」这一步要用的材料备齐" in first:
-            first = ""
-        lines[0] = f"先把「{marker}」这一步要用的材料备齐" + (f"，{first}" if first else "")
-    elif field == "audience":
-        lines[0] = f"{first.split('（')[0]}（对应 {marker}）"
-    elif field == "scene":
-        lines[0] = f"在「{marker}」这一步要反复做的时候"
-    record[field] = "\n".join(lines)
-
-
-def _disambiguate_boards(records: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Keep every board distinguishable even when source material is identical.
-
-    Two collected skills can genuinely carry the same description, and a batch can
-    be rendered from records that share a stage. A board must never print the same
-    line on two posters, so a repeated board is amended with the record's stage
-    first and, if that is still ambiguous, with its (unique) name. Only the label
-    changes: no capability is invented.
-    """
-    for field in ("does", "how", "audience", "scene"):
-        for marker_key in ("stage_name", "name"):
-            groups: dict[str, list[dict[str, object]]] = {}
-            for record in records:
-                value = str(record.get(field) or "").strip()
-                if value:
-                    groups.setdefault(value, []).append(record)
-            duplicates = [group for group in groups.values() if len(group) > 1]
-            if not duplicates:
-                break
-            for group in duplicates:
-                for record in group:
-                    marker = str(record.get(marker_key) or "").strip()
-                    if marker:
-                        _amend_board(record, field, marker)
-    return records
-
-
 def skills_as_repos(skills: Iterable[dict[str, object]]) -> list[dict[str, object]]:
-    """Turn collected skills into render-ready records for the poster pipeline.
+    """Turn collected skills into fact records for the poster pipeline.
 
-    ``kind`` is the capability category (never the source), and every text board
-    is derived from the skill's own material with a category-specific fallback.
+    ``kind`` is the capability category (never the source). Copy fields stay
+    empty until the LLM enrich step fills them.
     """
-    from .github_weekly import fallback_copy, format_stars
+    from .github_weekly import format_stars
 
     repos: list[dict[str, object]] = []
     for index, skill in enumerate(skills, start=1):
@@ -1831,11 +1699,8 @@ def skills_as_repos(skills: Iterable[dict[str, object]]) -> list[dict[str, objec
             "enriched": False,
         }
         record["kind"] = _skill_kind(record)
-        record.update(_skill_boards(record))
-        # Category copy only fills a board the skill itself could not supply.
-        record.update(fallback_copy(record))
         repos.append(record)
-    return _disambiguate_boards(repos)
+    return repos
 
 
 def _skill_groups(
@@ -2503,16 +2368,18 @@ def render_skill_package(
     repos = skills_as_repos(skills)
     _prune_stale_pages(images_dir, {str(job["id"]) for job in _plan_jobs(snapshot, repos)})
     if copy_writer is not None:
-        # Skill posters share the weekly copy layer; a model failure keeps the
-        # template copy instead of dropping the render (same policy as weekly).
-        try:
-            enriched = copy_writer(repos)
-        except LLMError:
-            enriched = None
-        if isinstance(enriched, list) and enriched and all(
+        from .copy_validate import require_enriched_copy
+
+        enriched = copy_writer(repos)
+        if not isinstance(enriched, list) or not enriched or not all(
             isinstance(row, dict) for row in enriched
         ):
-            repos = enriched
+            raise LLMError(
+                "llm_enrichment_failed",
+                "LLM_ENRICHMENT_FAILED: enrichment not completed",
+            )
+        require_enriched_copy(enriched)
+        repos = enriched
     cover_title = str(snapshot.get("user_title") or "").strip() or str(
         snapshot.get("title") or "Skill 查找结果"
     )

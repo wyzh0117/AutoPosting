@@ -228,6 +228,11 @@ class BrandAndIssueTests(unittest.TestCase):
                 "name": "alpha",
                 "kind": "CLI",
                 "description": "命令行调用模型",
+                "summary": "在终端里直接调用模型拿结果。",
+                "does": "把提示词发给模型。",
+                "how": "在项目目录执行命令。",
+                "audience": "习惯开终端的人。",
+                "scene": "需要对着仓库立刻问模型的时候。",
                 "url": "https://github.com/example/alpha",
             },
             issue=issue,
@@ -267,6 +272,7 @@ class BrandAndIssueTests(unittest.TestCase):
                 "does": "动态 sentinel",
                 "how": "动态 sentinel",
                 "scene": "动态 sentinel",
+                "audience": "相关的人",
                 "url": "https://github.com/acme/sentinel",
             }
             for index in range(1, 7)
@@ -309,8 +315,30 @@ class BrandAndIssueTests(unittest.TestCase):
         temp = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(temp, ignore_errors=True))
         repos = [
-            {"rank": 1, "name": "repo-one", "kind": "CLI", "description": "one", "url": "https://github.com/acme/repo-one"},
-            {"rank": 2, "name": "repo-two", "kind": "CLI", "description": "two", "url": "https://github.com/acme/repo-two"},
+            {
+                "rank": 1,
+                "name": "repo-one",
+                "kind": "CLI",
+                "summary": "第一个项目的一句话。",
+                "does": "完成第一项工作。",
+                "how": "按说明执行。",
+                "audience": "需要这一步的人。",
+                "scene": "要做这一步的时候。",
+                "description": "one",
+                "url": "https://github.com/acme/repo-one",
+            },
+            {
+                "rank": 2,
+                "name": "repo-two",
+                "kind": "CLI",
+                "summary": "第二个项目的一句话。",
+                "does": "完成第二项工作。",
+                "how": "按说明执行。",
+                "audience": "需要这一步的人。",
+                "scene": "要做这一步的时候。",
+                "description": "two",
+                "url": "https://github.com/acme/repo-two",
+            },
         ]
         jobs = [
             {"id": "legacy-one", "kind": "poster", "title": "repo-one"},
@@ -331,6 +359,7 @@ class BrandAndIssueTests(unittest.TestCase):
                 "rank": 2,
                 "name": "long-poster",
                 "kind": "Agent",
+                "summary": long_text,
                 "description": long_text,
                 "does": long_text,
                 "how": long_text,
@@ -497,11 +526,8 @@ class PosterCopyTests(unittest.TestCase):
         self.assertFalse(payload.get("tagline"))
         self.assertFalse(payload.get("logo"))
         self.assertGreaterEqual(len(payload["features"]), 2)
-        self.assertTrue(all(len(item) <= 36 for item in payload["features"]))
-        self.assertTrue(payload["how"])
-        self.assertNotIn("项目主页", " ".join(payload["how"]))
+        self.assertEqual(["开源仓库，安装步骤和文档在项目主页。"], payload["how"])
         self.assertGreaterEqual(len(payload["scene"]), 1)
-        self.assertGreaterEqual(len(payload["audience"]), 1)
 
     def test_long_does_becomes_short_bullets(self) -> None:
         from autoposting.visual.adapter import to_bullets
@@ -543,89 +569,29 @@ class PosterCopyTests(unittest.TestCase):
         self.assertTrue(all("…" not in item and "..." not in item for item in items))
         self.assertTrue(any("带动效" in item for item in items))
 
-    def test_clipped_ellipsis_lines_are_dropped(self) -> None:
+    def test_adapter_keeps_ellipsis_and_english_and_it_led_lines(self) -> None:
         from autoposting.visual.adapter import project_from_repo, to_bullets
 
-        self.assertEqual([], to_bullets("做带动效的演…"))
-        payload = project_from_repo(
-            {
-                "rank": 1,
-                "name": "demo-webui",
-                "kind": "WebUI",
-                "scene": "做带动效的演…\n给不会命令行的同事试用",
-            }
+        self.assertEqual(["做带动效的演…"], to_bullets("做带动效的演…"))
+        self.assertEqual(
+            ["Agent skill for beautiful", "verifiable architecture"],
+            to_bullets("Agent skill for beautiful, verifiable architecture"),
         )
-        self.assertTrue(payload["scene"])
-        self.assertTrue(all("…" not in item and "..." not in item for item in payload["scene"]))
-        self.assertTrue(any("同事" in item or "命令行" in item for item in payload["scene"]))
-
-    def test_kind_does_fallback_uses_complete_sentences(self) -> None:
-        from autoposting.visual.adapter import KIND_DOES, project_from_repo
-
-        payload = project_from_repo(
-            {
-                "rank": 1,
-                "name": "archify",
-                "kind": "Agent",
-                "description": "Agent skill for architecture.",
-                "does": "Agent skill for beautiful architecture",
-            }
-        )
-        self.assertGreaterEqual(len(payload["features"]), 3)
-        self.assertTrue(all(item.endswith("。") for item in payload["features"]))
-        self.assertTrue(all(len(item) >= 16 for item in payload["features"]))
-        self.assertTrue(all(item.endswith("。") for item in KIND_DOES["Agent"]))
-
-    def test_four_panel_kind_copy_does_not_lead_with_it(self) -> None:
-        from autoposting.visual.adapter import KIND_AUDIENCE, KIND_DOES, KIND_HOW, KIND_SCENE
-
-        banned = ("它", "这个工具")
-        for table in (KIND_DOES, KIND_HOW, KIND_AUDIENCE, KIND_SCENE):
-            for kind, items in table.items():
-                for item in items:
-                    lead = str(item).lstrip()
-                    self.assertFalse(
-                        lead.startswith(banned),
-                        f"{kind} {item!r} starts with 它-style subject",
-                    )
-
-    def test_it_led_does_falls_back_to_kind_copy(self) -> None:
-        from autoposting.visual.adapter import project_from_repo
-
         payload = project_from_repo(
             {
                 "rank": 1,
                 "name": "agency-agents",
                 "kind": "Agent",
-                "does": "它把不同职责的角色编成一支小团队。\n它帮你把任务交给下一位。",
-            }
-        )
-        self.assertTrue(payload["features"])
-        self.assertTrue(all(not item.lstrip().startswith("它") for item in payload["features"]))
-        self.assertTrue(any("角色" in item or "助手" in item for item in payload["features"]))
-
-    def test_english_does_falls_back_to_chinese_kind_bullets(self) -> None:
-        from autoposting.visual.adapter import project_from_repo, to_bullets
-
-        self.assertEqual([], to_bullets("Agent skill for beautiful, verifiable architecture"))
-        payload = project_from_repo(
-            {
-                "rank": 1,
-                "name": "archify",
-                "kind": "Agent",
-                "description": "Agent skill for beautiful, verifiable architecture.",
-                "summary": "它可以帮你把不同的 AI 角色组织起来一起干活，而不是只会聊天。",
-                "does": "Agent skill for beautiful\nverifiable architecture\nworkflow",
+                "summary": "它把不同职责的角色编成一支小团队。",
+                "does": "它把不同职责的角色编成一支小团队。\nIt organizes frontend agents.",
                 "how": "先定角色和各自职责",
-                "scene": "本地把开发、内容和运营串成一条流水线",
-                "icon_url": "https://github.com/tt-a1i.png",
+                "audience": "想搭小型 AI 团队的人",
+                "scene": "做带动效的演…\n给不会命令行的同事试用",
             }
         )
-        self.assertTrue(payload["features"])
-        self.assertTrue(all("architecture" not in item.lower() for item in payload["features"]))
-        self.assertTrue(any("角色" in item or "任务" in item for item in payload["features"]))
-        self.assertFalse(payload.get("tagline"))
-        self.assertFalse(payload["keyMessage"].startswith("它"))
+        self.assertTrue(any(item.lstrip().startswith("它") for item in payload["features"]))
+        self.assertTrue(any("It organizes" in item for item in payload["features"]))
+        self.assertTrue(any("…" in item for item in payload["scene"]))
 
     def test_specific_chinese_summary_is_kept_without_identity_formula(self) -> None:
         from autoposting.visual.adapter import project_from_repo
@@ -641,14 +607,14 @@ class PosterCopyTests(unittest.TestCase):
         )
         self.assertEqual("把长素材按脚本切成能发的粗剪。", payload["keyMessage"])
 
-    def test_same_kind_empty_copy_includes_each_repo_name(self) -> None:
+    def test_empty_copy_is_not_filled_with_repo_name_formula(self) -> None:
         from autoposting.visual.adapter import project_from_repo
 
         one = project_from_repo({"rank": 1, "name": "alpha-cli", "kind": "CLI"})
         two = project_from_repo({"rank": 2, "name": "beta-cli", "kind": "CLI"})
-        self.assertIn("alpha-cli", one["keyMessage"])
-        self.assertIn("beta-cli", two["keyMessage"])
-        self.assertNotEqual(one["keyMessage"], two["keyMessage"])
+        self.assertEqual("", one["keyMessage"])
+        self.assertEqual("", two["keyMessage"])
+        self.assertEqual([], one["features"])
 
     def test_markdown_markers_are_stripped_from_poster_fields(self) -> None:
         from autoposting.visual.adapter import project_from_repo
@@ -684,8 +650,7 @@ class PosterCopyTests(unittest.TestCase):
             }
         )
         self.assertNotEqual("一句话看懂", payload["keyMessage"])
-        self.assertNotIn("**", payload["keyMessage"])
-        self.assertIn("cutter", payload["keyMessage"])
+        self.assertEqual("", payload["keyMessage"])
 
     def test_render_weekly_visual_cache_busts_image_url(self) -> None:
         from autoposting.visual.weekly import render_weekly_visual
@@ -703,6 +668,8 @@ class PosterCopyTests(unittest.TestCase):
                     "summary": "它可以帮你在终端里直接调用 AI，少绕一层界面。",
                     "does": "A tiny LLM CLI agent.",
                     "how": "装到本机命令行",
+                    "audience": "习惯开终端的人。",
+                    "scene": "需要对着仓库立刻问模型的时候。",
                     "description": "A tiny LLM CLI agent.",
                     "url": "https://github.com/acme/demo-cli",
                 }
@@ -714,7 +681,6 @@ class PosterCopyTests(unittest.TestCase):
         self.assertTrue(rendered[0].get("url"))
         self.assertIn("?v=", str(rendered[0]["url"]))
         html = (out / "01-demo-cli.html").read_text(encoding="utf-8")
-        self.assertNotIn("tiny LLM CLI", html)
         self.assertIn("终端", html)
 
 
@@ -924,6 +890,10 @@ class SmartCoverGuardTests(unittest.TestCase):
                 "name": f"skill-{index}",
                 "kind": "CLI",
                 "summary": "s",
+                "does": "完成这一步。",
+                "how": "按说明执行。",
+                "audience": "需要这一步的人。",
+                "scene": "要做这一步的时候。",
                 "stars": index,
                 "url": f"https://github.com/acme/skill-{index}",
             }

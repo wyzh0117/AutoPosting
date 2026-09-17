@@ -196,7 +196,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("llm-cli", payload["xhs_body"])
         self.assertIn("https://github.com/acme/llm-cli", payload["xhs_body"])
         self.assertEqual("llm-cli", payload["repos"][0]["name"])
-        self.assertTrue(payload["repos"][0]["summary"])
+        self.assertFalse(str(payload["repos"][0].get("summary") or "").strip())
         self.assertFalse(payload["repos"][0]["enriched"])
         self.assertEqual(len(payload["repos"]) + 1, len(payload["images"]))
         self.assertEqual("cover", payload["images"][0]["kind"])
@@ -280,6 +280,9 @@ class WebApiTests(unittest.TestCase):
             return rendered
 
         self.app.visual_renderer = fake_render
+        from copy_fixtures import attach_stub_poster_copy
+
+        attach_stub_poster_copy(self.app)
         self._request("POST", "/api/github-weekly", {})
         status, payload = self._request(
             "POST",
@@ -295,6 +298,16 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(payload["images"][0]["url"])
         self.assertEqual("light", payload["visual"]["theme"])
         self.assertEqual("#C45C26", payload["visual"]["palette"]["accent"])
+
+    def test_github_weekly_render_without_enrichment_returns_error(self) -> None:
+        self.app.github_fetcher = (
+            lambda url: TRENDING_HTML if "trending" in url else {"items": []}
+        )
+        self._request("POST", "/api/github-weekly", {})
+        status, payload = self._request("POST", "/api/github-weekly/render", {"theme": "dark"})
+        self.assertEqual(502, status)
+        self.assertEqual("llm_enrichment_failed", payload["error"])
+        self.assertIn("LLM_ENRICHMENT_FAILED", str(payload.get("error_reason") or ""))
 
     def test_github_weekly_image_renders_one_job_and_accepts_palette(self) -> None:
         self.app.github_fetcher = (
@@ -348,7 +361,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.4", payload["version"])
+        self.assertEqual("1.4.5", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -2044,7 +2057,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.4", html)
+        self.assertIn("1.4.5", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
