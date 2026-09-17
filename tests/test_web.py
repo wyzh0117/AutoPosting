@@ -348,7 +348,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.1", payload["version"])
+        self.assertEqual("1.4.2", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -1966,7 +1966,7 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("exportGithubImages", html)
         self.assertIn("github-gallery", html)
         self.assertIn("github-select-all", html)
-        self.assertIn("grid-template-columns:repeat(3", html)
+        self.assertIn("github-gallery-prev", html)
         self.assertIn("aspect-ratio:3/4", html)
         self.assertIn("/api/github-weekly", html)
         # D8: the image-model configuration surface is torn out, not hidden.
@@ -2044,7 +2044,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.1", html)
+        self.assertIn("1.4.2", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2428,15 +2428,66 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("本地工作台", html)
         picker = html[html.index("#image-picker{") : html.index("#image-picker[hidden]")]
         self.assertIn("overflow:hidden", picker)
-        self.assertIn("max-height:20.5rem", picker)
-        scroller = html[html.index("#image-picker-list{") : html.index(".image-card{")]
-        self.assertIn("overflow-y:auto", scroller)
-        self.assertIn("overscroll-behavior:contain", scroller)
+        scroller = html[html.index("#image-picker-list{") : html.index(".image-carousel-nav{")]
+        self.assertIn("overflow:hidden", scroller)
+        self.assertNotIn("overflow-y:auto", scroller)
         self.assertIn('class="image-picker-head"', html)
         list_rule = html[html.index("#hotspot-list{") : html.index("#hotspot-list li")]
         self.assertIn("overflow-y:auto", list_rule)
         self.assertIn("height:var(--hotspot-list-h)", list_rule)
         self.assertNotIn("emoji", html.lower())
+
+    def test_patch_142_image_carousels(self) -> None:
+        html = self._index()
+        picker = html[html.index('id="image-picker"') : html.index('id="xhs-studio"')]
+        self.assertIn('id="image-picker-prev"', picker)
+        self.assertIn('id="image-picker-next"', picker)
+        self.assertIn('id="image-picker-counter"', picker)
+        self.assertIn("上一张", picker)
+        self.assertIn("下一张", picker)
+        github = html[html.index('id="github-studio"') : html.index('id="skills-studio"')]
+        self.assertIn('id="github-gallery-prev"', github)
+        self.assertIn('id="github-gallery-next"', github)
+        self.assertIn('id="github-gallery-counter"', github)
+        self.assertIn("上一张", github)
+        self.assertIn("下一张", github)
+        skills = html[html.index('id="skills-studio"') : html.index('id="article-view"')]
+        self.assertIn('id="skills-gallery-prev"', skills)
+        self.assertIn('id="skills-gallery-next"', skills)
+        self.assertIn('id="skills-gallery-counter"', skills)
+        self.assertIn("上一张", skills)
+        self.assertIn("下一张", skills)
+        self.assertIn("function clampCarouselIndex", html)
+        self.assertIn("function paintCarouselNav", html)
+        self.assertIn("function stepImagePicker", html)
+        self.assertIn("imagePickerIndex", html)
+        self.assertIn("githubGalleryIndex", html)
+        self.assertIn("skillsGalleryIndex", html)
+        gallery_css = html[html.index(".gh-gallery{") : html.index(".gh-tile{")]
+        self.assertIn("display:flex", gallery_css)
+        self.assertNotIn("grid-template-columns:repeat(3", gallery_css)
+        scroller = html[html.index("#image-picker-list{") : html.index(".image-card{")]
+        self.assertNotIn("overflow-y:auto", scroller)
+        github_fn = html[
+            html.index("function renderGithubGallery()") : html.index("function toggleGithubImage(")
+        ]
+        self.assertIn("githubGalleryIndex", github_fn)
+        self.assertIn("clampCarouselIndex", github_fn)
+        skills_fn = html[
+            html.index("function renderSkillsGallery()") : html.index("function toggleSkillImage(")
+        ]
+        self.assertIn("skillsGalleryIndex", skills_fn)
+        picker_fn = html[
+            html.index("function renderImagePicker(") : html.index("function proxiedImage(")
+        ]
+        self.assertIn("imagePickerIndex", picker_fn)
+        render_fn = html[
+            html.index("function renderGithubWeeklyImages()") : html.index("function copyGithubXhs()")
+        ]
+        self.assertIn("state.githubGalleryIndex = index", render_fn)
+        self.assertIn('$("image-picker-prev").addEventListener("click"', html)
+        self.assertIn('$("github-gallery-prev").addEventListener("click"', html)
+        self.assertIn('$("skills-gallery-prev").addEventListener("click"', html)
 
     def test_responsive_and_no_external_resources(self) -> None:
         html = self._index()

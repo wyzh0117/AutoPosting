@@ -58,7 +58,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -589,7 +589,7 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
 .article-meta{margin:0; font-size:.8rem;}
 #image-picker{
   display:flex; flex-direction:column; gap:.55rem; margin-top:.2rem;
-  max-height:20.5rem; overflow:hidden;
+  overflow:hidden;
   border:1px solid var(--border); border-radius:var(--radius-md);
   background:var(--bg-raised); padding:.7rem .75rem .65rem;
   box-shadow:inset 0 1px 0 rgba(243, 238, 228, 0.04);
@@ -599,20 +599,28 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
 .image-picker-head .panel-sub{margin:0; flex:1 1 auto;}
 #image-picker-list{
   display:flex; flex-direction:column; gap:.55rem;
-  flex:1 1 auto; min-height:0; max-height:16.5rem;
-  overflow-y:auto; overscroll-behavior:contain;
-  padding-right:.3rem; scrollbar-width:thin;
+  flex:1 1 auto; min-height:0;
+  overflow:hidden;
+}
+.image-carousel-nav{
+  display:flex; align-items:center; justify-content:center; gap:.65rem;
+}
+.image-carousel-nav[hidden]{display:none;}
+.image-carousel-nav button{height:32px; min-height:32px; padding:0 .9rem; font-size:.78rem;}
+.image-carousel-counter{
+  min-width:4.8rem; text-align:center; font-size:.8rem; font-variant-numeric:tabular-nums;
+  color:var(--text-muted);
 }
 .image-card{
-  display:grid; grid-template-columns:64px minmax(0,1fr) auto; gap:.6rem;
-  align-items:center; background:rgba(0,0,0,0.22);
-  border:1px solid var(--border); border-radius:var(--radius-sm); padding:.5rem;
+  display:flex; flex-direction:column; gap:.55rem;
+  align-items:stretch; background:rgba(0,0,0,0.22);
+  border:1px solid var(--border); border-radius:var(--radius-sm); padding:.65rem;
   animation:rise var(--t-mid) var(--ease) both;
   transition:border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
 }
 .image-card:hover{transform:translateY(-1px); border-color:rgba(196, 164, 106, 0.35);}
 .image-card img{
-  width:64px; height:86px; object-fit:cover; aspect-ratio:3/4;
+  width:100%; height:auto; max-height:18rem; object-fit:contain;
   border-radius:6px; background:#111; display:block; cursor:zoom-in;
 }
 .image-card .image-meta{min-width:0; font-size:.75rem; color:var(--text-muted);}
@@ -890,7 +898,7 @@ body.lane-skills #skill-crawl-sources span{color:var(--text-muted);}
 #skill-title{font-size:.92rem;}
 body.lane-skills #skills-studio > .article-field{flex:0 0 auto;}
 body.lane-skills #skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0; flex:1 1 auto;}
-body.lane-skills #skills-gallery{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem; min-height:12rem;}
+body.lane-skills #skills-gallery{display:flex; justify-content:center; min-height:12rem;}
 #skills-article{
   flex:0 0 auto; min-height:6rem; max-height:24rem; overflow-y:auto;
   padding:.85rem 1rem 1rem;
@@ -922,7 +930,8 @@ body.lane-skills #github-render-btn{display:none;}
   border-radius:6px; background:transparent; cursor:pointer;
 }
 .gh-toolbar{display:flex; gap:.65rem; flex-wrap:wrap;}
-.gh-gallery{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:.7rem;}
+.gh-gallery{display:flex; justify-content:center; align-items:flex-start; min-height:12rem;}
+.gh-gallery .gh-tile{width:min(100%, 20rem);}
 .gh-tile{
   position:relative; aspect-ratio:4/3; border-radius:0; overflow:hidden;
   background:#141210; border:2px solid #2a261f; cursor:zoom-in;
@@ -1008,7 +1017,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.1 · 本地服务</span>
+  <span id="service-status">v1.4.2 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1143,6 +1152,11 @@ body.lane-skills #github-render-btn{display:none;}
         <button type="button" id="github-copy-btn" disabled>复制小红书文案</button>
       </div>
       <div id="github-gallery" class="gh-gallery"></div>
+      <div class="image-carousel-nav" id="github-gallery-nav" hidden>
+        <button type="button" id="github-gallery-prev">上一张</button>
+        <span id="github-gallery-counter" class="image-carousel-counter">0 / 0</span>
+        <button type="button" id="github-gallery-next">下一张</button>
+      </div>
       <label class="article-field">小红书标题<input id="github-xhs-title" type="text" readonly value="本周值得关注的github ai项目前10"></label>
       <label class="article-field">小红书正文<textarea id="github-xhs-body" rows="12"></textarea></label>
       <canvas id="github-canvas" hidden></canvas>
@@ -1157,6 +1171,11 @@ body.lane-skills #github-render-btn{display:none;}
         <button type="button" id="skills-export-btn" disabled>导出选中图片</button>
       </div>
       <div id="skills-gallery" class="gh-gallery"></div>
+      <div class="image-carousel-nav" id="skills-gallery-nav" hidden>
+        <button type="button" id="skills-gallery-prev">上一张</button>
+        <span id="skills-gallery-counter" class="image-carousel-counter">0 / 0</span>
+        <button type="button" id="skills-gallery-next">下一张</button>
+      </div>
       <div id="skills-article">
         <h3 id="skills-title">介绍文</h3>
         <div id="skills-body">查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。</div>
@@ -1167,10 +1186,15 @@ body.lane-skills #github-render-btn{display:none;}
         <label class="article-field">标题<input id="article-title" type="text"></label>
         <div id="image-picker" hidden>
           <div class="image-picker-head">
-            <p class="panel-sub">原文配图。点击预览可看大图；勾选封面和正文。默认只勾选封面，正文图需另行勾选。</p>
+            <p class="panel-sub">原文配图。上一张 / 下一张切换；点击预览可看大图；勾选封面和正文。默认只勾选封面，正文图需另行勾选。</p>
             <button type="button" id="image-rescan">重新扫描</button>
           </div>
           <div id="image-picker-list"></div>
+          <div class="image-carousel-nav" id="image-picker-nav" hidden>
+            <button type="button" id="image-picker-prev">上一张</button>
+            <span id="image-picker-counter" class="image-carousel-counter">0 / 0</span>
+            <button type="button" id="image-picker-next">下一张</button>
+          </div>
           <p id="image-picker-status" role="status"></p>
         </div>
         <div id="xhs-studio" hidden>
@@ -1384,6 +1408,9 @@ var state = {
   favoriteIds: {},
   draft: null,
   lightboxIndex: 0,
+  imagePickerIndex: 0,
+  githubGalleryIndex: 0,
+  skillsGalleryIndex: 0,
   creatorUrl: "",
   pendingPublish: false,
   articleDirty: false,
@@ -3076,6 +3103,35 @@ function rescanImages() {
   }).then(function () { busy(button, false); });
 }
 
+function clampCarouselIndex(index, total) {
+  if (total <= 0) { return 0; }
+  return ((index % total) + total) % total;
+}
+function paintCarouselNav(navId, prevId, nextId, counterId, index, total) {
+  var nav = $(navId);
+  if (nav) { nav.hidden = total < 2; }
+  var prev = $(prevId);
+  var next = $(nextId);
+  if (prev) { prev.disabled = total < 2; }
+  if (next) { next.disabled = total < 2; }
+  var counter = $(counterId);
+  if (counter) { counter.textContent = total ? ((index + 1) + " / " + total) : "0 / 0"; }
+}
+function stepImagePicker(delta) {
+  var assets = normalizeClientAssets(state.draft && state.draft.assets);
+  var total = (assets.candidates || []).length;
+  state.imagePickerIndex = clampCarouselIndex((state.imagePickerIndex || 0) + delta, total);
+  renderImagePicker(assets);
+}
+function stepGithubGallery(delta) {
+  state.githubGalleryIndex = clampCarouselIndex((state.githubGalleryIndex || 0) + delta, githubImages().length);
+  renderGithubGallery();
+}
+function stepSkillsGallery(delta) {
+  state.skillsGalleryIndex = clampCarouselIndex((state.skillsGalleryIndex || 0) + delta, skillImages().length);
+  renderSkillsGallery();
+}
+
 function renderImagePicker(raw) {
   var picker = $("image-picker");
   var list = $("image-picker-list");
@@ -3084,6 +3140,7 @@ function renderImagePicker(raw) {
   list.textContent = "";
   if (!state.draft) {
     picker.hidden = true;
+    paintCarouselNav("image-picker-nav", "image-picker-prev", "image-picker-next", "image-picker-counter", 0, 0);
     return;
   }
   picker.hidden = false;
@@ -3091,12 +3148,16 @@ function renderImagePicker(raw) {
     list.appendChild(el("p", "muted", "未从原文找到配图。可点重新扫描。"));
     var sourceLine = "来源：" + (state.draft.source_ids || []).join(", ");
     $("article-sources").textContent = sourceLine + " · 无配图";
+    paintCarouselNav("image-picker-nav", "image-picker-prev", "image-picker-next", "image-picker-counter", 0, 0);
     return;
   }
   var coverCount = assets.cover_id ? 1 : 0;
   var sourceLine = "来源：" + ((state.draft && state.draft.source_ids) || []).join(", ");
   $("article-sources").textContent = sourceLine + " · 封面 " + coverCount + " · 正文图 " + assets.body_ids.length + " / " + assets.candidates.length;
-  assets.candidates.forEach(function (image, index) {
+  state.imagePickerIndex = clampCarouselIndex(state.imagePickerIndex || 0, assets.candidates.length);
+  var index = state.imagePickerIndex;
+  var image = assets.candidates[index];
+  if (image) {
     var card = el("div", "image-card" + (image.id === assets.cover_id ? " cover" : ""));
     var thumb = document.createElement("img");
     thumb.alt = "点击查看大图";
@@ -3166,7 +3227,8 @@ function renderImagePicker(raw) {
     }
     card.appendChild(actions);
     list.appendChild(card);
-  });
+  }
+  paintCarouselNav("image-picker-nav", "image-picker-prev", "image-picker-next", "image-picker-counter", index, assets.candidates.length);
 }
 
 function proxiedImage(url) {
@@ -3852,42 +3914,50 @@ function githubImages() {
 function renderGithubGallery() {
   var gallery = $("github-gallery");
   gallery.textContent = "";
-  githubImages().forEach(function (image, index) {
-    var extras = "";
-    if (image.busy) { extras += " is-running"; }
-    else if (image.queued) { extras += " is-queued"; }
-    if (image.error) { extras += " is-error"; }
-    if (image.selected !== false) { extras += " selected"; }
-    var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
-    var tile = el("div", "gh-tile" + kindClass + extras);
-    tile.dataset.imageId = image.id;
-    var check = document.createElement("button");
-    check.type = "button";
-    check.className = "gh-check";
-    check.textContent = image.selected === false ? "" : "✓";
-    check.addEventListener("click", function (event) {
-      event.stopPropagation();
-      toggleGithubImage(image.id);
-    });
-    tile.appendChild(check);
-    if (image.url) {
-      var img = document.createElement("img");
-      img.alt = image.title || image.id;
-      img.src = githubFreshUrl(image.url);
-      img.addEventListener("click", function () { openGithubLightbox(index); });
-      tile.appendChild(img);
-    }
-    if (image.busy) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
-    } else if (image.queued) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
-    } else if (image.error) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
-    } else if (!image.url) {
-      tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
-    }
-    gallery.appendChild(tile);
+  var images = githubImages();
+  var total = images.length;
+  if (!total) {
+    paintCarouselNav("github-gallery-nav", "github-gallery-prev", "github-gallery-next", "github-gallery-counter", 0, 0);
+    return;
+  }
+  state.githubGalleryIndex = clampCarouselIndex(state.githubGalleryIndex || 0, total);
+  var index = state.githubGalleryIndex;
+  var image = images[index];
+  var extras = "";
+  if (image.busy) { extras += " is-running"; }
+  else if (image.queued) { extras += " is-queued"; }
+  if (image.error) { extras += " is-error"; }
+  if (image.selected !== false) { extras += " selected"; }
+  var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
+  var tile = el("div", "gh-tile" + kindClass + extras);
+  tile.dataset.imageId = image.id;
+  var check = document.createElement("button");
+  check.type = "button";
+  check.className = "gh-check";
+  check.textContent = image.selected === false ? "" : "✓";
+  check.addEventListener("click", function (event) {
+    event.stopPropagation();
+    toggleGithubImage(image.id);
   });
+  tile.appendChild(check);
+  if (image.url) {
+    var img = document.createElement("img");
+    img.alt = image.title || image.id;
+    img.src = githubFreshUrl(image.url);
+    img.addEventListener("click", function () { openGithubLightbox(index); });
+    tile.appendChild(img);
+  }
+  if (image.busy) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
+  } else if (image.queued) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
+  } else if (image.error) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
+  } else if (!image.url) {
+    tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
+  }
+  gallery.appendChild(tile);
+  paintCarouselNav("github-gallery-nav", "github-gallery-prev", "github-gallery-next", "github-gallery-counter", index, total);
 }
 function toggleGithubImage(imageId) {
   githubImages().forEach(function (image) {
@@ -4026,6 +4096,7 @@ function renderGithubWeeklyImages() {
     job.queued = false;
     job.busy = true;
     job.error = "";
+    state.githubGalleryIndex = index;
     waitProgress(index + 1, total, job.title || job.id, "github_render");
     if (state.lane === "github") {
       status("hotspot-status", "正在生成第 " + (index + 1) + " / " + total + " 张 · " + (job.title || job.id));
@@ -4397,47 +4468,56 @@ function renderSkillsGallery() {
   var images = skillImages();
   if (!images.length && (pack.skills || []).length) {
     images = queuedSkillImages(pack);
+    pack.images = images;
   }
   if (!images.length) {
     gallery.appendChild(el("p", "gh-pending", "查找完成后会自动出图。封面是主题大字报，项目卡按收录 skill 生成。"));
+    paintCarouselNav("skills-gallery-nav", "skills-gallery-prev", "skills-gallery-next", "skills-gallery-counter", 0, 0);
     return;
   }
-  images.forEach(function (image, index) {
-    var extras = "";
-    if (image.busy) { extras += " is-running"; }
-    else if (image.queued) { extras += " is-queued"; }
-    if (image.error) { extras += " is-error"; }
-    if (image.selected !== false) { extras += " selected"; }
-    var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
-    var tile = el("div", "gh-tile" + kindClass + extras);
-    tile.dataset.imageId = image.id;
-    var check = document.createElement("button");
-    check.type = "button";
-    check.className = "gh-check";
-    check.textContent = image.selected === false ? "" : "✓";
-    check.addEventListener("click", function (event) {
-      event.stopPropagation();
-      toggleSkillImage(image.id);
+  if (waitRunning("skill_render")) {
+    images.forEach(function (image, pos) {
+      if (image.url || image.busy) { state.skillsGalleryIndex = pos; }
     });
-    tile.appendChild(check);
-    if (image.url) {
-      var img = document.createElement("img");
-      img.alt = image.title || image.id;
-      img.src = githubFreshUrl(image.url);
-      img.addEventListener("click", function () { openSkillsLightbox(index); });
-      tile.appendChild(img);
-    }
-    if (image.busy) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
-    } else if (image.queued) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
-    } else if (image.error) {
-      tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
-    } else if (!image.url) {
-      tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
-    }
-    gallery.appendChild(tile);
+  }
+  state.skillsGalleryIndex = clampCarouselIndex(state.skillsGalleryIndex || 0, images.length);
+  var index = state.skillsGalleryIndex;
+  var image = images[index];
+  var extras = "";
+  if (image.busy) { extras += " is-running"; }
+  else if (image.queued) { extras += " is-queued"; }
+  if (image.error) { extras += " is-error"; }
+  if (image.selected !== false) { extras += " selected"; }
+  var kindClass = image.kind === "cover" ? " gh-cover" : (image.kind === "poster" ? " gh-poster" : "");
+  var tile = el("div", "gh-tile" + kindClass + extras);
+  tile.dataset.imageId = image.id;
+  var check = document.createElement("button");
+  check.type = "button";
+  check.className = "gh-check";
+  check.textContent = image.selected === false ? "" : "✓";
+  check.addEventListener("click", function (event) {
+    event.stopPropagation();
+    toggleSkillImage(image.id);
   });
+  tile.appendChild(check);
+  if (image.url) {
+    var img = document.createElement("img");
+    img.alt = image.title || image.id;
+    img.src = githubFreshUrl(image.url);
+    img.addEventListener("click", function () { openSkillsLightbox(index); });
+    tile.appendChild(img);
+  }
+  if (image.busy) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "正在生成…"));
+  } else if (image.queued) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "排队中"));
+  } else if (image.error) {
+    tile.appendChild(el("p", "gh-pending gh-overlay", "失败 · " + image.error));
+  } else if (!image.url) {
+    tile.appendChild(el("p", "gh-pending", "待出图 · " + (image.title || image.id)));
+  }
+  gallery.appendChild(tile);
+  paintCarouselNav("skills-gallery-nav", "skills-gallery-prev", "skills-gallery-next", "skills-gallery-counter", index, images.length);
 }
 function toggleSkillImage(imageId) {
   skillImages().forEach(function (image) {
@@ -5006,6 +5086,12 @@ $("original-dialog").addEventListener("cancel", closeOriginal);
 $("generate-btn").addEventListener("click", generate);
 $("save-article-btn").addEventListener("click", saveArticle);
 $("image-rescan").addEventListener("click", rescanImages);
+$("image-picker-prev").addEventListener("click", function () { stepImagePicker(-1); });
+$("image-picker-next").addEventListener("click", function () { stepImagePicker(1); });
+$("github-gallery-prev").addEventListener("click", function () { stepGithubGallery(-1); });
+$("github-gallery-next").addEventListener("click", function () { stepGithubGallery(1); });
+$("skills-gallery-prev").addEventListener("click", function () { stepSkillsGallery(-1); });
+$("skills-gallery-next").addEventListener("click", function () { stepSkillsGallery(1); });
 $("lightbox-close").addEventListener("click", closeImageLightbox);
 $("lightbox-prev").addEventListener("click", function () { stepImageLightbox(-1); });
 $("lightbox-next").addEventListener("click", function () { stepImageLightbox(1); });
