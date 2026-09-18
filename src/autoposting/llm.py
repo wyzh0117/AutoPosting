@@ -39,9 +39,18 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/1.4.6"
+HTTP_USER_AGENT = "AutoPosting/1.4.7"
 LLM_TIMEOUT_SECONDS = 90
-LEADERBOARD_ENRICH_SECONDS = 25
+LEADERBOARD_ENRICH_SECONDS = 180
+
+
+def _deadline_label(seconds: float) -> str:
+    whole_minutes = seconds / 60
+    if seconds >= 60 and abs(whole_minutes - round(whole_minutes)) < 0.05:
+        return f"{int(round(whole_minutes))} 分钟"
+    return f"{seconds:g} 秒"
+
+
 MAX_OUTPUT_CHARS = 100_000
 MAX_STYLE_CHARS = 50_000
 MAX_CHAT_MESSAGES = 50
@@ -706,6 +715,13 @@ class LLMService:
 
     def _run_deadline(self, prompt: str, settings: LLMSettings, seconds: float) -> str:
         box: dict[str, object] = {}
+        runner = self.runner
+        previous_timeout = getattr(runner, "timeout", None)
+        wait = float(seconds)
+        # HTTP urlopen uses runner.timeout (article calls stay at 90s). Enrich
+        # must be allowed to wait the full deadline, otherwise 90s cuts it first.
+        if isinstance(previous_timeout, (int, float)) and wait > previous_timeout:
+            runner.timeout = int(wait)
 
         def worker() -> None:
             try:
@@ -713,18 +729,22 @@ class LLMService:
             except Exception as exc:
                 box["error"] = exc
 
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        thread.join(max(0.05, float(seconds)))
-        if thread.is_alive():
-            raise LLMError("llm_timeout", f"榜单改写超过 {seconds:g} 秒未返回")
-        error = box.get("error")
-        if isinstance(error, Exception):
-            raise error
-        text = box.get("text")
-        if not isinstance(text, str):
-            raise LLMError("llm_invalid_output", "模型没有返回文本")
-        return text
+        try:
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            thread.join(max(0.05, wait))
+            if thread.is_alive():
+                raise LLMError("llm_timeout", f"榜单改写超过 {_deadline_label(wait)}未返回")
+            error = box.get("error")
+            if isinstance(error, Exception):
+                raise error
+            text = box.get("text")
+            if not isinstance(text, str):
+                raise LLMError("llm_invalid_output", "模型没有返回文本")
+            return text
+        finally:
+            if previous_timeout is not None:
+                runner.timeout = previous_timeout
 
     def extract_hook_candidates(self, excerpt: str) -> list[dict[str, str]]:
         """Optional extra phrases from the article model.

@@ -297,6 +297,13 @@ class GitHubWeeklyTests(unittest.TestCase):
         self.assertEqual("llm_timeout", ctx.exception.code)
         self.assertLess(elapsed, 1.5)
 
+    def test_leaderboard_enrich_deadline_is_three_minutes(self) -> None:
+        from autoposting.llm import LEADERBOARD_ENRICH_SECONDS, _deadline_label
+
+        self.assertEqual(180, LEADERBOARD_ENRICH_SECONDS)
+        self.assertEqual("3 分钟", _deadline_label(180))
+        self.assertEqual("0.2 秒", _deadline_label(0.2))
+
     def test_apply_leaderboard_copy_ignores_name_tampering(self) -> None:
         repos = [
             {
