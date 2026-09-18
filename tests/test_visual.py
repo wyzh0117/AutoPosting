@@ -382,6 +382,13 @@ class BrandAndIssueTests(unittest.TestCase):
         self.assertNotIn("c-poster-b-info", body)
         self.assertIn("-webkit-line-clamp: 3", html)
         self.assertIn("overflow: hidden", html)
+        self.assertIn(".c-project-shell", html)
+        self.assertIn("min-height: 0", html)
+        self.assertRegex(html, r"\.c-bullet-panel[^{]*\{[^}]*overflow:\s*hidden")
+        self.assertRegex(html, r"\.c-bullet-panel \.c-feature-list li \{[^}]*font-size: 1em")
+        self.assertIn("function fitPosterCopy()", html)
+        fit_js = html[html.index("function fitPosterCopy()") :]
+        self.assertIn(".c-feature-list", fit_js)
         self.assertIn("width: 1080px;", html)
 
 
@@ -432,7 +439,7 @@ class HtmlRendererTests(unittest.TestCase):
         self.assertLess(body.find("适合哪些人群"), body.find("使用场景"))
         self.assertNotIn("开源仓库，安装步骤和文档在项目主页", html)
         self.assertNotIn("max-height: 36%", html)
-        self.assertRegex(html, r"\.c-project-shell \{[^}]*justify-content: center")
+        self.assertRegex(html, r"\.c-project-shell \{[^}]*justify-content: flex-start")
         self.assertRegex(html, r"\.c-project-pair \{[^}]*grid-template-columns: 1fr 1fr")
         self.assertRegex(html, r"\.c-bullet-panel \{[^}]*height: auto")
 

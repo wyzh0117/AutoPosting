@@ -46,6 +46,44 @@ class CopyValidatorTests(unittest.TestCase):
             validate_copy_items(repos, [_item()])
         self.assertIn("acme/other", raised.exception.reason)
 
+    def test_short_skill_name_matches_full_name(self) -> None:
+        repos = [
+            {
+                "full_name": "prime-skills/runcomfy-agent-skills/video-inpainting",
+                "name": "video-inpainting",
+            }
+        ]
+        incoming = _item(full_name="video-inpainting")
+        matched = validate_copy_items(repos, [incoming])
+        self.assertEqual(
+            incoming["summary"],
+            matched["prime-skills/runcomfy-agent-skills/video-inpainting"]["summary"],
+        )
+
+    def test_name_only_item_matches_full_name(self) -> None:
+        repos = [
+            {
+                "full_name": "prime-skills/runcomfy-agent-skills/video-inpainting",
+                "name": "video-inpainting",
+            }
+        ]
+        incoming = _item(full_name="", name="video-inpainting")
+        incoming.pop("full_name", None)
+        matched = validate_copy_items(repos, [incoming])
+        self.assertEqual(
+            incoming["summary"],
+            matched["prime-skills/runcomfy-agent-skills/video-inpainting"]["summary"],
+        )
+
+    def test_ambiguous_short_name_still_requires_full_name(self) -> None:
+        repos = [
+            {"full_name": "acme/one/video-edit", "name": "video-edit"},
+            {"full_name": "other/two/video-edit", "name": "video-edit"},
+        ]
+        with self.assertRaises(LLMError) as raised:
+            validate_copy_items(repos, [_item(full_name="video-edit")])
+        self.assertIn("missing item", raised.exception.reason)
+
     def test_unenriched_snapshot_fails_render_gate(self) -> None:
         with self.assertRaises(LLMError) as raised:
             require_enriched_copy(
@@ -74,6 +112,18 @@ class ApplyLeaderboardCopyTests(unittest.TestCase):
         repos = [{"full_name": "acme/llm-cli", "name": "llm-cli", "enriched": False}]
         with self.assertRaises(LLMError):
             apply_leaderboard_copy(repos, [_item(how="")])
+
+    def test_apply_accepts_short_skill_name(self) -> None:
+        repos = [
+            {
+                "full_name": "prime-skills/runcomfy-agent-skills/video-inpainting",
+                "name": "video-inpainting",
+                "enriched": False,
+            }
+        ]
+        updated = apply_leaderboard_copy(repos, [_item(full_name="video-inpainting")])
+        self.assertTrue(updated[0]["enriched"])
+        self.assertEqual("prime-skills/runcomfy-agent-skills/video-inpainting", updated[0]["full_name"])
 
     def test_apply_writes_llm_fields_and_marks_enriched(self) -> None:
         repos = [{"full_name": "acme/llm-cli", "name": "llm-cli", "stars": 9, "enriched": False}]

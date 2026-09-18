@@ -31,6 +31,7 @@ from .github_weekly import (
 )
 from .image_gen import build_weekly_render_plan
 from .skill_finder import (
+    POSTER_RENDER_CAP,
     aggregate_skills,
     apply_skill_selection,
     crawl_sources,
@@ -61,7 +62,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.9"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -1066,7 +1067,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.7 · 本地服务</span>
+  <span id="service-status">v1.4.9 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1199,6 +1200,7 @@ body.lane-skills #github-render-btn{display:none;}
       <select id="prompt-style-select" aria-label="生成风格" title="生成风格">
         <option value="AI专家" selected>AI专家</option>
         <option value="经验分享">经验分享</option>
+        <option value="klinkenborg_style">klinkenborg_style</option>
       </select>
       <button type="button" id="find-hooks-btn" disabled>找切口</button>
       <button type="button" id="generate-btn" class="btn-magic" disabled>生成文章</button>
@@ -4623,6 +4625,53 @@ function renderSkillList(skills) {
     list.appendChild(row);
   });
 }
+function escapeSkillHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+function replacePlainToken(html, token, replacement) {
+  var out = "";
+  var rest = html;
+  while (rest) {
+    var at = rest.indexOf(token);
+    if (at < 0) { return out + rest; }
+    var before = rest.slice(0, at);
+    var lastOpen = before.lastIndexOf("<a ");
+    var lastClose = before.lastIndexOf("</a>");
+    if (lastOpen > lastClose) {
+      var end = rest.indexOf("</a>", at);
+      if (end < 0) { return out + rest; }
+      out += rest.slice(0, end + 4);
+      rest = rest.slice(end + 4);
+      continue;
+    }
+    out += before + replacement;
+    rest = rest.slice(at + token.length);
+  }
+  return out;
+}
+function linkifySkillArticle(body, skills) {
+  var html = escapeSkillHtml(body).replace(/\\n/g, "<br>");
+  var rows = (skills || []).slice().sort(function (left, right) {
+    return String((right && right.name) || "").length - String((left && left.name) || "").length;
+  });
+  var seen = {};
+  rows.forEach(function (skill) {
+    var name = String((skill && skill.name) || "");
+    var url = skillPageUrl(skill);
+    if (!name || !url || seen[name]) { return; }
+    seen[name] = true;
+    var token = escapeSkillHtml(name);
+    html = replacePlainToken(
+      html,
+      token,
+      '<a href="' + String(url).replace(/"/g, "") + '" target="_blank" rel="noreferrer noopener">' + token + "</a>"
+    );
+  });
+  return html;
+}
 function toggleSkillIncluded(skill, on) {
   skill.selected = !!on;
   var pack = state.skillsPackage || {};
@@ -4666,7 +4715,13 @@ function renderSkillPackage(payload) {
   // 标题框 is the title of the whole package: it titles the cover poster and it
   // titles the intro piece in the text area.
   $("skills-title").textContent = userTitle || articleTitle || "介绍文";
-  $("skills-body").textContent = articleBody || "查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。";
+  var bodyNode = $("skills-body");
+  var fallbackBody = "查找完成后会生成介绍文。按收录 skill 从左到右、从上到下说明。";
+  if (articleBody) {
+    bodyNode.innerHTML = linkifySkillArticle(articleBody, skills);
+  } else {
+    bodyNode.textContent = fallbackBody;
+  }
   $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
   renderSkillList(skills);
   renderSkillsGallery();
@@ -5117,6 +5172,10 @@ function renderSkillImages() {
   }
   if (!selectedSkills(pack).length) {
     status("hotspot-status", "请先勾选要出图的 skill", "error");
+    return;
+  }
+  if (selectedSkills(pack).length > 10) {
+    status("hotspot-status", "超过条目上限", "error");
     return;
   }
   if (waitRunning("skill_render")) { return; }
@@ -6843,6 +6902,9 @@ class WebApp:
         chosen = apply_skill_selection(aggregated, selected_ids)
         if not chosen:
             raise ValueError("skill_none_selected" if selected_ids is not None else "skill_package_empty")
+        cover_only = bool(body.get("cover_only"))
+        if not cover_only and len(chosen) > POSTER_RENDER_CAP:
+            raise ValueError("超过条目上限")
         if selected_ids is not None:
             chosen_ids = {skill_identity(row) for row in chosen}
             for row in aggregated:

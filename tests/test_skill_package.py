@@ -327,6 +327,11 @@ class AggregateTests(unittest.TestCase):
         rows = [{"name": "keep-me", "source_id": "acme/keep-me"}]
         self.assertEqual([], apply_skill_selection(rows, []))
 
+    def test_poster_render_cap_is_ten(self) -> None:
+        from autoposting.skill_finder import POSTER_RENDER_CAP
+
+        self.assertEqual(10, POSTER_RENDER_CAP)
+
     def test_a_pasted_skill_replaces_its_searched_twin(self) -> None:
         snapshot = {
             "skills": [
@@ -576,6 +581,18 @@ class SkillPackageApiTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("skill_none_selected", rendered.get("error"))
+
+    def test_render_rejects_more_than_ten_selected_ids(self) -> None:
+        links = "\n".join(f"https://skills.sh/acme/pack/skill-{index}" for index in range(11))
+        status, pasted = self._request("POST", "/api/skills/paste", {"links": links})
+        self.assertEqual(200, status)
+        ids = [skill_identity(row) for row in pasted["skills"]]
+        self.assertGreaterEqual(len(ids), 11)
+        status, rendered = self._request(
+            "POST", "/api/skills/render", {"theme": "dark", "selected_ids": ids[:11]}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("超过条目上限", rendered.get("error"))
 
     def test_search_endpoint_works_without_a_model(self) -> None:
         status, payload = self._request("POST", "/api/skills/search", {"query": "视频 剪辑"})

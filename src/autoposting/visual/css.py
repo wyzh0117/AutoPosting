@@ -336,6 +336,7 @@ html, body {{
   font-size: 13px;
 }}
 .c-footer {{
+  flex: 0 0 auto;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -348,22 +349,29 @@ html, body {{
 .c-project-shell {{
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   margin-top: {space["md"]}px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   gap: {space["md"]}px;
 }}
 .c-bullet-panel {{
-  flex: 0 1 auto;
+  flex: 1 1 0;
+  min-height: 0;
   height: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   padding: {space["md"]}px {space["lg"]}px;
+  font-size: {type_["body"]["size"]}px;
 }}
 .c-bullet-panel h3 {{
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: {space["sm"]}px;
+  flex: 0 0 auto;
 }}
 .c-bullet-panel h3 .c-feature-icon {{
   width: 22px;
@@ -371,15 +379,20 @@ html, body {{
   flex: 0 0 22px;
 }}
 .c-bullet-panel .c-feature-list {{
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
   gap: 8px;
 }}
 .c-bullet-panel .c-feature-list li {{
   align-items: flex-start;
-  font-size: {type_["body"]["size"]}px;
+  font-size: 1em;
   line-height: 1.4;
 }}
 .c-bullet-panel .c-feature-list li span {{
   white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }}
 .c-plain-list .c-feature-list li {{
   display: block;
@@ -392,8 +405,10 @@ html, body {{
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: {space["sm"]}px;
-  flex: 0 1 auto;
-  align-items: start;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  align-items: stretch;
 }}
 .page-project .c-panel h3 {{
   letter-spacing: 0.04em;
@@ -402,6 +417,8 @@ html, body {{
   color: {color["primary"]};
 }}
 .c-masthead {{
+  flex: 0 1 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 120px;
   gap: {space["md"]}px;
@@ -456,6 +473,9 @@ html, body {{
   border-radius: {radius["card"]}px;
   background: {color["surface"]};
   border: 1px solid {color["border"]};
+  overflow: hidden;
+  min-height: 0;
+  font-size: {type_["subtitle"]["size"] - 4}px;
 }}
 .c-quote-card .label {{
   font-size: 12px;
@@ -465,7 +485,7 @@ html, body {{
 }}
 .c-quote-card p {{
   margin: {space["sm"]}px 0 0;
-  font-size: {type_["subtitle"]["size"] - 4}px;
+  font-size: 1em;
   line-height: 1.4;
   color: {color["quote"]};
   display: -webkit-box;
@@ -479,6 +499,7 @@ html, body {{
   background: transparent;
   border: none;
   max-width: 78%;
+  font-size: {type_["body"]["size"] + 2}px;
 }}
 .c-quote-lede .label {{
   font-size: {tokens["fontSize"]["md"]}px;
@@ -487,7 +508,7 @@ html, body {{
   font-weight: 600;
 }}
 .c-quote-lede p {{
-  font-size: {type_["body"]["size"] + 2}px;
+  font-size: 1em;
   -webkit-line-clamp: 4;
 }}
 .c-panel {{
@@ -517,7 +538,7 @@ html, body {{
   display: flex;
   gap: 12px;
   align-items: center;
-  font-size: {type_["body"]["size"]}px;
+  font-size: 1em;
 }}
 .c-feature-icon {{
   width: 32px;
@@ -779,6 +800,15 @@ html, body {{
   padding: 72px 64px 60px;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+}}
+.skin-toc .c-project-shell {{
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}}
+.skin-toc .c-footer {{
+  flex: 0 0 auto;
 }}
 .skin-toc.template-poster-a.page-project,
 .skin-toc.template-poster-b.page-project {{

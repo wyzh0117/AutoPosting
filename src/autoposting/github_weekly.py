@@ -235,7 +235,7 @@ def apply_leaderboard_copy(
     updated: list[dict[str, object]] = []
     for repo in repos:
         copy = dict(repo)
-        incoming = by_name[str(repo["full_name"])]
+        incoming = by_name[str(repo.get("full_name") or repo.get("name") or "")]
         for field in COPY_FIELDS:
             copy[field] = str(incoming[field]).strip()
         copy["enriched"] = True

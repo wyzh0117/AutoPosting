@@ -11,6 +11,7 @@ ARTICLE_BASE_PROMPT_FILENAME = "ARTICLE_BASE_PROMPT.md"
 ARTICLE_STYLE_PROMPT_FILES = {
     "AI专家": "AI专家.md",
     "经验分享": "经验分享.md",
+    "klinkenborg_style": "klinkenborg.md",
 }
 ARTICLE_STYLE_PROMPT_IDS = tuple(ARTICLE_STYLE_PROMPT_FILES)
 ARTICLE_STYLE_PROMPT_DIRNAME = "article_styles"
@@ -51,7 +52,9 @@ def load_article_prompt_doc(path: str | Path | None = None) -> str:
 def article_style_prompt_paths(style_id: str) -> tuple[Path, ...]:
     filename = ARTICLE_STYLE_PROMPT_FILES.get(style_id)
     if filename is None:
-        raise ValueError("prompt_style must be one of AI专家, 经验分享")
+        raise ValueError(
+            "prompt_style must be one of " + ", ".join(ARTICLE_STYLE_PROMPT_FILES)
+        )
     here = Path(__file__).resolve()
     return (
         here.parents[2] / "docs" / ARTICLE_STYLE_PROMPT_DIRNAME / filename,

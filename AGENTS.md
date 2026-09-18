@@ -15,7 +15,7 @@ When the package version changes, update all of: `pyproject.toml`, `src/autopost
 
 ## Article prompting
 
-Article-model instructions live in `docs/ARTICLE_BASE_PROMPT.md` and `docs/article_styles/` named files (`AI专家.md`, `经验分享.md`). Option values are `AI专家` and `经验分享`. The base file owns shared facts, output, priority, and platform rules; the style files own the selectable writing types. Do not put new 调教 copy in `llm.py`. Settings → 写作风格 is the highest-priority prompt overlay.
+Article-model instructions live in `docs/ARTICLE_BASE_PROMPT.md` and `docs/article_styles/` named files (`AI专家.md`, `经验分享.md`, `klinkenborg.md`). Option values are `AI专家`, `经验分享`, and `klinkenborg_style`. The base file owns shared facts, output, priority, and platform rules; the style files own the selectable writing types. Do not put new 调教 copy in `llm.py`. Settings → 写作风格 is the highest-priority prompt overlay.
 
 ## Image prompting
 

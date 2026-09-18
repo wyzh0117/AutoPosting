@@ -361,7 +361,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.7", payload["version"])
+        self.assertEqual("1.4.9", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -699,6 +699,15 @@ class WebApiTests(unittest.TestCase):
         prompts = [call[2] for call in self.model.calls]
         self.assertTrue(any("拆解" in prompt for prompt in prompts))
         self.assertTrue(any("一般人容易看漏的角度" in prompt for prompt in prompts))
+
+        k_status, k_payload = self._request(
+            "POST",
+            "/api/articles",
+            {"item_id": item_id, "platform": "wechat", "prompt_style": "klinkenborg_style"},
+        )
+        self.assertEqual(200, k_status, k_payload)
+        self.assertEqual("klinkenborg_style", k_payload["prompt_style"])
+        self.assertTrue(any("句子这一最小可控单位" in call[2] for call in self.model.calls))
 
     def test_xiaohongshu_article_returns_caption_and_9x16_cards(self) -> None:
         item_id = self._insert_item(self.sources[0], "xhs1", "Model One news", "https://lab.example/xhs1")
@@ -2057,7 +2066,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.7", html)
+        self.assertIn("1.4.9", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2089,6 +2098,7 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="prompt-style-select"', html)
         self.assertIn('<option value="AI专家" selected>AI专家</option>', html)
         self.assertIn('<option value="经验分享">经验分享</option>', html)
+        self.assertIn('<option value="klinkenborg_style">klinkenborg_style</option>', html)
         self.assertNotIn("1 消息", html)
         self.assertNotIn('option value="8"', html)
         self.assertNotIn("新闻特写", html)
@@ -2571,8 +2581,13 @@ class IndexPageContractTests(unittest.TestCase):
         render_fn = html[html.index("function renderSkillImages()") : html.index("function exportSkillImages(")]
         self.assertIn("selected_ids", render_fn)
         self.assertIn("selectedSkills", render_fn)
+        self.assertIn("超过条目上限", render_fn)
         pack_fn = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
         self.assertIn("renderSkillList", pack_fn)
+        self.assertIn("linkifySkillArticle", html)
+        self.assertIn('.replace(/\\n/g, "<br>")', html)
+        self.assertIn("replacePlainToken", html)
+        self.assertIn('lastIndexOf("<a ")', html)
 
     def test_responsive_and_no_external_resources(self) -> None:
         html = self._index()

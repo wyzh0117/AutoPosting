@@ -111,6 +111,7 @@ def crawl_sources(*, github_token: bool = False) -> list[dict[str, str]]:
 
 
 SKILL_CAP = 16
+POSTER_RENDER_CAP = 10
 FRESH_DAYS = 180
 MIN_STARS = 10
 # One query now costs up to two search calls (GitHub + skills.sh) instead of one,

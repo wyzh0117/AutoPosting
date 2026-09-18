@@ -162,6 +162,16 @@ def _try_playwright(html_path: Path, png_path: Path, width: int, height: int) ->
             device_scale_factor=1,
         )
         page.goto(html_path.resolve().as_uri(), wait_until="load")
+        page.evaluate(
+            """() => {
+              const ready = (document.fonts && document.fonts.ready)
+                ? document.fonts.ready
+                : Promise.resolve();
+              return ready.then(() => {
+                if (typeof fitPosterCopy === "function") fitPosterCopy();
+              });
+            }"""
+        )
         page.screenshot(path=str(png_path), clip={"x": 0, "y": 0, "width": width, "height": height})
         browser.close()
     return png_path.is_file()

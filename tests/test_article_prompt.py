@@ -24,25 +24,28 @@ class ArticlePromptDocTests(unittest.TestCase):
         expected_files = {
             "AI专家": "AI专家.md",
             "经验分享": "经验分享.md",
+            "klinkenborg_style": "klinkenborg.md",
         }
-        self.assertEqual(("AI专家", "经验分享"), ARTICLE_STYLE_PROMPT_IDS)
+        self.assertEqual(("AI专家", "经验分享", "klinkenborg_style"), ARTICLE_STYLE_PROMPT_IDS)
         self.assertEqual(expected_files, ARTICLE_STYLE_PROMPT_FILES)
         prompts = {}
         for style_id in ARTICLE_STYLE_PROMPT_IDS:
             prompts[style_id] = load_article_style_prompt(style_id)
             self.assertTrue(prompts[style_id])
             self.assertEqual(expected_files[style_id], article_style_prompt_paths(style_id)[0].name)
-        self.assertEqual(2, len(set(prompts.values())))
+        self.assertEqual(3, len(set(prompts.values())))
         self.assertIn("不要把写作提纲暴露给读者", prompts["AI专家"])
         self.assertIn("一般人容易看漏的角度", prompts["AI专家"])
         self.assertIn("拆解", prompts["经验分享"])
         self.assertIn("梳理", prompts["经验分享"])
         self.assertIn("解读", prompts["经验分享"])
         self.assertIn("分享", prompts["经验分享"])
+        self.assertIn("句子这一最小可控单位", prompts["klinkenborg_style"])
+        self.assertIn("自告奋勇句", prompts["klinkenborg_style"])
         style_dir = article_style_prompt_paths("AI专家")[0].parent
         leftover = {path.name for path in style_dir.glob("*.md")}
-        self.assertEqual({"AI专家.md", "经验分享.md"}, leftover)
-        for invalid in ("8", "1", "7", "9", "../AI专家"):
+        self.assertEqual({"AI专家.md", "经验分享.md", "klinkenborg.md"}, leftover)
+        for invalid in ("8", "1", "7", "9", "../AI专家", "klinkenborg"):
             with self.assertRaises(ValueError):
                 load_article_style_prompt(invalid)
 

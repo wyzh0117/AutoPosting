@@ -33,11 +33,29 @@ def render_html(payload: dict[str, Any], tokens: dict[str, Any] | None = None) -
     else:
         raise ValueError(f"unsupported page: {page}")
     skin = " skin-toc" if poster_template == "2" else ""
+    fit = ""
+    if page == "project-detail":
+        fit = (
+            "<script>function overflowing(el){"
+            "return !!(el&&el.scrollHeight>el.clientHeight+1);"
+            "}"
+            "function fitPosterCopy(){"
+            "document.querySelectorAll('.c-bullet-panel,.c-quote-card').forEach(function(box){"
+            "var size=parseFloat(window.getComputedStyle(box).fontSize)||16;"
+            "var list=box.querySelector('.c-feature-list');"
+            "var guard=0;"
+            "while((overflowing(box)||overflowing(list))&&size>10&&guard<32){"
+            "size-=0.5;guard+=1;box.style.fontSize=size+'px';"
+            "}});"
+            "}"
+            "fitPosterCopy();"
+            "if(document.fonts&&document.fonts.ready){document.fonts.ready.then(fitPosterCopy);}</script>"
+        )
     return (
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         f"<meta name=\"viewport\" content=\"width={resolved['canvas']['width']}\">"
         f"<title>{_title(payload)}</title><style>{stylesheet(resolved)}</style></head>"
-        f"<body><div class=\"{page_class}{(' template-' + variant) if variant else ''}{skin}\">{body}</div></body></html>"
+        f"<body><div class=\"{page_class}{(' template-' + variant) if variant else ''}{skin}\">{body}</div>{fit}</body></html>"
     )
 
 
