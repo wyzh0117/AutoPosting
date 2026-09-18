@@ -61,7 +61,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -219,8 +219,8 @@ body.news-supplement-open #wait-banner{
   display:flex; flex-direction:column; gap:.75rem;
 }
 .news-supplement-item{
-  background:var(--bg-input); border:1px solid transparent;
-  border-radius:var(--radius-md); padding:.8rem .9rem;
+  position:relative; background:var(--bg-input); border:1px solid transparent;
+  border-radius:var(--radius-md); padding:.8rem 2.4rem .8rem .9rem;
 }
 .news-supplement-item.is-focus{border-color:var(--accent);}
 .news-supplement-item a{display:block; color:var(--accent); font-weight:600; line-height:1.4; word-break:break-word;}
@@ -1066,7 +1066,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.5 · 本地服务</span>
+  <span id="service-status">v1.4.6 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1228,6 +1228,7 @@ body.lane-skills #github-render-btn{display:none;}
       </label>
       <div class="gh-toolbar">
         <button type="button" id="skills-render-btn">生成图片</button>
+        <button type="button" id="skills-cover-btn" disabled>只重新生成封面海报</button>
         <button type="button" id="skills-select-all" disabled>全选</button>
         <button type="button" id="skills-export-btn" disabled>导出选中图片</button>
       </div>
@@ -1483,6 +1484,7 @@ var state = {
   translation: {model: "", base_url: "", configured: false, enabled: false},
   leaderboard: {model: "", base_url: "", configured: false, enabled: false},
   newsSupplements: [],
+  pickedNewsKeys: {},
   articleSessions: {},
   articleLastKeys: {},
   articleRequestGen: 0,
@@ -2787,6 +2789,45 @@ function syncRelatedSearchEnabled() {
   button.disabled = !selectedArticleContext();
 }
 
+function newsKey(item) {
+  if (!item || typeof item !== "object") { return ""; }
+  return String(item.url || item.link || item.source_url || item.title || "").trim();
+}
+
+function selectedNewsItems() {
+  var picked = state.pickedNewsKeys || {};
+  return (Array.isArray(state.newsSupplements) ? state.newsSupplements : []).filter(function (item) {
+    var key = newsKey(item);
+    return key && picked[key];
+  });
+}
+
+function toggleNewsPicked(item) {
+  var key = newsKey(item);
+  if (!key) { return; }
+  if (!state.pickedNewsKeys) { state.pickedNewsKeys = {}; }
+  if (state.pickedNewsKeys[key]) { delete state.pickedNewsKeys[key]; }
+  else { state.pickedNewsKeys[key] = true; }
+  renderNewsSupplements();
+}
+
+function newsPickToggle(item) {
+  var key = newsKey(item);
+  var picked = !!(state.pickedNewsKeys && state.pickedNewsKeys[key]);
+  var toggle = el("button", "ht-pick" + (picked ? " is-on" : ""));
+  toggle.type = "button";
+  toggle.setAttribute("role", "checkbox");
+  toggle.setAttribute("aria-checked", String(picked));
+  toggle.setAttribute("aria-label", picked ? "取消选用这条新闻" : "选用这条新闻生成文章");
+  toggle.appendChild(el("span", "ht-pick-box", picked ? "✓" : ""));
+  toggle.addEventListener("click", function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleNewsPicked(item);
+  });
+  return toggle;
+}
+
 function renderNewsSupplements() {
   var list = $("news-supplement-list");
   if (!list) { return; }
@@ -2802,7 +2843,10 @@ function renderNewsSupplements() {
     var title = String(item.title || item.name || item.url || item.link || "相关新闻");
     var url = String(item.url || item.link || item.source_url || "").trim();
     var isFocus = state.newsFocus && state.newsFocus.url === url && state.newsFocus.title === title;
+    var key = newsKey(item);
     row.classList.toggle("is-focus", !!isFocus);
+    row.classList.toggle("is-picked", !!(key && state.pickedNewsKeys && state.pickedNewsKeys[key]));
+    if (key) { row.appendChild(newsPickToggle(item)); }
     if (/^https?:\/\//i.test(url)) {
       var link = document.createElement("a");
       link.href = url;
@@ -2840,6 +2884,7 @@ function invalidateRelatedSearch() {
   state.relatedSearchGen += 1;
   if (waitRunning("related_search")) { waitStop("related_search"); }
   state.newsSupplements = [];
+  state.pickedNewsKeys = {};
   state.newsFocus = null;
   renderNewsSupplements();
   renderPickedDock();
@@ -2882,6 +2927,7 @@ function relatedSearch() {
   var gen = ++state.relatedSearchGen;
   var button = $("related-search-btn");
   state.newsSupplements = [];
+  state.pickedNewsKeys = {};
   renderNewsSupplements();
   toggleNewsSupplementDrawer(true);
   status("news-supplement-status", state.articleDirty ? "正在保存修改并检索相关新闻…" : "正在检索相关新闻…");
@@ -3642,6 +3688,8 @@ function generate() {
   }
   var pasted = String((($("article-paste") || {}).value) || "").trim();
   if (pasted) { payload.pasted_text = pasted.slice(0, 20000); }
+  var related = selectedNewsItems();
+  if (related.length) { payload.related_items = related; }
   if (waitRunning("generate")) { return; }
   busy(button, true);
   waitStart("generate");
@@ -4626,6 +4674,10 @@ function renderSkillPackage(payload) {
   $("skills-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
   $("skills-select-all").disabled = !images.length;
   $("skills-render-btn").disabled = !selectedSkills(pack).length;
+  var coverBtn = $("skills-cover-btn");
+  if (coverBtn) {
+    coverBtn.disabled = !images.some(function (image) { return image.kind === "cover" && image.url; });
+  }
   renderGithubTokenState(pack);
   if (waitRunning("skill_search")) { paintWait(); }
 }
@@ -5023,6 +5075,40 @@ function queueSkillImagesForRender() {
   pack.images = queuedSkillImages(pack);
   renderSkillsGallery();
 }
+function renderSkillCoverOnly() {
+  var pack = state.skillsPackage || {};
+  if (!skillImages().some(function (image) { return image.kind === "cover" && image.url; })) {
+    status("hotspot-status", "请先生成图片，再只更新封面", "error");
+    return;
+  }
+  if (waitRunning("skill_render")) { return; }
+  var button = $("skills-cover-btn");
+  if (button) { busy(button, true); }
+  waitStart("skill_render");
+  var laneStatus = function (text, kind) {
+    if (state.lane === "skills") { status("hotspot-status", text, kind); }
+  };
+  laneStatus("正在只重新生成封面海报…");
+  waitApi("skill_render", "/api/skills/render", {
+    theme: state.githubTheme || "dark",
+    palette: visualPalette(),
+    poster_template: state.posterTemplate || "1",
+    title: String((($("skill-title") || {}).value) || "").trim(),
+    cover_only: true
+  }).then(function (data) {
+    if (waitCancelled("skill_render")) { return; }
+    renderSkillPackage(data);
+    laneStatus("封面海报已更新", "ok");
+    waitDone("封面海报已更新", "skill_render");
+  }).catch(function (error) {
+    if (isWaitAbort(error, "skill_render")) { return; }
+    var reason = error.reason || error.message || "封面更新失败";
+    laneStatus("封面更新失败：" + reason, "error");
+    waitFail(reason, "skill_render");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
 function renderSkillImages() {
   var pack = state.skillsPackage || {};
   if (!collectedSkills(pack).length) {
@@ -5380,6 +5466,7 @@ $("skill-title").addEventListener("change", saveSkillTitle);
 $("skill-token-save").addEventListener("click", saveGithubToken);
 $("skill-token-clear").addEventListener("click", clearGithubToken);
 $("skills-render-btn").addEventListener("click", renderSkillImages);
+$("skills-cover-btn").addEventListener("click", renderSkillCoverOnly);
 $("skills-select-all").addEventListener("click", selectAllSkillImages);
 $("skills-export-btn").addEventListener("click", exportSkillImages);
 $("gh-theme-dark").addEventListener("click", function () { setGithubTheme("dark"); });
@@ -6001,6 +6088,7 @@ class WebApp:
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         item_ids: list[str] | None = None,
         pasted_text: str | None = None,
+        related_items: object = None,
     ) -> dict[str, object]:
         if not self._article_model_configured:
             raise ValueError("article_model_not_configured")
@@ -6018,6 +6106,7 @@ class WebApp:
                 self.xiaohongshu_config.get("account_name") or "",
                 item_ids,
                 pasted_text=pasted_text,
+                related_items=related_items,
             ),
         }
 
@@ -6797,6 +6886,8 @@ class WebApp:
                 current.append(image)
             publish_images(current)
 
+        cover_only = bool(body.get("cover_only"))
+        writer = None if cover_only else self._skill_copy_writer()
         try:
             images = render_skill_package(
                 snapshot,
@@ -6805,10 +6896,28 @@ class WebApp:
                 palette=palette,
                 screenshot_fn=self.skill_screenshot,
                 visual_renderer=self.visual_renderer,
-                copy_writer=self._skill_copy_writer(),
+                copy_writer=writer,
                 on_image=on_image,
                 poster_template=poster_template,
+                cover_only=cover_only,
             )
+            if cover_only:
+                previous = list(snapshot.get("images") or [])
+                cover_row = next(
+                    (row for row in images if str(row.get("kind") or "") == "cover"),
+                    images[0] if images else None,
+                )
+                merged: list[dict[str, object]] = []
+                replaced = False
+                for row in previous:
+                    if str(row.get("kind") or row.get("id") or "") == "cover":
+                        merged.append(cover_row or row)
+                        replaced = True
+                    else:
+                        merged.append(row)
+                if not replaced and cover_row is not None:
+                    merged.insert(0, cover_row)
+                images = merged or images
         except Exception as exc:
             # Never leave the package parked in "rendering": that phase is what
             # refused the next paste.
@@ -7414,6 +7523,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         else DEFAULT_ARTICLE_PROMPT_STYLE,
                         item_ids,
                         payload.get("pasted_text") if isinstance(payload, dict) else None,
+                        payload.get("related_items") if isinstance(payload, dict) else None,
                     )
                 elif self.path == "/api/related-search":
                     result = app.related_search(payload)

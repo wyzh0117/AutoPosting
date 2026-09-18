@@ -779,7 +779,10 @@ def find_skills(
         package_path: str = "",
         detail: str = "",
     ) -> dict[str, object]:
-        skills = [_public_skill(skill) for skill in cap_skills(collected, stages)]
+        skills = [
+            _public_skill(skill)
+            for skill in cap_skills(_dedupe_by_skill_name(collected), stages)
+        ]
         filled = _filled_stages(stages, skills)
         visible = _visible_stages(stages, skills)
         use_filled = phase in {"group", "compose", "skills_ready", "error"}
@@ -936,7 +939,7 @@ def find_skills(
             token in str(exc) for token in ("skill_search_budget", "skill_stage_quota")
         ):
             raise
-    capped = cap_skills(collected, stages)
+    capped = cap_skills(_dedupe_by_skill_name(collected), stages)
     kept_ids = {id(row) for row in capped}
     # The cap is a real limit and pasted skills are pinned, so a big package can
     # only make room by dropping a searched skill. That must be visible: a silent
@@ -1385,6 +1388,31 @@ def apply_skill_selection(
             item["selected"] = True
             picked.append(item)
     return picked
+
+
+def _dedupe_by_skill_name(skills: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Keep one searched skill per name. Manual rows are never collapsed."""
+    kept: list[dict[str, object]] = []
+    index_by_name: dict[str, int] = {}
+    for skill in skills:
+        if skill.get("gap"):
+            kept.append(skill)
+            continue
+        name = str(skill.get("name") or "").strip().lower()
+        if not name or skill.get("manual"):
+            kept.append(skill)
+            continue
+        previous = index_by_name.get(name)
+        if previous is None:
+            index_by_name[name] = len(kept)
+            kept.append(skill)
+            continue
+        current = kept[previous]
+        if current.get("manual"):
+            continue
+        if _popularity(skill) > _popularity(current):
+            kept[previous] = skill
+    return kept
 
 
 def cap_skills(
@@ -2356,6 +2384,7 @@ def render_skill_package(
     copy_writer: Callable[[list[dict[str, object]]], list[dict[str, object]]] | None = None,
     on_image: Callable[[dict[str, object]], None] | None = None,
     poster_template: str = "1",
+    cover_only: bool = False,
 ) -> list[dict[str, object]]:
     from .visual.weekly import render_weekly_visual
 
@@ -2366,8 +2395,15 @@ def render_skill_package(
     # same set the individual posters are cut from.
     skills = aggregate_skills(snapshot)
     repos = skills_as_repos(skills)
-    _prune_stale_pages(images_dir, {str(job["id"]) for job in _plan_jobs(snapshot, repos)})
-    if copy_writer is not None:
+    planned = _plan_jobs(snapshot, repos)
+    if cover_only:
+        keep = {path.stem for path in images_dir.glob("*.html")}
+        keep.update(path.stem for path in images_dir.glob("*.png"))
+        keep.add("cover")
+        _prune_stale_pages(images_dir, keep)
+    else:
+        _prune_stale_pages(images_dir, {str(job["id"]) for job in planned})
+    if copy_writer is not None and not cover_only:
         from .copy_validate import require_enriched_copy
 
         enriched = copy_writer(repos)
@@ -2410,6 +2446,8 @@ def render_skill_package(
         }
         for repo in repos
     )
+    if cover_only:
+        jobs = [job for job in jobs if job.get("kind") == "cover"]
     if visual_renderer is not None:
         # Keep the injected screenshot hook useful for lightweight renderers
         # (tests and local adapters) while the production path below remains a

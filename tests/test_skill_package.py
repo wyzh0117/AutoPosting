@@ -398,6 +398,42 @@ class AggregateTests(unittest.TestCase):
             self.assertIn("本周值得装的 3 个 Skill", cover)
             self.assertNotIn("模型写的标题", cover)
 
+    def test_cover_only_rerender_updates_title_and_keeps_posters(self) -> None:
+        snapshot = {
+            "title": "旧标题",
+            "user_title": "旧标题",
+            "stages": [{"id": "topic", "name": "选题"}],
+            "skills": [
+                {"name": "topic-radar", "source": "GitHub", "source_id": "acme/topic-radar",
+                 "description": "选题趋势", "stage_id": "topic", "stage_name": "选题"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            with _OfflineMarks():
+                first = render_skill_package(
+                    snapshot,
+                    out,
+                    screenshot_fn=_offline_render(),
+                    copy_writer=stub_copy_writer,
+                )
+            poster = next(card for card in first if card["kind"] == "poster")
+            poster_html = (out / f"{poster['id']}.html").read_text(encoding="utf-8")
+            snapshot["user_title"] = "只改封面的新标题"
+            with _OfflineMarks():
+                second = render_skill_package(
+                    snapshot,
+                    out,
+                    screenshot_fn=_offline_render(),
+                    cover_only=True,
+                )
+            self.assertEqual(["cover"], [card["kind"] for card in second])
+            cover = (out / "cover.html").read_text(encoding="utf-8")
+            self.assertIn("只改封面的新标题", cover)
+            self.assertNotIn("旧标题", cover)
+            self.assertTrue((out / f"{poster['id']}.html").is_file())
+            self.assertEqual(poster_html, (out / f"{poster['id']}.html").read_text(encoding="utf-8"))
+
 
 class SkillPackageApiTests(unittest.TestCase):
     """The lane as the browser drives it: paste, title, render, sources, clear."""

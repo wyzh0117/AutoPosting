@@ -80,6 +80,37 @@ def _with_pasted_page(
     return f"{prefix}用户粘贴的原文页面：\n{clipped}", updated
 
 
+def _with_related_news(
+    material: str, background: dict[str, object], related_items: object
+) -> tuple[str, dict[str, object]]:
+    if not isinstance(related_items, list) or not related_items:
+        return material, background
+    rows: list[str] = []
+    for item in related_items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        url = str(item.get("url") or item.get("link") or item.get("source_url") or "").strip()
+        snippet = str(
+            item.get("snippet") or item.get("summary") or item.get("description") or ""
+        ).strip()
+        if not title and not snippet:
+            continue
+        block = title
+        if snippet:
+            block = f"{block}\n{snippet}" if block else snippet
+        if url:
+            block = f"{block}\n{url}"
+        rows.append(block)
+    if not rows:
+        return material, background
+    clipped = ("相关新闻补充：\n" + "\n\n".join(rows))[:PASTED_PAGE_LIMIT]
+    updated = dict(background)
+    updated["related_news"] = clipped
+    prefix = f"{material}\n\n" if str(material or "").strip() else ""
+    return f"{prefix}{clipped}", updated
+
+
 def xhs_fields(
     title: str,
     caption: str,
@@ -597,6 +628,7 @@ class Workbench:
         xhs_handle: str = "",
         item_ids: list[str] | None = None,
         pasted_text: str | None = None,
+        related_items: object = None,
     ) -> dict[str, object]:
         if platform not in {"wechat", "xiaohongshu"}:
             raise ValueError(f"unsupported platform: {platform}")
@@ -613,6 +645,7 @@ class Workbench:
                 prompt_style=prompt_style,
                 xhs_handle=xhs_handle,
                 pasted_text=pasted_text,
+                related_items=related_items,
             )
         if ids:
             item_id = ids[0]
@@ -684,6 +717,7 @@ class Workbench:
         if hooks:
             background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)
+        material, background = _with_related_news(material, background, related_items)
         article = self.llm_service.generate_article(
             platform,
             str(item["title"]),
@@ -791,6 +825,7 @@ class Workbench:
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         xhs_handle: str = "",
         pasted_text: str | None = None,
+        related_items: object = None,
     ) -> dict[str, object]:
         preset_style = load_article_style_prompt(prompt_style)
         prepared: list[dict[str, object]] = []
@@ -864,6 +899,7 @@ class Workbench:
         if hooks:
             background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)
+        material, background = _with_related_news(material, background, related_items)
         article = self.llm_service.generate_article(
             platform,
             fused_title,

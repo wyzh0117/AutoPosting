@@ -39,6 +39,7 @@ from autoposting.skill_finder import (
     _skills_sh_search,
     add_manual_skills,
     cap_skills,
+    _dedupe_by_skill_name,
     decompose_coverage,
     extract_keywords,
     fetch_skill_md,
@@ -2056,6 +2057,42 @@ class SkillPosterCopyTests(unittest.TestCase):
         },
     ]
 
+    def test_search_dedupes_skills_by_name_only(self) -> None:
+        rows = _dedupe_by_skill_name(
+            [
+                {
+                    "name": "video-edit",
+                    "source_id": "acme/video-edit",
+                    "stars": 10,
+                    "stage_id": "edit",
+                },
+                {
+                    "name": "Video-Edit",
+                    "source_id": "other/video-edit",
+                    "stars": 80,
+                    "stage_id": "edit",
+                },
+                {
+                    "name": "cover-maker",
+                    "source_id": "acme/cover-maker",
+                    "stars": 5,
+                    "stage_id": "cover",
+                },
+                {
+                    "name": "video-edit",
+                    "source_id": "pasted/video-edit",
+                    "stars": 1,
+                    "manual": True,
+                    "stage_id": "edit",
+                },
+            ]
+        )
+        searched = [row for row in rows if not row.get("manual")]
+        manuals = [row for row in rows if row.get("manual")]
+        self.assertEqual(["Video-Edit", "cover-maker"], [row["name"] for row in searched])
+        self.assertEqual("other/video-edit", searched[0]["source_id"])
+        self.assertEqual(["video-edit"], [row["name"] for row in manuals])
+
     def test_kind_is_a_capability_category_never_the_source(self) -> None:
         rows = skills_as_repos(self.SKILLS)
         kinds = [str(row["kind"]) for row in rows]
@@ -2956,6 +2993,9 @@ class SkillFinderApiTests(unittest.TestCase):
         )
         gallery = html.index('id="skills-gallery"')
         toolbar = html.index('id="skills-render-btn"')
+        self.assertIn('id="skills-cover-btn"', html)
+        self.assertIn("function renderSkillCoverOnly()", html)
+        self.assertIn("cover_only: true", html)
         self.assertLess(toolbar, gallery, msg="工具栏必须紧贴画廊上方")
         self.assertNotIn('id="skills-article"', html[toolbar:gallery])
         article_css = html.split("#skills-article{")[1].split("}")[0]

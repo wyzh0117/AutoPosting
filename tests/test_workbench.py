@@ -489,6 +489,27 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("这是用户从内容页粘贴进来的完整正文，必须进入生成提示。", prompt)
         self.assertIn("pasted_page", prompt)
 
+    def test_generate_article_includes_selected_related_news(self) -> None:
+        item_id = self._named_item("news-1", "Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+        workbench.generate_article(
+            item_id,
+            "wechat",
+            related_items=[
+                {
+                    "title": "补充新闻标题",
+                    "url": "https://news.example/extra",
+                    "snippet": "这条相关新闻必须进入生成提示。",
+                }
+            ],
+        )
+        prompt = model.calls[-1][2]
+        self.assertIn("补充新闻标题", prompt)
+        self.assertIn("这条相关新闻必须进入生成提示。", prompt)
+        self.assertIn("https://news.example/extra", prompt)
+        self.assertIn("related_news", prompt)
+
     def test_generate_article_item_ids_fuses_two_items_into_one_prompt(self) -> None:
         first_id = self._named_item("fuse-a", "Alpha launch", "Alpha body from lab")
         second_id = self._named_item("fuse-b", "Beta debate", "Beta body from media")
