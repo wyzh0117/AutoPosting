@@ -26,6 +26,7 @@ from .db import Database
 from .images import BROWSER_UA
 from .linked_works import fetch_linked_works
 from .normalize import canonicalize_url, normalize_text
+from .reader import ReaderService
 
 Fetcher = Callable[[str], bytes]
 WEB_RESULT_LIMIT = 5
@@ -1429,10 +1430,7 @@ def excerpt_page(payload: bytes) -> str:
 
 
 def article_page_text(payload: bytes) -> str:
-    parser = _ArticleTextParser()
-    parser.feed(payload.decode("utf-8", errors="replace"))
-    parser.close()
-    return parser.text()
+    return ReaderService().read_payload(payload).text
 
 
 def gather_background(
@@ -1442,6 +1440,7 @@ def gather_background(
     item_id: str = "",
     page_url: str = "",
     fetcher: Fetcher | None = None,
+    render_fetcher: Callable[[str], object] | None = None,
 ) -> BackgroundNote:
     focus = infer_focus(title, summary)
     note = BackgroundNote(focus=focus, query=search_query(title), source_excerpt=normalize_text(summary)[:PAGE_TEXT_LIMIT])
@@ -1451,9 +1450,12 @@ def gather_background(
         note.local = []
     if fetcher is not None and page_url:
         try:
-            excerpt = excerpt_page(fetcher(page_url))
-            if excerpt:
-                note.source_excerpt = excerpt
+            document = ReaderService(
+                fetcher=fetcher,
+                render_fetcher=render_fetcher,
+            ).read(page_url)
+            if document.status in {"full", "partial"} and document.text:
+                note.source_excerpt = document.text[:PAGE_TEXT_LIMIT]
         except (OSError, TimeoutError, ValueError, UnicodeError):
             pass
     if fetcher is not None:

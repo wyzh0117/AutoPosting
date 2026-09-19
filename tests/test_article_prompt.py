@@ -34,8 +34,8 @@ class ArticlePromptDocTests(unittest.TestCase):
             self.assertTrue(prompts[style_id])
             self.assertEqual(expected_files[style_id], article_style_prompt_paths(style_id)[0].name)
         self.assertEqual(3, len(set(prompts.values())))
-        self.assertIn("不要把写作提纲暴露给读者", prompts["AI专家"])
-        self.assertIn("一般人容易看漏的角度", prompts["AI专家"])
+        self.assertIn("结构留给写作者，不要留给读者", prompts["AI专家"])
+        self.assertIn("一般人容易忽略的角度", prompts["AI专家"])
         self.assertIn("拆解", prompts["经验分享"])
         self.assertIn("梳理", prompts["经验分享"])
         self.assertIn("解读", prompts["经验分享"])
@@ -75,8 +75,8 @@ class ArticlePromptDocTests(unittest.TestCase):
             style="短句",
             preset_style=expert,
         )
-        self.assertIn("一般人容易看漏的角度", wechat)
-        self.assertLess(wechat.index("一般人容易看漏的角度"), wechat.index("短句"))
+        self.assertIn("一般人容易忽略的角度", wechat)
+        self.assertLess(wechat.index("一般人容易忽略的角度"), wechat.index("短句"))
         self.assertIn("lab_blog", wechat)
         self.assertIn("写作风格要求：", wechat)
         self.assertIn("短句", wechat)
@@ -96,7 +96,7 @@ class ArticlePromptDocTests(unittest.TestCase):
             {"title": "t", "summary": "s", "background": {}},
             preset_style=expert,
         )
-        self.assertIn("小红书更快、更短", notes)
+        self.assertIn("更快、更短", notes)
         self.assertIn("caption", notes)
         self.assertIn("- ", notes)
         self.assertNotIn("前因与脉络", notes)
@@ -128,5 +128,5 @@ class ArticlePromptDocTests(unittest.TestCase):
         prompt = fake.calls[0][2]
         self.assertIn("文章生成基础约束", load_article_prompt_doc())
         self.assertIn(load_article_style_prompt("AI专家"), prompt)
-        self.assertIn("一般人容易看漏的角度", prompt)
-        self.assertIn("不要把写作提纲暴露给读者", prompt)
+        self.assertIn("一般人容易忽略的角度", prompt)
+        self.assertIn("结构留给写作者，不要留给读者", prompt)

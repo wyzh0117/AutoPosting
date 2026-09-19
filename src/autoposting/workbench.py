@@ -54,6 +54,7 @@ from .llm import ARTICLE_PROMPT_VERSION, LLMError, LLMService
 from .pipeline import collect_sources
 from .publishing import PublicationError
 from .models import Source
+from .radar import rank_events
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +110,36 @@ def _with_related_news(
     updated["related_news"] = clipped
     prefix = f"{material}\n\n" if str(material or "").strip() else ""
     return f"{prefix}{clipped}", updated
+
+
+def _with_radar_evidence(
+    background: dict[str, object], radar_event: object
+) -> dict[str, object]:
+    """Pass compact, typed event evidence into the existing writer payload."""
+    if not isinstance(radar_event, dict):
+        return background
+    evidence = radar_event.get("evidence_pack")
+    if not isinstance(evidence, dict):
+        return background
+    updated = dict(background)
+    updated["evidence_pack"] = dict(evidence)
+    updated["radar_event"] = {
+        key: radar_event[key]
+        for key in (
+            "event_id",
+            "title",
+            "topic",
+            "importance_score",
+            "attention_score",
+            "priority_score",
+            "canonical_source",
+            "supporting_sources",
+            "community_sources",
+            "discussion_sources",
+        )
+        if key in radar_event
+    }
+    return updated
 
 
 def xhs_fields(
@@ -375,6 +406,63 @@ def _decorate_candidate(
     return entry
 
 
+def _radar_source_metadata(sources: tuple[Source, ...]) -> dict[str, dict[str, object]]:
+    return {
+        source.source_id: {
+            "source_id": source.source_id,
+            "name": source.name,
+            "source_type": source.type,
+            "tier": source.tier,
+            "url": source.url_or_handle,
+            "identity_verified": source.identity_verified,
+        }
+        for source in sources
+    }
+
+
+def _radar_row(
+    row: dict[str, object], source_metadata: dict[str, dict[str, object]]
+) -> dict[str, object]:
+    enriched = dict(row)
+    enriched["source_metadata"] = {
+        source_id: dict(source_metadata[source_id])
+        for source_id in row.get("source_ids") or ()
+        if source_id in source_metadata
+    }
+    return enriched
+
+
+def _radar_event_candidate(
+    event: dict[str, object],
+    rows_by_id: dict[str, dict[str, object]],
+    translated: dict[str, dict[str, str]],
+) -> dict[str, object] | None:
+    representative_id = str(
+        event.get("representative_item_id") or event.get("canonical_item_id") or ""
+    )
+    row = rows_by_id.get(representative_id)
+    if row is None:
+        item_ids = event.get("item_ids") or ()
+        representative_id = str(next(iter(item_ids), ""))
+        row = rows_by_id.get(representative_id)
+    if row is None:
+        return None
+    candidate = _decorate_candidate(row, translated)
+    source_ids = [str(value) for value in (event.get("source_ids") or ()) if str(value)]
+    source_urls = [
+        str(source.get("url") or "")
+        for source in (event.get("sources") or ())
+        if isinstance(source, dict) and str(source.get("url") or "")
+    ]
+    candidate["item_id"] = representative_id
+    if source_ids:
+        candidate["source_ids"] = source_ids
+        candidate["source_count"] = len(source_ids)
+    if source_urls:
+        candidate["source_urls"] = source_urls
+    return candidate
+
+
 class HotspotService:
     def __init__(
         self,
@@ -389,7 +477,9 @@ class HotspotService:
         self.llm_service = llm_service
         self.x_bearer_token = ""
 
-    def source_health(self, now: datetime | None = None) -> list[dict[str, object]]:
+    def source_health(
+        self, now: datetime | None = None, *, persist: bool = True
+    ) -> list[dict[str, object]]:
         moment = now or datetime.now(timezone.utc)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
@@ -397,8 +487,16 @@ class HotspotService:
         for source in self.sources:
             if source.type == "reddit":
                 continue
-            self.database.upsert_source(source)
-            row = self.database.get_source(source.source_id)
+            if persist:
+                self.database.upsert_source(source)
+            try:
+                row = self.database.get_source(source.source_id)
+            except KeyError:
+                row = {
+                    "fetch_interval_minutes": source.fetch_interval_minutes,
+                    "last_fetched_at": None,
+                    "last_error": None,
+                }
             health.append(_source_health_entry(source, row, moment))
         return health
 
@@ -433,6 +531,7 @@ class HotspotService:
             x_bearer_token=self.x_bearer_token,
         )
         payload = self.list_window(hours, translate=False, lane=lane)
+        self._persist_radar_snapshots(payload)
         payload["collection"] = {
             "inserted": batch.inserted,
             "duplicates": batch.duplicates,
@@ -445,6 +544,41 @@ class HotspotService:
         }
         return payload
 
+    def _persist_radar_snapshots(self, payload: dict[str, object]) -> None:
+        radar = payload.get("radar")
+        if not isinstance(radar, dict):
+            return
+        events = radar.get("events")
+        if not isinstance(events, list):
+            return
+        rows: list[dict[str, object]] = []
+        observed_at = datetime.now(timezone.utc).isoformat()
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_id = str(event.get("event_id") or "").strip()
+            engagement = event.get("engagement_by_platform")
+            if not event_id or not isinstance(engagement, dict):
+                continue
+            for platform, value in engagement.items():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric <= 0:
+                    continue
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "platform": str(platform),
+                        "metric": "engagement",
+                        "value": numeric,
+                        "observed_at": observed_at,
+                    }
+                )
+        if rows:
+            self.database.record_engagement_snapshots(rows)
+
     def list_window(
         self, hours: int = 4, *, translate: bool = True, lane: str = "hotspots"
     ) -> dict[str, object]:
@@ -454,7 +588,8 @@ class HotspotService:
             raise ValueError(
                 f"hours must be between {HOTSPOT_HOUR_MIN} and {HOTSPOT_HOUR_MAX}"
             )
-        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=hours)
         time_rows = [
             row
             for row in self.database.list_hotspot_candidates(
@@ -491,13 +626,65 @@ class HotspotService:
                 ],
                 cache_only=not translate,
             )
-        time_candidates = [_decorate_candidate(row, translated) for row in time_rows]
-        heat_candidates = [_decorate_candidate(row, translated) for row in heat_rows]
+        source_metadata = _radar_source_metadata(self.sources)
+        radar_rows = [
+            _radar_row(row, source_metadata) for row in (*time_rows, *heat_rows)
+        ]
+        rows_by_id = {str(row["item_id"]): row for row in radar_rows}
+        snapshots = self.database.list_engagement_snapshots()
+        radar_events = rank_events(radar_rows, snapshots=snapshots, now=now)
+        event_by_id = {
+            str(event["event_id"]): event
+            for event in radar_events
+            if event.get("event_id")
+        }
+        event_by_item_id = {
+            str(item_id): str(event["event_id"])
+            for event in radar_events
+            for item_id in event.get("item_ids") or ()
+        }
+
+        def event_ids_for(rows: list[dict[str, object]]) -> list[str]:
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for row in rows:
+                event_id = event_by_item_id.get(str(row.get("item_id") or ""))
+                if event_id and event_id not in seen:
+                    seen.add(event_id)
+                    ordered.append(event_id)
+            return ordered
+
+        time_event_ids = event_ids_for(time_rows)
+        heat_event_ids = event_ids_for(heat_rows)
+        time_candidates = [
+            candidate
+            for event_id in time_event_ids
+            if (candidate := _radar_event_candidate(event_by_id[event_id], rows_by_id, translated)) is not None
+        ]
+        heat_candidates = [
+            candidate
+            for event_id in heat_event_ids
+            if (candidate := _radar_event_candidate(event_by_id[event_id], rows_by_id, translated)) is not None
+        ]
+        priority_candidates = [
+            candidate
+            for event in radar_events[:HOTSPOT_LIMIT]
+            if (candidate := _radar_event_candidate(event, rows_by_id, translated)) is not None
+        ]
         return {
             "hours": hours,
-            "candidates": time_candidates,
+            "candidates": priority_candidates,
+            # Keep the legacy time/heat tabs intact; the primary candidates
+            # list is the new event-level priority order.
             "rankings": {"time": time_candidates, "heat": heat_candidates},
-            "sources": self.source_health(),
+            "sources": self.source_health(persist=False),
+            "radar": {
+                "events": radar_events,
+                "rankings": {
+                    "time": [event_by_id[event_id] for event_id in time_event_ids],
+                    "heat": [event_by_id[event_id] for event_id in heat_event_ids],
+                },
+            },
         }
 
 
@@ -508,11 +695,13 @@ class Workbench:
         llm_service: LLMService | None = None,
         page_fetcher=None,
         image_fetcher=None,
+        render_fetcher=None,
     ) -> None:
         self.database = database
         self.llm_service = llm_service
         self.page_fetcher = page_fetcher
         self.image_fetcher = image_fetcher
+        self.render_fetcher = render_fetcher
 
     def find_hooks(self, item_id: str, searcher=None) -> dict[str, object]:
         item = self.database.get_item(item_id)
@@ -530,6 +719,7 @@ class Workbench:
             item_id=item_id,
             page_url=page_url,
             fetcher=self.page_fetcher,
+            render_fetcher=self.render_fetcher,
         )
         excerpt = notes.source_excerpt or str(item["content_text"])
         extra = (
@@ -629,6 +819,7 @@ class Workbench:
         item_ids: list[str] | None = None,
         pasted_text: str | None = None,
         related_items: object = None,
+        radar_event: object = None,
     ) -> dict[str, object]:
         if platform not in {"wechat", "xiaohongshu"}:
             raise ValueError(f"unsupported platform: {platform}")
@@ -646,6 +837,7 @@ class Workbench:
                 xhs_handle=xhs_handle,
                 pasted_text=pasted_text,
                 related_items=related_items,
+                radar_event=radar_event,
             )
         if ids:
             item_id = ids[0]
@@ -709,11 +901,13 @@ class Workbench:
             item_id=item_id,
             page_url=page_url,
             fetcher=self.page_fetcher,
+            render_fetcher=self.render_fetcher,
         )
         material = notes.source_excerpt or str(item["content_text"])
         hooks = sanitize_chosen_hooks(chosen_hooks)
         background = notes.as_prompt()
         background["source_refs"] = source_refs
+        background = _with_radar_evidence(background, radar_event)
         if hooks:
             background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)
@@ -826,6 +1020,7 @@ class Workbench:
         xhs_handle: str = "",
         pasted_text: str | None = None,
         related_items: object = None,
+        radar_event: object = None,
     ) -> dict[str, object]:
         preset_style = load_article_style_prompt(prompt_style)
         prepared: list[dict[str, object]] = []
@@ -891,11 +1086,13 @@ class Workbench:
             item_id="",
             page_url="",
             fetcher=self.page_fetcher,
+            render_fetcher=self.render_fetcher,
         )
         material = fused_content or notes.source_excerpt
         hooks = sanitize_chosen_hooks(chosen_hooks)
         background = notes.as_prompt()
         background["source_refs"] = source_refs
+        background = _with_radar_evidence(background, radar_event)
         if hooks:
             background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)

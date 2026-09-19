@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
@@ -361,7 +362,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("1.4.9", payload["version"])
+        self.assertEqual("2.0.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -434,6 +435,68 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["candidates"], payload["rankings"]["time"])
         status, payload = self._request("GET", "/api/hotspots?hours=nope")
         self.assertEqual(400, status)
+
+    def test_radar_is_nested_and_get_does_not_write_snapshots(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem(
+                "radar-1",
+                "https://lab.example/radar-1",
+                "OpenAI announces Orion model",
+                "OpenAI announces Orion model 内容",
+                now,
+                {"score": "80"},
+            ),
+        )
+        before = {
+            source.source_id: self.db.get_source(source.source_id).get("updated_at")
+            for source in self.sources
+        }
+        self.assertEqual([], self.db.list_engagement_snapshots())
+
+        status, payload = self._request("GET", "/api/hotspots?hours=4")
+
+        self.assertEqual(200, status)
+        self.assertEqual([], self.db.list_engagement_snapshots())
+        self.assertEqual(
+            before,
+            {
+                source.source_id: self.db.get_source(source.source_id).get("updated_at")
+                for source in self.sources
+            },
+        )
+        self.assertIn("radar", payload)
+        event = payload["radar"]["events"][0]
+        self.assertIn("event_id", event)
+        self.assertIn("importance_score", event)
+        self.assertIn("attention_score", event)
+        self.assertIn("priority_score", event)
+        self.assertIn("evidence_pack", event)
+
+        status, collected = self._request("POST", "/api/collect", {"hours": 4})
+
+        self.assertEqual(200, status)
+        snapshots = self.db.list_engagement_snapshots()
+        self.assertTrue(snapshots)
+        self.assertEqual(
+            {row["event_id"] for row in snapshots},
+            {
+                row["event_id"]
+                for row in collected["radar"]["events"]
+                if any(float(value or 0) > 0 for value in (row.get("engagement_by_platform") or {}).values())
+            },
+        )
+        self.model.calls = []
+        article_status, _article = self._request(
+            "POST",
+            "/api/articles",
+            {"item_id": collected["candidates"][0]["item_id"], "platform": "wechat"},
+        )
+        self.assertEqual(200, article_status)
+        self.assertTrue(self.model.calls)
+        self.assertIn("evidence_pack", self.model.calls[-1][2])
+        self.assertIn("priority_score", self.model.calls[-1][2])
 
     def test_hotspots_translate_query_uses_model(self) -> None:
         self._insert_item(self.sources[0], "en-1", "English model news", "https://lab.example/en-1")
@@ -746,6 +809,13 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("complete English article body", payload["content"])
         self.assertNotIn("menu noise", payload["content"])
         self.assertEqual("page", payload["content_source"])
+        self.assertEqual("full", payload["reader_status"])
+        self.assertEqual("full", payload["status"])
+        self.assertGreaterEqual(float(payload["quality_score"]), 0.55)
+        self.assertIsNone(payload["failure_reason"])
+        self.assertEqual("https://lab.example/original", payload["canonical_url"])
+        self.assertEqual("http", payload["fetch_method"])
+        self.assertEqual("html", payload["extractor"])
         self.assertTrue(payload["translatable"])
         self.assertIn("中文摘要", translated["translation"])
         self.assertEqual("https://lab.example/original", payload["sources"][0]["url"])
@@ -787,6 +857,109 @@ class WebApiTests(unittest.TestCase):
             )
             self.assertEqual(200, scheme_status)
             self.assertEqual([], scheme_payload["sources"])
+
+    def test_original_endpoint_reuses_full_feed_content_without_fetching(self) -> None:
+        body = "The feed already contains the complete article and its verified context. " * 10
+        self.db.insert_item(
+            self.sources[0],
+            FeedItem(
+                "full-feed-original",
+                "https://lab.example/full-feed-original",
+                "Full feed article",
+                body,
+                None,
+                {},
+            ),
+        )
+        item_id = str(
+            self.db.connect()
+            .execute(
+                "SELECT item_id FROM items WHERE external_id = ?",
+                ("full-feed-original",),
+            )
+            .fetchone()["item_id"]
+        )
+        calls: list[str] = []
+
+        def should_not_fetch(url: str) -> bytes:
+            calls.append(url)
+            raise AssertionError("full RSS content should not trigger a page fetch")
+
+        self.app.workbench.page_fetcher = should_not_fetch
+
+        result = self.app.original(item_id)
+
+        self.assertEqual("feed", result["content_source"])
+        self.assertEqual(body, result["content"])
+        self.assertEqual("full", result["reader_status"])
+        self.assertEqual("rss", result["fetch_method"])
+        self.assertEqual("rss", result["extractor"])
+        self.assertEqual("https://lab.example/full-feed-original", result["canonical_url"])
+        self.assertEqual([], calls)
+
+    def test_original_endpoint_uses_injected_dynamic_reader(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "dynamic-original", "Dynamic report", "https://lab.example/dynamic"
+        )
+        static_shell = b'<html><body><div id="app"></div><script>boot()</script></body></html>'
+        rendered = (
+            "<article><h1>Dynamic report</h1><p>"
+            + "The rendered page contains the complete verified report and context. " * 10
+            + "</p></article>"
+        )
+        calls: list[str] = []
+
+        def render_fetcher(url: str) -> str:
+            calls.append(url)
+            return rendered
+
+        app = WebApp(
+            self.db,
+            self.sources,
+            self.root / "dynamic-reader",
+            page_fetcher=lambda _url: static_shell,
+            render_fetcher=render_fetcher,
+            credential_store=self.credentials,
+        )
+
+        result = app.original(item_id)
+
+        self.assertEqual("page", result["content_source"])
+        self.assertEqual("full", result["reader_status"])
+        self.assertEqual("dynamic", result["fetch_method"])
+        self.assertIn("complete verified report", result["content"])
+        self.assertEqual(["https://lab.example/dynamic"], calls)
+
+    def test_original_endpoint_uses_lazy_default_dynamic_reader(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "default-dynamic-original", "Dynamic report", "https://lab.example/default-dynamic"
+        )
+        static_shell = b'<html><body><div id="app"></div><script>boot()</script></body></html>'
+        rendered = (
+            "<article><h1>Dynamic report</h1><p>"
+            + "The default rendered page contains the complete verified report. " * 10
+            + "</p></article>"
+        )
+        calls: list[str] = []
+
+        def default_renderer(url: str) -> str:
+            calls.append(url)
+            return rendered
+
+        with patch("autoposting.web.playwright_render_fetcher", default_renderer):
+            app = WebApp(
+                self.db,
+                self.sources,
+                self.root / "default-dynamic-reader",
+                page_fetcher=lambda _url: static_shell,
+                credential_store=self.credentials,
+            )
+            result = app.original(item_id)
+
+        self.assertEqual("full", result["reader_status"])
+        self.assertEqual("dynamic", result["fetch_method"])
+        self.assertIn("complete verified report", result["content"])
+        self.assertEqual(["https://lab.example/default-dynamic"], calls)
 
     def test_original_translation_requires_translation_model(self) -> None:
         item_id = self._insert_item(
@@ -2066,7 +2239,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("1.4.9", html)
+        self.assertIn("2.0.0", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)

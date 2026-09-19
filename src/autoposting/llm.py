@@ -39,7 +39,7 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/1.4.9"
+HTTP_USER_AGENT = "AutoPosting/2.0.0"
 LLM_TIMEOUT_SECONDS = 90
 LEADERBOARD_ENRICH_SECONDS = 180
 

@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .background import RELATED_SELECTION_LIMIT, article_page_text
+from .background import RELATED_SELECTION_LIMIT
 from .config import load_sources
 from .content import ContentWorkflow
 from .db import Database, model_endpoint_id
@@ -46,6 +46,7 @@ from .visual.tokens import normalize_poster_template, parse_palette
 from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
 from .publishing import PublicationError, PublicationService
+from .reader import ArticleDocument, ReaderService, playwright_render_fetcher
 from .scheduler import PublishScheduler, parse_run_at
 from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE
 from .workbench import (
@@ -62,7 +63,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "1.4.9"
+APP_VERSION = "2.0.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -1067,7 +1068,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v1.4.9 · 本地服务</span>
+  <span id="service-status">v2.0.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1461,6 +1462,7 @@ var state = {
   lane: "hotspots",
   newsStyle: "AI专家",
   rankings: {heat: [], time: []},
+  radarEvents: {},
   sources: [],
   platform: "wechat",
   item: null,
@@ -1890,6 +1892,12 @@ function renderHotspots(items) {
     if (heat.likes) { heatBits.push("赞 " + heat.likes); }
     if (heat.reposts) { heatBits.push("转 " + heat.reposts); }
     if (heatBits.length) { meta += " · " + heatBits.join(" "); }
+    var radar = state.radarEvents[item.item_id];
+    if (radar) {
+      meta += " · 重要 " + Number(radar.importance_score || 0).toFixed(1)
+        + " · 关注 " + Number(radar.attention_score || 0).toFixed(1)
+        + " · 优先 " + Number(radar.priority_score || 0).toFixed(1);
+    }
     if (item.discussion) { meta += " · 讨论观察"; }
     button.appendChild(el("span", "ht-meta", meta));
     button.addEventListener("click", function () { selectHotspot(item, button); });
@@ -3010,6 +3018,15 @@ function nextWiderHours(hours) {
 
 function applyHotspots(data, extraStatus) {
   state.rankings = data.rankings || {time: data.candidates || [], heat: data.candidates || []};
+  state.radarEvents = {};
+  var radarEvents = data.radar && Array.isArray(data.radar.events) ? data.radar.events : [];
+  radarEvents.forEach(function (event) {
+    var ids = [event.item_id, event.representative_item_id, event.canonical_item_id]
+      .concat(Array.isArray(event.item_ids) ? event.item_ids : []);
+    ids.forEach(function (itemId) {
+      if (itemId) { state.radarEvents[itemId] = event; }
+    });
+  });
   if (data.sources) { renderSourceHealth(data.sources); }
   setRank(state.rank);
   var shown = (state.rankings[state.rank] || []).length;
@@ -5683,6 +5700,7 @@ class WebApp:
         github_fetcher=None,
         leaderboard_service: LLMService | None = None,
         visual_renderer=None,
+        render_fetcher=None,
     ) -> None:
         self.database = database
         self.packages_dir = Path(packages_dir)
@@ -5701,6 +5719,7 @@ class WebApp:
         self._leaderboard_model_configured = leaderboard_service is not None
         self.visual_renderer = visual_renderer
         self.github_fetcher = github_fetcher
+        self.render_fetcher = render_fetcher or playwright_render_fetcher
         self.skill_complete = None
         self.skill_screenshot = None
         self.skill_web_search = None
@@ -5718,6 +5737,7 @@ class WebApp:
             database,
             llm_service=self.llm_service,
             page_fetcher=default_page_fetcher if page_fetcher is None else page_fetcher,
+            render_fetcher=self.render_fetcher,
         )
         self.workflow = ContentWorkflow(database)
         # ponytail: one local lock prevents duplicate platform submissions;
@@ -5734,6 +5754,7 @@ class WebApp:
         self.article_style = ""
         self._original_text_cache: dict[str, dict[str, object]] = {}
         self._hotspot_payloads: dict[str, dict[str, object]] = {}
+        self._radar_events: dict[str, dict[str, object]] = {}
         self.x_bearer_token = ""
         self.scheduler = PublishScheduler(database, self.publish, interval_seconds=15)
         self._restore_accounts()
@@ -5983,6 +6004,24 @@ class WebApp:
             for item in items:
                 if isinstance(item, dict) and item.get("item_id"):
                     self._hotspot_payloads[str(item["item_id"])] = dict(item)
+        radar = payload.get("radar")
+        events = radar.get("events") if isinstance(radar, dict) else None
+        if isinstance(events, list):
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                ids = {
+                    str(value)
+                    for value in (
+                        event.get("item_id"),
+                        event.get("representative_item_id"),
+                        event.get("canonical_item_id"),
+                        *(event.get("item_ids") or ()),
+                    )
+                    if str(value or "").strip()
+                }
+                for item_id in ids:
+                    self._radar_events[item_id] = dict(event)
 
     def _favorite_payload_from_item(self, item: dict[str, object]) -> dict[str, object]:
         item_id = str(item["item_id"])
@@ -6072,6 +6111,12 @@ class WebApp:
         content_source = "feed"
         is_reddit = "reddit.com" in str(item.get("canonical_url") or "").lower()
         if is_reddit:
+            reader_document = ReaderService().read_payload(
+                content,
+                url=str(item.get("canonical_url") or ""),
+                title_hint=str(item.get("title") or ""),
+                source_type="rss",
+            )
             result = {
                 "item_id": item_id,
                 "title": str(item.get("title") or ""),
@@ -6080,16 +6125,38 @@ class WebApp:
                 "content_note": "正文和热评来自 Reddit 收录，未抓板块页面",
                 "translatable": _looks_english(content or str(item.get("title") or "")),
                 "sources": sources,
+                **self._reader_observability(reader_document),
             }
             return {"ok": True, **result}
+        reader_document: ArticleDocument | None = None
         if sources and self.workbench.page_fetcher is not None:
             try:
-                fetched = article_page_text(self.workbench.page_fetcher(sources[0]["url"]))
+                reader_document = ReaderService(
+                    fetcher=self.workbench.page_fetcher,
+                    render_fetcher=self.workbench.render_fetcher,
+                ).read(
+                    sources[0]["url"],
+                    rss_content=stored,
+                    title_hint=str(item.get("title") or ""),
+                )
             except (OSError, TimeoutError, ValueError, UnicodeError):
-                fetched = ""
-            if fetched and (not stored or len(fetched) > max(240, len(stored) + 80)):
+                reader_document = None
+            fetched = reader_document.text if reader_document is not None else ""
+            if (
+                reader_document is not None
+                and reader_document.status in {"full", "partial"}
+                and fetched
+                and (not stored or len(fetched) > max(240, len(stored) + 80))
+            ):
                 content = fetched
                 content_source = "page"
+        if reader_document is None:
+            reader_document = ReaderService().read_payload(
+                stored,
+                url=str(item.get("canonical_url") or ""),
+                title_hint=str(item.get("title") or ""),
+                source_type="rss",
+            )
         result = {
             "item_id": item_id,
             "title": str(item.get("title") or ""),
@@ -6100,10 +6167,27 @@ class WebApp:
             ),
             "translatable": _looks_english(content or str(item.get("title") or "")),
             "sources": sources,
+            **self._reader_observability(reader_document),
         }
         if content_source == "page":
             self._original_text_cache[item_id] = result
         return {"ok": True, **result}
+
+    @staticmethod
+    def _reader_observability(document: ArticleDocument) -> dict[str, object]:
+        """Expose reader diagnostics without changing original API fields."""
+
+        return {
+            # Keep both names: ``status`` mirrors ArticleDocument while the
+            # prefixed field avoids colliding with future API workflow state.
+            "status": document.status,
+            "reader_status": document.status,
+            "quality_score": document.quality_score,
+            "failure_reason": document.failure_reason,
+            "canonical_url": document.canonical_url,
+            "fetch_method": document.fetch_method,
+            "extractor": document.extractor,
+        }
 
     def translate_original(self, item_id: str) -> dict[str, object]:
         if not self._translation_model_configured:
@@ -6151,6 +6235,12 @@ class WebApp:
     ) -> dict[str, object]:
         if not self._article_model_configured:
             raise ValueError("article_model_not_configured")
+        radar_event = self._radar_events.get(str(item_id or "").strip())
+        if radar_event is None and isinstance(item_ids, (list, tuple)):
+            for candidate_id in item_ids:
+                radar_event = self._radar_events.get(str(candidate_id or "").strip())
+                if radar_event is not None:
+                    break
         return {
             "ok": True,
             **self.workbench.generate_article(
@@ -6166,6 +6256,7 @@ class WebApp:
                 item_ids,
                 pasted_text=pasted_text,
                 related_items=related_items,
+                radar_event=radar_event,
             ),
         }
 

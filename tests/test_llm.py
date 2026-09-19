@@ -225,7 +225,7 @@ class OpenAICompatibleRunnerTests(unittest.TestCase):
 
         self.assertEqual("/v1/chat/completions", requests[0][0])
         self.assertEqual("Bearer test-api-key", requests[0][1])
-        self.assertEqual("AutoPosting/1.4.9", requests[0][2])
+        self.assertEqual("AutoPosting/2.0.0", requests[0][2])
         self.assertEqual("remote-model", requests[0][3]["model"])
         self.assertEqual("REAL PROMPT", requests[0][3]["messages"][0]["content"])
 
@@ -714,10 +714,10 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertNotIn("不超过", prompt)
         self.assertIn("lab_blog", prompt)
         self.assertIn("不可信", prompt)
-        self.assertIn("不要把写作提纲暴露给读者", prompt)
-        self.assertIn("大家在聊什么", prompt)
-        self.assertIn("一般人容易看漏的角度", prompt)
-        self.assertIn("普通人", prompt)
+        self.assertIn("结构留给写作者，不要留给读者", prompt)
+        self.assertIn("真正变了什么", prompt)
+        self.assertIn("一般人容易忽略的角度", prompt)
+        self.assertIn("没持续关注此事的普通读者", prompt)
         self.assertIn("背景资料", prompt)
         cached = self.db.cache_get(
             service._cache_key(

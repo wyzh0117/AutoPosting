@@ -310,6 +310,50 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("background", model.calls[0][2])
         self.assertEqual([], (first.get("assets") or {}).get("candidates", first.get("assets") or []))
 
+    def test_generate_article_passes_radar_evidence_to_writer_prompt(self) -> None:
+        item_id = self._one_item("Model One news", "Model One news 内容")
+        model = FakeModel()
+        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
+
+        workbench.generate_article(
+            item_id,
+            "wechat",
+            radar_event={
+                "event_id": "radar-event-1",
+                "title": "Model One news",
+                "importance_score": 82.0,
+                "attention_score": 41.0,
+                "priority_score": 63.55,
+                "canonical_source": {"source_id": "lab_blog", "role": "canonical"},
+                "supporting_sources": [{"source_id": "media_feed", "role": "supporting"}],
+                "community_sources": [{"source_id": "github", "role": "community"}],
+                "discussion_sources": [{"source_id": "hn", "role": "discussion"}],
+                "evidence_pack": {
+                    "canonical_source": {"source_id": "lab_blog", "role": "canonical"},
+                    "supported_facts": [{"text": "官方确认", "status": "SUPPORTED"}],
+                    "supporting_reports": [{"source_id": "media_feed"}],
+                    "attention_signals": [{"platform": "hn", "value": 12, "status": "SUPPORTED"}],
+                    "uncertainty": [{"text": "细节待确认", "status": "UNSUPPORTED"}],
+                    "conflicts": [],
+                    "inference": [{"text": "社区推测", "status": "INFERRED"}],
+                },
+            },
+        )
+
+        prompt = model.calls[-1][2]
+        for marker in (
+            "evidence_pack",
+            "canonical_source",
+            "supported_facts",
+            "supporting_reports",
+            "attention_signals",
+            "uncertainty",
+            "conflicts",
+            "inference",
+            "community_sources",
+        ):
+            self.assertIn(marker, prompt)
+
     def test_generate_article_attaches_source_images_without_source_credits(self) -> None:
         lab = self.sources[0]
         self.db.insert_item(

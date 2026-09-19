@@ -5,6 +5,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from .engagement import (
     better_tier,
@@ -82,6 +83,21 @@ CREATE TABLE IF NOT EXISTS events (
     error_message TEXT,
     created_at TEXT NOT NULL
 );
+
+-- Radar history is intentionally separate from the publishing/event-trigger
+-- table above.  It records only snapshots explicitly saved by a collect path.
+CREATE TABLE IF NOT EXISTS engagement_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    value REAL NOT NULL CHECK (value >= 0),
+    observed_at TEXT NOT NULL,
+    UNIQUE (event_id, platform, metric, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_engagement_snapshots_event_time
+    ON engagement_snapshots (event_id, observed_at);
 
 CREATE TABLE IF NOT EXISTS claims (
     claim_id TEXT PRIMARY KEY,
@@ -251,6 +267,7 @@ class Database:
             self._ensure_github_weekly_visual(connection)
             self._ensure_skill_finder(connection)
             self._ensure_hotspot_favorites(connection)
+            self._ensure_engagement_snapshots(connection)
 
     @staticmethod
     def _ensure_sitemap_source_type(connection: sqlite3.Connection) -> None:
@@ -443,6 +460,25 @@ class Database:
                 payload_json TEXT NOT NULL,
                 favorited_at TEXT NOT NULL
             )
+            """
+        )
+
+    @staticmethod
+    def _ensure_engagement_snapshots(connection: sqlite3.Connection) -> None:
+        """Idempotently add radar-only engagement history to old databases."""
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS engagement_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                value REAL NOT NULL CHECK (value >= 0),
+                observed_at TEXT NOT NULL,
+                UNIQUE (event_id, platform, metric, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_engagement_snapshots_event_time
+                ON engagement_snapshots (event_id, observed_at);
             """
         )
 
@@ -802,6 +838,151 @@ class Database:
                 (since,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_engagement_snapshot(
+        self,
+        event_id: str | Mapping[str, object],
+        platform: str | None = None,
+        metric: str | None = None,
+        value: float | int | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, object]:
+        """Persist one explicit radar snapshot idempotently.
+
+        This method is intentionally opt-in; initialization and radar scoring
+        never call it, so idle processes do not create background history.
+        """
+        if isinstance(event_id, Mapping):
+            payload = event_id
+            observed_at = str(payload.get("observed_at") or observed_at or "") or None
+            platform = str(payload.get("platform") or platform or "")
+            metric = str(payload.get("metric") or metric or "")
+            value = payload.get("value") if value is None else value
+            event_id = str(payload.get("event_id") or "")
+        event = str(event_id or "").strip()
+        channel = str(platform or "").strip().lower()
+        name = str(metric or "").strip().lower()
+        if not event or not channel or not name:
+            raise ValueError("event_id, platform and metric are required")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("snapshot value must be numeric") from exc
+        if numeric < 0 or numeric != numeric:
+            raise ValueError("snapshot value must be non-negative")
+        observed = str(observed_at or _utc_now()).strip()
+        snapshot_id = hashlib.sha256(
+            f"radar-snapshot:{event}:{channel}:{name}:{observed}".encode("utf-8")
+        ).hexdigest()[:32]
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO engagement_snapshots (
+                    snapshot_id, event_id, platform, metric, value, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id, platform, metric, observed_at) DO UPDATE SET
+                    value = excluded.value,
+                    snapshot_id = excluded.snapshot_id
+                """,
+                (snapshot_id, event, channel, name, numeric, observed),
+            )
+            row = connection.execute(
+                """
+                SELECT snapshot_id, event_id, platform, metric, value, observed_at
+                FROM engagement_snapshots
+                WHERE event_id = ? AND platform = ? AND metric = ? AND observed_at = ?
+                """,
+                (event, channel, name, observed),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("engagement snapshot write did not persist")
+        return dict(row)
+
+    def save_engagement_snapshot(
+        self,
+        event_id: str | Mapping[str, object],
+        platform: str | None = None,
+        metric: str | None = None,
+        value: float | int | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, object]:
+        """Alias used by explicit collect callers."""
+        return self.record_engagement_snapshot(event_id, platform, metric, value, observed_at)
+
+    def upsert_engagement_snapshot(
+        self,
+        event_id: str | Mapping[str, object],
+        platform: str | None = None,
+        metric: str | None = None,
+        value: float | int | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, object]:
+        return self.record_engagement_snapshot(event_id, platform, metric, value, observed_at)
+
+    def record_engagement_snapshots(
+        self, snapshots: Iterable[Mapping[str, object]]
+    ) -> list[dict[str, object]]:
+        """Save a caller-provided batch; no scheduler or implicit writes."""
+        return [
+            self.record_engagement_snapshot(
+                str(snapshot.get("event_id") or ""),
+                str(snapshot.get("platform") or ""),
+                str(snapshot.get("metric") or ""),
+                snapshot.get("value") or 0,
+                str(snapshot.get("observed_at") or "") or None,
+            )
+            for snapshot in snapshots
+            if isinstance(snapshot, Mapping)
+        ]
+
+    def list_engagement_snapshots(
+        self,
+        event_id: str | None = None,
+        platform: str | None = None,
+        metric: str | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if event_id:
+            clauses.append("event_id = ?")
+            parameters.append(str(event_id))
+        if platform:
+            clauses.append("platform = ?")
+            parameters.append(str(platform).lower())
+        if metric:
+            clauses.append("metric = ?")
+            parameters.append(str(metric).lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT snapshot_id, event_id, platform, metric, value, observed_at
+                FROM engagement_snapshots
+                {where}
+                ORDER BY observed_at ASC, snapshot_id ASC
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_engagement_snapshots(
+        self,
+        event_id: str | None = None,
+        platform: str | None = None,
+        metric: str | None = None,
+    ) -> list[dict[str, object]]:
+        return self.list_engagement_snapshots(event_id, platform, metric)
+
+    def latest_engagement_snapshot(
+        self, event_id: str, platform: str, metric: str
+    ) -> dict[str, object] | None:
+        rows = self.list_engagement_snapshots(event_id, platform, metric)
+        return rows[-1] if rows else None
+
+    def get_engagement_snapshot(
+        self, event_id: str, platform: str, metric: str
+    ) -> dict[str, object] | None:
+        return self.latest_engagement_snapshot(event_id, platform, metric)
 
     def create_event(self, name: str, topic: str, trigger_type: str, stable_key: str) -> str:
         event_id = hashlib.sha256(stable_key.encode()).hexdigest()[:24]

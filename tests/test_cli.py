@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from autoposting.cli import build_parser, main
 from autoposting.db import Database
@@ -87,6 +88,58 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(1, exit_code)
             self.assertIn("127.0.0.1", payload["error"])
+
+    def test_web_subcommand_wires_lazy_default_renderer(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_renderer(url: str) -> str:
+            raise AssertionError(f"renderer should remain lazy: {url}")
+
+        def capture_run_web(app: object, host: str, port: int) -> None:
+            captured["app"] = app
+            captured["host"] = host
+            captured["port"] = port
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources_path = root / "sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "lab_blog",
+                                "name": "AI Lab",
+                                "type": "rss",
+                                "url_or_handle": "https://example.com/feed.xml",
+                                "tier": "S1",
+                                "topics": ["models"],
+                                "enabled": True,
+                                "fetch_interval": "15m",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("autoposting.web.playwright_render_fetcher", fake_renderer), patch(
+                "autoposting.web.run_web", side_effect=capture_run_web
+            ):
+                exit_code, payload = self._run(
+                    [
+                        "web",
+                        "--db",
+                        str(root / "autoposting.db"),
+                        "--sources",
+                        str(sources_path),
+                    ]
+                )
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["ok"])
+        app = captured["app"]
+        self.assertIs(fake_renderer, app.render_fetcher)
+        self.assertIs(fake_renderer, app.workbench.render_fetcher)
 
     def test_init_event_draft_review_and_package_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
