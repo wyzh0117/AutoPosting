@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from .models import FeedItem, Source, canonical_source_types
 from .normalize import content_hash
 
 
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 _JSON_VERSIONS = {
     "github_weekly_repos": "github-weekly-repos-v1",
     "github_weekly_images": "github-weekly-images-v1",
@@ -38,7 +39,16 @@ _JSON_VERSIONS = {
     "collection_run_source_attempt_diagnostic": "collection-run-source-attempt-diagnostic-v1",
     "topic_dossier": "topic-dossier-envelope-v1",
     "topic_dossier_event_ids": "topic-dossier-event-ids-v1",
+    "resource_set": "resource-set-envelope-v1",
 }
+
+_RESOURCE_SECRET_KEY_RE = re.compile(
+    r"(?i)(?:api[_-]?key|apikey|token|secret|password|authorization|cookie|headers?)"
+)
+_RESOURCE_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)(?:authorization|access[_-]?token|api[_-]?key|appsecret|secret|"
+    r"password|passwd|pwd|bearer|token|signature|sig|auth)\s*[:=]\s*[^\s,;]+"
+)
 
 
 def _reject_json_constant(value: str) -> object:
@@ -378,6 +388,20 @@ CREATE TABLE IF NOT EXISTS topic_dossiers (
 
 CREATE INDEX IF NOT EXISTS idx_topic_dossiers_created
     ON topic_dossiers (created_at DESC, dossier_id DESC);
+
+CREATE TABLE IF NOT EXISTS resource_sets (
+    set_id TEXT PRIMARY KEY,
+    query TEXT NOT NULL,
+    preset TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'degraded', 'empty')),
+    degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+    resource_set_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_sets_created
+    ON resource_sets (created_at DESC, set_id DESC);
 """
 
 
@@ -446,6 +470,8 @@ class Database:
                         self._migrate_v2(connection)
                     elif next_version == 3:
                         self._migrate_v3(connection)
+                    elif next_version == 4:
+                        self._migrate_v4(connection)
                     else:  # pragma: no cover - guarded by DB_SCHEMA_VERSION
                         raise RuntimeError(f"missing_database_migration:{next_version}")
                     connection.execute(f"PRAGMA user_version = {next_version}")
@@ -459,6 +485,7 @@ class Database:
                     self._migrate_v1(connection)
                     self._migrate_v2(connection)
                     self._migrate_v3(connection)
+                    self._migrate_v4(connection)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -553,6 +580,30 @@ class Database:
             """
             CREATE INDEX IF NOT EXISTS idx_topic_dossiers_created
             ON topic_dossiers (created_at DESC, dossier_id DESC)
+            """
+        )
+
+    @staticmethod
+    def _migrate_v4(connection: sqlite3.Connection) -> None:
+        """Create the durable ResourceSet store without storing credentials."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_sets (
+                set_id TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                preset TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('ok', 'degraded', 'empty')),
+                degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+                resource_set_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_resource_sets_created
+            ON resource_sets (created_at DESC, set_id DESC)
             """
         )
 
@@ -1946,6 +1997,139 @@ class Database:
             )
         return cursor.rowcount == 1
 
+    @staticmethod
+    def _sanitize_resource_value(value: object, *, section: str = "", depth: int = 0) -> object:
+        """Keep ResourceSet JSON safe while dropping credential-shaped state."""
+        if depth > 8:
+            return str(value)[:500]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            if value and (
+                section in {"adapter_status", "diagnostics", "detail"}
+                or _RESOURCE_CREDENTIAL_VALUE_RE.search(value)
+            ):
+                return sanitize_detail(value)
+            return value
+        if isinstance(value, Mapping):
+            result: dict[str, object] = {}
+            for key, item in list(value.items())[:100]:
+                name = str(key)
+                normalized = name.strip().lower().replace("-", "_")
+                if _RESOURCE_SECRET_KEY_RE.search(normalized):
+                    continue
+                child_section = section
+                if normalized in {"adapter_status", "diagnostics", "detail"}:
+                    child_section = normalized
+                result[name] = Database._sanitize_resource_value(
+                    item, section=child_section, depth=depth + 1
+                )
+            return result
+        if isinstance(value, (list, tuple, set)):
+            return [
+                Database._sanitize_resource_value(item, section=section, depth=depth + 1)
+                for item in list(value)[:100]
+            ]
+        return sanitize_detail(value)
+
+    @staticmethod
+    def _resource_set_payload(resource_set: object) -> dict[str, object]:
+        """Validate and canonicalize a ResourceSet at the persistence boundary."""
+        serializer = getattr(resource_set, "to_dict", None)
+        raw = serializer() if callable(serializer) else resource_set
+        if not isinstance(raw, Mapping):
+            raise TypeError("resource_set_must_be_object")
+        # Keep Database independent from the resource service at import time;
+        # callers may still pass either its dataclass or its JSON mapping.
+        from .resource_discovery import ResourceSet
+
+        payload = ResourceSet.from_dict(raw).to_dict()
+        sanitized = Database._sanitize_resource_value(payload)
+        if not isinstance(sanitized, dict):  # pragma: no cover - canonical serializer
+            raise TypeError("resource_set_must_be_object")
+        return sanitized
+
+    def save_resource_set(self, resource_set: object) -> None:
+        """Persist one canonical ResourceSet and its adapter state."""
+        payload = self._resource_set_payload(resource_set)
+        now = _utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO resource_sets (
+                    set_id, query, preset, status, degraded, resource_set_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(set_id) DO UPDATE SET
+                    query = excluded.query,
+                    preset = excluded.preset,
+                    status = excluded.status,
+                    degraded = excluded.degraded,
+                    resource_set_json = excluded.resource_set_json,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["set_id"],
+                    payload["query"],
+                    payload["preset"],
+                    payload["status"],
+                    int(payload["degraded"]),
+                    _json_envelope(_JSON_VERSIONS["resource_set"], payload, dict),
+                    payload["created_at"],
+                    now,
+                ),
+            )
+
+    def get_resource_set(self, set_id: str) -> dict[str, object] | None:
+        set_id = str(set_id or "").strip()
+        if not set_id:
+            raise ValueError("resource_set_id_required")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT resource_set_json FROM resource_sets WHERE set_id = ?", (set_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        payload, issue = _decode_json_envelope(
+            row["resource_set_json"], field="resource_set", expected_type=dict
+        )
+        if issue or not isinstance(payload, dict):
+            raise ValueError(str(issue["cause_code"] if issue else "resource_set_invalid_json"))
+        return payload
+
+    def list_resource_sets(self, limit: int = 20) -> list[dict[str, object]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("resource_set_limit_invalid")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT resource_set_json FROM resource_sets
+                ORDER BY created_at DESC, set_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            payload, issue = _decode_json_envelope(
+                row["resource_set_json"], field="resource_set", expected_type=dict
+            )
+            if issue or not isinstance(payload, dict):
+                raise ValueError(str(issue["cause_code"] if issue else "resource_set_invalid_json"))
+            result.append(payload)
+        return result
+
+    def delete_resource_set(self, set_id: str) -> bool:
+        set_id = str(set_id or "").strip()
+        if not set_id:
+            raise ValueError("resource_set_id_required")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM resource_sets WHERE set_id = ?", (set_id,)
+            )
+        return cursor.rowcount == 1
+
     def update_event_status(
         self, event_id: str, status: str, error_message: str | None = None
     ) -> None:
@@ -2020,6 +2204,34 @@ class Database:
         if row is None:
             raise KeyError(draft_id)
         return dict(row)
+
+    def list_drafts(self, limit: int = 20) -> list[dict[str, object]]:
+        """Recent drafts with their latest publication attempt, newest activity first.
+
+        Basic persistence query only: ordering/status semantics stay in the
+        application layer (publishing center).
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("draft_limit_invalid")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT d.draft_id, d.event_id, d.platform, d.title, d.status,
+                       d.approved_by, d.approved_at, d.created_at, d.updated_at,
+                       a.status AS attempt_status, a.created_at AS attempt_at
+                FROM drafts AS d
+                LEFT JOIN publication_attempts AS a
+                  ON a.attempt_id = (
+                      SELECT attempt_id FROM publication_attempts
+                      WHERE draft_id = d.draft_id
+                      ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                  )
+                ORDER BY d.updated_at DESC, d.rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def is_current_draft(self, draft_id: str) -> bool:
         with self.connect() as connection:

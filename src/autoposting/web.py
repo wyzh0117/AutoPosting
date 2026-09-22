@@ -8,7 +8,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .background import RELATED_SELECTION_LIMIT
 from .config import load_sources
@@ -30,6 +30,7 @@ from .copy_validate import enrichment_error, require_enriched_copy
 from .github_weekly import (
     XHS_TITLE,
     build_xhs_copy,
+    default_github_get,
     fetch_weekly_ai_repos,
     set_github_token,
     week_window_start,
@@ -37,6 +38,8 @@ from .github_weekly import (
 from .image_gen import build_weekly_render_plan
 from .skill_finder import (
     POSTER_RENDER_CAP,
+    _github_search,
+    _skills_sh_search,
     aggregate_skills,
     apply_skill_selection,
     crawl_sources,
@@ -52,6 +55,11 @@ from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
 from .publishing import PublicationError, PublicationService
 from .reader import ArticleDocument, ReaderService, playwright_render_fetcher
+from .resource_discovery import (
+    GITHUB_WEEKLY_PRESET,
+    ResourceDiscoveryError,
+    ResourceDiscoveryService,
+)
 from .research.service import ResearchError
 from .scheduler import PublishScheduler, parse_run_at
 from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE
@@ -69,7 +77,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -90,6 +98,37 @@ MAX_PASTE_LINKS = 16
 MAX_PASTE_CHARS = 20000
 # How many rejected paste tokens are echoed back (the count is always exact).
 MAX_PASTE_REJECTS = 20
+
+
+class _MemoryResourceSetRepository:
+    """Small process-local fallback until the database contract is available."""
+
+    def __init__(self) -> None:
+        self._rows: dict[str, dict[str, object]] = {}
+        self._lock = threading.RLock()
+
+    def save_resource_set(self, resource_set: object) -> None:
+        payload = resource_set.to_dict() if hasattr(resource_set, "to_dict") else resource_set
+        if not isinstance(payload, dict):
+            raise TypeError("resource_set_must_be_object")
+        set_id = str(payload.get("set_id") or "").strip()
+        if not set_id:
+            raise ValueError("set_id required")
+        with self._lock:
+            self._rows[set_id] = dict(payload)
+
+    def get_resource_set(self, set_id: str) -> dict[str, object] | None:
+        with self._lock:
+            value = self._rows.get(str(set_id))
+            return dict(value) if value is not None else None
+
+    def list_resource_sets(self, limit: int = 20) -> list[dict[str, object]]:
+        with self._lock:
+            return [dict(value) for value in list(self._rows.values())[-limit:][::-1]]
+
+    def delete_resource_set(self, set_id: str) -> bool:
+        with self._lock:
+            return self._rows.pop(str(set_id), None) is not None
 
 
 def _json_default(value: object) -> object:
@@ -885,7 +924,6 @@ body.lane-skills #collect-btn,
 body.lane-skills #translate-btn,
 body.lane-skills #hotspot-list,
 body.lane-skills #github-list,
-body.lane-skills #github-studio,
 body.lane-skills #prompt-style-select,
 body.lane-skills #find-hooks-btn,
 body.lane-skills #generate-btn,
@@ -894,8 +932,12 @@ body.lane-skills #article-empty,
 body.lane-skills #article-view,
 body.lane-skills #hook-list{display:none !important;}
 body.lane-github #picked-dock, body.lane-skills #picked-dock { display:none !important; }
-#github-list,#github-studio,#skill-search-row,#skill-source-bar,#skill-source-toggle,#skill-crawl-sources,#skills-studio,
+#github-list,#skill-search-row,#skill-source-bar,#skill-source-toggle,#skill-crawl-sources,
 #skill-degraded-note,#skill-paste-row,#skill-paste-hint,#skill-paste-status,#skill-token-box,#skill-list{display:none;}
+/* Iteration 2: the creation page owns the retained visual studios (weekly 3:4
+   and skill posters), so they are no longer gated behind the retired lanes. */
+#github-studio,#skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
+.studio-heading{margin:0; font-size:1rem;}
 body.lane-github #github-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
 body.lane-github #github-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
 body.lane-skills #skill-search-row{display:flex; gap:.5rem; align-items:center; width:100%; margin:.35rem 0 .55rem;}
@@ -1048,9 +1090,7 @@ body.lane-skills #skills-gallery{display:flex; justify-content:center; min-heigh
 .gh-stars{display:flex; flex-direction:column; align-items:flex-end; gap:.25rem; min-width:4.8rem;}
 .gh-bar{width:4.6rem; height:5px; border-radius:99px; background:#2c2923; overflow:hidden;}
 .gh-bar > span{display:block; height:100%; background:var(--accent); border-radius:99px;}
-#github-render-controls{display:none; align-items:center; gap:.45rem; flex-wrap:wrap;}
-body.lane-github #github-render-controls,
-body.lane-skills #github-render-controls{display:flex;}
+#github-render-controls{display:flex; align-items:center; gap:.45rem; flex-wrap:wrap;}
 body.lane-skills #github-render-btn{display:none;}
 .gh-swatch{display:flex; align-items:center; gap:.28rem; font-size:.72rem; color:var(--text-muted);}
 .gh-swatch input[type=color]{
@@ -1147,7 +1187,6 @@ body.lane-skills #github-render-btn{display:none;}
 #primary-nav{display:flex; gap:.35rem; flex:1 1 auto; flex-wrap:wrap;}
 #primary-nav button{border-radius:999px; padding:.48rem .9rem;}
 #primary-nav button[aria-current="page"]{background:var(--bg-card); border-color:var(--accent); color:var(--accent);}
-#legacy-lane-tabs{display:none !important;}
 #platform-switcher{margin-left:auto; flex:0 0 auto;}
 .app-page > .panel{width:100%;}
 #page-home .home-hero{display:grid; grid-template-columns:minmax(0,1.35fr) minmax(16rem,.65fr); gap:1.2rem; align-items:stretch;}
@@ -1180,6 +1219,9 @@ body.lane-skills #github-render-btn{display:none;}
 .run-empty{padding:1.2rem; color:var(--text-muted); border:1px dashed var(--border); border-radius:var(--radius-md);}
 #page-resources .resource-toolbar{display:flex; gap:.55rem; flex-wrap:wrap; align-items:center;}
 #page-resources .resource-toolbar input{flex:1 1 22rem;}
+#page-resources .resource-options{display:flex; gap:.75rem; flex-wrap:wrap; align-items:center; margin-top:.8rem;}
+#page-resources .resource-options label{display:inline-flex; gap:.3rem; align-items:center; color:var(--text-muted);}
+#page-resources #resource-pasted-text{width:100%; margin-top:.8rem; min-height:4rem; resize:vertical;}
 #resource-results{margin-top:1rem;}
 #resource-results[hidden]{display:none;}
 #research-summary,#research-diagnostics{margin:.75rem 0 1rem;}
@@ -1192,6 +1234,8 @@ body.lane-skills #github-render-btn{display:none;}
 #page-creation,#page-publishing{display:block;}
 #page-publishing .publishing-actions{display:flex; gap:.6rem; flex-wrap:wrap;}
 #page-publishing .publishing-note{color:var(--text-muted); max-width:48rem;}
+#page-publishing .publishing-draft-actions{display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.6rem;}
+#page-publishing .publishing-draft h3{margin:0 0 .3rem;}
 #source-health-wrap{display:none !important;}
 #source-health-toggle{display:none !important;}
 #skill-token-box{display:none !important;}
@@ -1210,7 +1254,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v3.1.0 · 本地服务</span>
+  <span id="service-status">v3.2.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1240,14 +1284,6 @@ body.lane-skills #github-render-btn{display:none;}
     <button type="button" class="nav-item" data-app-page-target="sources">信息源</button>
     <button type="button" class="nav-item" data-app-page-target="runs">运行记录</button>
     <button type="button" class="nav-item" data-app-page-target="settings">设置</button>
-  </div>
-  <div id="legacy-lane-tabs" hidden aria-hidden="true">
-    <div class="platform-tabs" role="tablist" aria-label="候选栏">
-      <button type="button" class="seg active" data-lane="hotspots" aria-selected="true">热点候选</button>
-      <button type="button" class="seg" data-lane="viewpoints" aria-selected="false">观点候选</button>
-      <button type="button" class="seg" data-lane="github" aria-selected="false">GitHub 周榜</button>
-      <button type="button" class="seg" data-lane="skills" aria-selected="false">Skill查找器</button>
-    </div>
   </div>
   <div id="platform-switcher" class="platform-tabs" role="group" aria-label="平台选择">
     <button type="button" id="seg-wechat" class="seg active" data-platform="wechat" aria-pressed="true">微信</button>
@@ -1288,7 +1324,6 @@ body.lane-skills #github-render-btn{display:none;}
       <div>
         <h2 id="h-hotspots" class="panel-title">资讯探索</h2>
         <p id="hotspot-sub" class="panel-sub">按综合分、时效与独立来源聚合资讯事件；选择一个或多个事件后可继续研究</p>
-        <p id="legacy-ui-contract" hidden aria-hidden="true">热点候选 观点候选 热度看独立来源数和讨论量 讨论观察 社区帖过阈会升温 某某称</p>
       </div>
       <div class="row">
         <label for="hours-select">时间范围</label>
@@ -1303,16 +1338,6 @@ body.lane-skills #github-render-btn{display:none;}
         </select>
         <input id="hours-custom" type="number" min="1" max="720" value="2" hidden aria-label="自定义小时数">
         <button type="button" id="collect-btn">刷新全部</button>
-        <span id="github-render-controls">
-          <button type="button" id="github-render-btn">生成图片</button>
-          <span class="platform-tabs" role="group" aria-label="配色">
-            <button type="button" class="seg active" id="gh-theme-dark" data-theme="dark">暗色</button>
-            <button type="button" class="seg" id="gh-theme-light" data-theme="light">浅色</button>
-          </span>
-          <label class="gh-swatch">主色<input id="gh-color-main" type="color" value="#06155A"></label>
-          <label class="gh-swatch">副色<input id="gh-color-secondary" type="color" value="#101F63"></label>
-          <label class="gh-swatch">强调色<input id="gh-color-accent" type="color" value="#F3F0E8"></label>
-        </span>
         <button type="button" id="translate-btn">翻译标题</button>
       </div>
     </div>
@@ -1393,18 +1418,35 @@ body.lane-skills #github-render-btn{display:none;}
     </section>
   </section>
   <section class="app-page" id="page-resources" data-app-page="resources" hidden>
-    <section class="panel" aria-labelledby="h-resources">
+  <section class="panel" aria-labelledby="h-resources">
       <p class="page-kicker">Resource Discovery</p>
       <h2 id="h-resources" class="page-heading">资源探索</h2>
-      <p class="page-description">统一 Resource Discovery 将按 Repo、Skill、Tool、Website 和其他资源返回候选。当前只保留接线位，不把旧 Skill / GitHub JSON 冒充统一搜索结果。</p>
+      <p class="page-description">用一句话搜索 Repo、Skill、Web 资源。结果来自统一 ResourceSet，不会把旧 Skill / GitHub 工作台 JSON 冒充成统一候选，也不会自动进入创作或发布。</p>
       <div class="resource-toolbar">
         <input id="resource-query" type="text" maxlength="200" placeholder="例如：能自动制作 PPT 的 Agent Skill / Repo" aria-label="资源探索输入">
-        <button type="button" id="resource-search-btn" class="primary">统一搜索（待接入）</button>
-        <button type="button" id="resource-weekly-btn">兼容周榜（待接入）</button>
+        <button type="button" id="resource-search-btn" class="primary">搜索资源</button>
+        <button type="button" id="resource-weekly-btn">GitHub Weekly Preset</button>
+        <button type="button" id="resource-studio-btn">送入 Skill 出图</button>
+        <button type="button" id="resource-weekly-studio-btn">周榜出图工作台</button>
       </div>
-      <p id="resource-status" class="page-description" role="status" aria-live="polite">ResourceDiscoveryService 接入后，这里将调用统一 discover(query, pasted_text, adapters, limit) 契约。</p>
-      <div id="resource-results" class="ia-grid" data-resource-discovery-slot="pending">
-        <article class="ia-card"><h3>统一搜索接线位</h3><p>等待 ResourceSet：schema_version、plan、adapter_status、diagnostics、candidates、counts。</p></article>
+      <div class="resource-options" role="group" aria-label="资源来源和类型">
+        <span class="muted">检索源</span>
+        <label><input type="checkbox" class="resource-adapter" value="github" checked> Repo</label>
+        <label><input type="checkbox" class="resource-adapter" value="skills" checked> Skill</label>
+        <label><input type="checkbox" class="resource-adapter" value="web" checked> Web</label>
+        <label for="resource-kind-filter" class="muted">显示</label>
+        <select id="resource-kind-filter" aria-label="资源类型筛选">
+          <option value="all">全部类型</option>
+          <option value="repo">Repo</option>
+          <option value="skill">Skill</option>
+          <option value="website">Web</option>
+          <option value="tool">Tool</option>
+        </select>
+      </div>
+      <textarea id="resource-pasted-text" rows="2" maxlength="20000" placeholder="可选：粘贴 GitHub / skills.sh Skill 链接，加入同一组候选" aria-label="粘贴 Skill 链接"></textarea>
+      <p id="resource-status" class="page-description" role="status" aria-live="polite">选择 Repo、Skill、Web 后搜索；可用 GitHub Weekly Preset 直接查本周 AI 项目。</p>
+      <div id="resource-results" class="ia-grid" data-resource-discovery-slot="unified">
+        <article class="ia-card"><h3>还没有资源搜索</h3><p>输入自然语言需求，结果会显示统一 ResourceSet 的计划、来源状态、诊断和候选。</p></article>
       </div>
     </section>
   </section>
@@ -1424,13 +1466,28 @@ body.lane-skills #github-render-btn{display:none;}
       </div>
     </div>
     <p id="article-status" role="status" aria-live="polite"></p>
+    <p id="studio-status" class="page-description" role="status" aria-live="polite"></p>
     <ul id="hook-list" hidden></ul>
     <p id="article-empty">尚未生成文章</p>
     <div id="github-studio">
+      <h3 class="studio-heading">GitHub 周榜出图工作台</h3>
+      <p class="page-description">周榜发现现在走资源探索的「GitHub Weekly Preset」；这里负责抓取本周 AI 项目、选主题配色并生成 3:4 图片。</p>
       <div class="gh-toolbar">
+        <button type="button" id="github-fetch-btn">抓取本周周榜</button>
+        <span id="github-render-controls">
+          <button type="button" id="github-render-btn">生成图片</button>
+          <span class="platform-tabs" role="group" aria-label="配色">
+            <button type="button" class="seg active" id="gh-theme-dark" data-theme="dark">暗色</button>
+            <button type="button" class="seg" id="gh-theme-light" data-theme="light">浅色</button>
+          </span>
+          <label class="gh-swatch">主色<input id="gh-color-main" type="color" value="#06155A"></label>
+          <label class="gh-swatch">副色<input id="gh-color-secondary" type="color" value="#101F63"></label>
+          <label class="gh-swatch">强调色<input id="gh-color-accent" type="color" value="#F3F0E8"></label>
+        </span>
         <button type="button" id="github-select-all" disabled>全选</button>
         <button type="button" id="github-export-btn" disabled>导出选中图片</button>
         <button type="button" id="github-copy-btn" disabled>复制小红书文案</button>
+        <button type="button" data-app-page-target="resources">去资源探索</button>
       </div>
       <div id="github-gallery" class="gh-gallery"></div>
       <div class="image-carousel-nav" id="github-gallery-nav" hidden>
@@ -1441,6 +1498,12 @@ body.lane-skills #github-render-btn{display:none;}
       <canvas id="github-canvas" hidden></canvas>
     </div>
     <div id="skills-studio">
+      <h3 class="studio-heading">Skill 海报出图工作台</h3>
+      <p class="page-description">在资源探索里用自然语言找 Skill 或粘贴 Skill 链接，再送到这里生成封面与每个 skill 一张海报。</p>
+      <div class="gh-toolbar">
+        <button type="button" id="skills-fetch-btn">读取上次收录</button>
+        <button type="button" data-app-page-target="resources">去资源探索</button>
+      </div>
       <label class="article-field" for="skill-title">标题
         <input id="skill-title" type="text" maxlength="120" placeholder="封面海报标题；同时作为介绍文标题">
       </label>
@@ -1514,12 +1577,14 @@ body.lane-skills #github-render-btn{display:none;}
     <section class="panel" aria-labelledby="h-publishing">
       <p class="page-kicker">Publishing</p>
       <h2 id="h-publishing" class="page-heading">发布</h2>
-      <p class="publishing-note">这里集中展示审批、微信草稿、小红书本地发布包和调度状态。现有发布动作仍由创作页的兼容工作台执行。</p>
+      <p class="publishing-note">审批、微信草稿、小红书本地发布包与调度的统一入口。发布动作复用现有安全边界：微信只写入草稿箱，小红书只生成本地包等待人工提交。</p>
       <div class="publishing-actions">
+        <button type="button" id="publishing-refresh-btn">刷新草稿</button>
         <button type="button" id="publishing-open-creation" class="primary">继续创作</button>
         <button type="button" id="publishing-open-settings">配置发布账号</button>
       </div>
-      <p id="publishing-summary" class="page-description" role="status" aria-live="polite">尚未选择待发布草稿。</p>
+      <p id="publishing-summary" class="page-description" role="status" aria-live="polite">正在加载草稿…</p>
+      <div id="publishing-draft-list" class="ia-grid"></div>
     </section>
   </section>
   <section class="app-page" id="page-sources" data-app-page="sources" hidden>
@@ -1774,6 +1839,7 @@ var state = {
   hotspotGen: 0,
   collectGen: 0,
   collectionRun: null,
+  resourceSet: null,
   research: {dossier: null, eventIds: [], loading: false},
   researchRuntime: {planner_configured: false, jev_configured: false},
 };
@@ -2030,6 +2096,94 @@ function loadCollectionRuns() {
   });
 }
 
+var PUBLISHING_STATUS_LABELS = {
+  DRAFTED: "待审批",
+  APPROVED: "已审批",
+  REJECTED: "已拒绝",
+  PUBLISHED: "已发布",
+  FAILED: "失败",
+};
+function publishingStatusLabel(status) {
+  return PUBLISHING_STATUS_LABELS[String(status || "")] || String(status || "未知");
+}
+function publishingPlatformLabel(platform) {
+  return String(platform || "") === "xiaohongshu" ? "小红书" : "微信";
+}
+function renderPublishingDrafts(drafts) {
+  var list = $("publishing-draft-list");
+  if (!list) { return; }
+  list.textContent = "";
+  if (!drafts.length) {
+    list.appendChild(el("article", "ia-card", "还没有草稿。从资讯或资源进入创作后，草稿会出现在这里。"));
+  }
+  drafts.forEach(function (draft) {
+    if (!draft || !draft.draft_id) { return; }
+    var card = el("article", "ia-card publishing-draft");
+    card.dataset.draftId = String(draft.draft_id);
+    card.appendChild(el("h3", "", draft.title || "未命名草稿"));
+    card.appendChild(el("p", "meta", publishingPlatformLabel(draft.platform) + " · " + publishingStatusLabel(draft.status) + " · 更新 " + formatTime(draft.updated_at || "")));
+    if (draft.approved_at) {
+      card.appendChild(el("p", "meta", "审批：" + (draft.approved_by || "—") + " · " + formatTime(draft.approved_at)));
+    }
+    if (draft.attempt_status) {
+      card.appendChild(el("p", "meta", "最近发布：" + String(draft.attempt_status) + " · " + formatTime(draft.attempt_at || "")));
+    }
+    var actions = el("div", "publishing-draft-actions");
+    var editBtn = el("button", "", "继续编辑");
+    editBtn.type = "button";
+    editBtn.addEventListener("click", function () { openDraftForPublishing(draft.draft_id, "edit"); });
+    actions.appendChild(editBtn);
+    var publishBtn = el("button", "primary", publishingPlatformLabel(draft.platform) === "微信" ? "到草稿箱" : "生成发布包");
+    publishBtn.type = "button";
+    publishBtn.addEventListener("click", function () { openDraftForPublishing(draft.draft_id, "publish"); });
+    actions.appendChild(publishBtn);
+    var scheduleBtn = el("button", "", "定时到草稿");
+    scheduleBtn.type = "button";
+    scheduleBtn.addEventListener("click", function () { openDraftForPublishing(draft.draft_id, "schedule"); });
+    actions.appendChild(scheduleBtn);
+    card.appendChild(actions);
+    list.appendChild(card);
+  });
+  var summary = $("publishing-summary");
+  if (summary) {
+    var pending = drafts.filter(function (item) { return String(item.status || "") === "DRAFTED"; }).length;
+    summary.textContent = "共 " + drafts.length + " 份草稿 · " + pending + " 份待审批";
+  }
+}
+function loadPublishingDrafts() {
+  return api("/api/drafts?limit=20", null, {method: "GET"}).then(function (data) {
+    renderPublishingDrafts(Array.isArray(data.drafts) ? data.drafts : []);
+    return data;
+  });
+}
+function openDraftForPublishing(draftId, action) {
+  if (!draftId) { return Promise.resolve(); }
+  return api("/api/drafts/" + encodeURIComponent(draftId), null, {method: "GET"}).then(function (data) {
+    var draft = data.draft || data;
+    if (!draft || !draft.draft_id) { throw new Error("草稿数据不完整"); }
+    state.draft = draft;
+    state.item = null;
+    state.creatorUrl = "";
+    state.articleDirty = false;
+    setPlatform(String(draft.platform || "wechat") === "xiaohongshu" ? "xiaohongshu" : "wechat");
+    setAppPage("creation");
+    renderArticle(draft);
+    $("publish-btn").disabled = false;
+    $("schedule-btn").disabled = false;
+    if (action === "publish") {
+      publish();
+    } else if (action === "schedule") {
+      status("publish-status", "请选择定时时间后点「定时到草稿」", "");
+      if ($("schedule-at")) { $("schedule-at").focus(); }
+    } else {
+      status("publish-status", "已载入草稿：" + (draft.title || draft.draft_id), "ok");
+    }
+    return draft;
+  }).catch(function (error) {
+    status("publishing-summary", "打开草稿失败：" + error.message, "error");
+  });
+}
+
 function selectedResearchEventIds() {
   var ids = [];
   pickedIdList().forEach(function (itemId) {
@@ -2173,6 +2327,18 @@ function setAppPage(page) {
   });
   if (page === "sources") { loadSourceRegistry().catch(function (error) { status("source-status", "读取信息源失败：" + error.message, "error"); }); }
   if (page === "runs") { loadCollectionRuns().catch(function (error) { status("source-status", "读取运行记录失败：" + error.message, "error"); }); }
+  if (page === "publishing") { loadPublishingDrafts().catch(function (error) { status("publishing-summary", "读取草稿失败：" + error.message, "error"); }); }
+  if (page === "creation") {
+    // Restore the retained poster studios from their persisted snapshots once.
+    if (!state.githubStudioLoaded) {
+      state.githubStudioLoaded = true;
+      loadGithubWeekly();
+    }
+    if (!state.skillsStudioLoaded) {
+      state.skillsStudioLoaded = true;
+      loadSkills();
+    }
+  }
   if (page === "creation" && state.lane === "skills") { setLane("hotspots"); }
   if (page === "news" && previousPage !== "news" && state.lane !== "mixed") { setLane("mixed"); }
 }
@@ -5287,10 +5453,162 @@ function renderSkillList(skills) {
     list.appendChild(row);
   });
 }
+function resourceKindLabel(kind) {
+  return {repo: "Repo", skill: "Skill", website: "Web", tool: "Tool", other: "Other"}[String(kind || "")] || "资源";
+}
+function resourceDiagnosticLabel(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") { return ""; }
+  return [diagnostic.source, diagnostic.stage, diagnostic.code, diagnostic.cause_code]
+    .filter(function (value) { return value !== undefined && value !== null && String(value); })
+    .map(function (value) { return String(value); }).join(" · ");
+}
+function renderResourceSet(resourceSet) {
+  state.resourceSet = resourceSet || null;
+  var target = $("resource-results");
+  if (!target) { return; }
+  target.textContent = "";
+  if (!resourceSet || typeof resourceSet !== "object") {
+    target.appendChild(el("article", "ia-card", "没有可展示的 ResourceSet。"));
+    return;
+  }
+  var plan = resourceSet.plan && resourceSet.plan.plan ? resourceSet.plan.plan : {};
+  var counts = resourceSet.counts && typeof resourceSet.counts === "object" ? resourceSet.counts : {};
+  var summary = el("article", "ia-card resource-set-summary");
+  summary.appendChild(el("h3", "", "ResourceSet · " + (resourceSet.status || "unknown")));
+  summary.appendChild(el("p", "", "查询：" + (resourceSet.query || plan.query || "—") + (resourceSet.preset ? " · preset: " + resourceSet.preset : "")));
+  summary.appendChild(el("p", "meta", "Repo " + (counts.repo || 0) + " · Skill " + (counts.skill || 0) + " · Web " + (counts.website || 0) + " · Tool " + (counts.tool || 0)));
+  if (resourceSet.degraded) { summary.appendChild(el("p", "status-error", "部分来源降级，仍保留已返回候选。")); }
+  var adapterStatus = resourceSet.adapter_status && typeof resourceSet.adapter_status === "object" ? resourceSet.adapter_status : {};
+  var sourceLabels = [];
+  Object.keys(adapterStatus).forEach(function (name) {
+    var item = adapterStatus[name] || {};
+    sourceLabels.push(name + " · " + (item.status || "unknown") + " · " + (item.count || 0));
+  });
+  if (sourceLabels.length) { summary.appendChild(el("p", "meta", "来源：" + sourceLabels.join(" ｜ "))); }
+  var diagnostics = Array.isArray(resourceSet.diagnostics) ? resourceSet.diagnostics : [];
+  var diagnosticLabels = [];
+  diagnostics.forEach(function (item) {
+    var label = resourceDiagnosticLabel(item);
+    if (label && diagnosticLabels.indexOf(label) < 0) { diagnosticLabels.push(label); }
+  });
+  if (diagnosticLabels.length) { summary.appendChild(el("p", "resource-diagnostics", "诊断：" + diagnosticLabels.slice(0, 6).join(" ｜ "))); }
+  target.appendChild(summary);
+  var filter = $("resource-kind-filter");
+  var kindFilter = filter ? String(filter.value || "all") : "all";
+  var rows = Array.isArray(resourceSet.candidates) ? resourceSet.candidates.filter(function (candidate) {
+    return candidate && (kindFilter === "all" || String(candidate.kind || "") === kindFilter);
+  }) : [];
+  if (!rows.length) {
+    target.appendChild(el("article", "ia-card", kindFilter === "all" ? "暂无候选；请查看来源状态或换一句需求。" : "当前筛选没有候选。"));
+    return;
+  }
+  rows.forEach(function (candidate) {
+    var card = el("article", "ia-card resource-candidate");
+    card.dataset.resourceId = String(candidate.resource_id || "");
+    var heading = el("h3", "", candidate.name || candidate.url || "未命名资源");
+    var url = String(candidate.url || "");
+    if (url) {
+      heading.textContent = "";
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = candidate.name || url;
+      heading.appendChild(link);
+    }
+    card.appendChild(heading);
+    card.appendChild(el("p", "meta", resourceKindLabel(candidate.kind) + " · " + (candidate.source || "unknown") + (candidate.selected ? " · 推荐" : "")));
+    if (candidate.description) { card.appendChild(el("p", "", String(candidate.description).slice(0, 280))); }
+    card.appendChild(el("p", "meta", "客观分 " + Number(candidate.objective_score || 0).toFixed(1)));
+    target.appendChild(card);
+  });
+}
+function selectedResourceAdapters() {
+  var values = [];
+  document.querySelectorAll(".resource-adapter").forEach(function (input) {
+    if (input.checked) { values.push(String(input.value)); }
+  });
+  return values;
+}
+function discoverResources(preset) {
+  var query = String($("resource-query").value || "").trim();
+  var adapters = selectedResourceAdapters();
+  if (!preset && !query) {
+    status("resource-status", "请先输入自然语言资源需求", "error");
+    return;
+  }
+  if (!adapters.length) {
+    status("resource-status", "至少选择一个 Repo、Skill 或 Web 检索源", "error");
+    return;
+  }
+  var button = preset ? $("resource-weekly-btn") : $("resource-search-btn");
+  busy(button, true);
+  status("resource-status", preset ? "正在查找 GitHub Weekly Preset…" : "正在搜索统一 ResourceSet…", "");
+  var body = {
+    query: query,
+    pasted_text: String($("resource-pasted-text").value || ""),
+    adapters: adapters,
+    limit: 50,
+    persist: true
+  };
+  if (preset) { body.preset = "github_weekly"; }
+  api("/api/resources/discover", body).then(function (data) {
+    var resourceSet = data.resource_set || data;
+    renderResourceSet(resourceSet);
+    status("resource-status", "搜索完成 · " + (resourceSet.status || "已返回") + (resourceSet.degraded ? " · 部分来源降级" : ""), resourceSet.degraded ? "error" : "ok");
+  }).catch(function (error) {
+    status("resource-status", "资源搜索失败：" + error.message, "error");
+  }).then(function () {
+    busy(button, false);
+  });
+}
+function sendResourcesToStudio() {
+  // Iteration 2 handoff: Skill stays a resource type, but the poster studio
+  // keeps living in the creation page — this reuses the single skills pipeline.
+  var query = String(($("resource-query") || {}).value || "").trim();
+  var links = String(($("resource-pasted-text") || {}).value || "").trim();
+  if (!links && !query) {
+    status("resource-status", "先输入资源需求或粘贴 Skill 链接", "error");
+    return;
+  }
+  setAppPage("creation");
+  if (links) {
+    if ($("skill-links")) { $("skill-links").value = links; growSkillLinks(); }
+    status("studio-status", "正在读取粘贴的 Skill…", "");
+    pasteSkills();
+  } else {
+    if ($("skill-query")) { $("skill-query").value = query; }
+    status("studio-status", "正在按资源需求查找 Skill…", "");
+    searchSkills();
+  }
+}
+function openWeeklyStudio() {
+  setAppPage("creation");
+  status("studio-status", "正在读取周榜快照…", "");
+  return loadGithubWeekly();
+}
+function fetchGithubWeekly() {
+  var button = $("github-fetch-btn");
+  if (button) { busy(button, true); }
+  waitStart("github_fetch");
+  status("studio-status", "正在抓取本周周榜…", "");
+  return waitApi("github_fetch", "/api/github-weekly", {}).then(function (data) {
+    renderGithubWeekly(data);
+    var count = (data.repos || []).length;
+    status("studio-status", count ? ("已抓取 " + count + " 个仓库，可生成图片") : "本周没有抓到合适的仓库", count ? "ok" : "error");
+    waitDone(count ? ("已抓取 " + count + " 个仓库") : "没有抓到仓库", "github_fetch");
+    return data;
+  }).catch(function (error) {
+    status("studio-status", "抓取周榜失败：" + error.message, "error");
+    waitFail(error.message || "抓取周榜失败", "github_fetch");
+  }).then(function () {
+    if (button) { busy(button, false); }
+  });
+}
 function renderResourceResults(skills) {
   var target = $("resource-results");
   if (!target) { return; }
-  if (target.dataset.resourceDiscoverySlot === "pending") { return; }
+  if (target.dataset.resourceDiscoverySlot !== "legacy") { return; }
   target.textContent = "";
   var rows = (skills || []).filter(function (skill) { return skill && !skill.gap; });
   if (!rows.length) {
@@ -5320,7 +5638,7 @@ function renderResourceResults(skills) {
 function renderResourceGithubResults(repos) {
   var target = $("resource-results");
   if (!target) { return; }
-  if (target.dataset.resourceDiscoverySlot === "pending") { return; }
+  if (target.dataset.resourceDiscoverySlot !== "legacy") { return; }
   var rows = (repos || []).filter(function (repo) { return repo && (repo.full_name || repo.name); });
   if (!rows.length) { return; }
   target.textContent = "";
@@ -6159,15 +6477,23 @@ $("home-search-btn").addEventListener("click", function () {
   }
 });
 $("resource-search-btn").addEventListener("click", function () {
-  var query = String($("resource-query").value || "").trim();
-  if (!query) {
-    status("resource-status", "请先输入想找的资源", "error");
-    return;
-  }
-  status("resource-status", "统一 ResourceDiscoveryService 尚未接入；本页不会把旧 Skill / GitHub 数据当作统一结果。", "");
+  discoverResources(false);
 });
 $("resource-weekly-btn").addEventListener("click", function () {
-  status("resource-status", "兼容周榜仍在旧工作台；统一资源页等待 ResourceSet 接口。", "");
+  discoverResources(true);
+});
+$("resource-studio-btn").addEventListener("click", function () { sendResourcesToStudio(); });
+$("resource-weekly-studio-btn").addEventListener("click", function () { openWeeklyStudio(); });
+$("github-fetch-btn").addEventListener("click", function () { fetchGithubWeekly(); });
+$("skills-fetch-btn").addEventListener("click", function () {
+  status("studio-status", "正在读取上次收录的 Skill…", "");
+  loadSkills().then(function (data) {
+    var count = data && Array.isArray(data.skills) ? data.skills.length : 0;
+    status("studio-status", count ? ("已读取 " + count + " 个 skill") : "还没有收录的 skill，请先去资源探索查找或粘贴链接", count ? "ok" : "error");
+  });
+});
+$("resource-kind-filter").addEventListener("change", function () {
+  if (state.resourceSet) { renderResourceSet(state.resourceSet); }
 });
 $("source-refresh-all").addEventListener("click", function () {
   setAppPage("news");
@@ -6176,6 +6502,11 @@ $("source-refresh-all").addEventListener("click", function () {
 });
 $("source-open-runs").addEventListener("click", function () { setAppPage("runs"); });
 $("publishing-open-creation").addEventListener("click", function () { setAppPage("creation"); });
+$("publishing-refresh-btn").addEventListener("click", function () {
+  loadPublishingDrafts().catch(function (error) {
+    status("publishing-summary", "读取草稿失败：" + error.message, "error");
+  });
+});
 $("publishing-open-settings").addEventListener("click", function () {
   setAppPage("settings");
   openSettings(true);
@@ -6499,6 +6830,7 @@ class WebApp:
         leaderboard_service: LLMService | None = None,
         visual_renderer=None,
         render_fetcher=None,
+        resource_discovery=None,
     ) -> None:
         self.database = database
         self.packages_dir = Path(packages_dir)
@@ -6548,6 +6880,8 @@ class WebApp:
         # HotspotService remains the owner of collection/ranking, while the
         # Workbench owns the research boundary and its persistence.
         self._refresh_research_runtime()
+        self._resource_memory_repository = _MemoryResourceSetRepository()
+        self.resource_discovery = resource_discovery or self._build_resource_discovery()
         self.workflow = ContentWorkflow(database)
         # ponytail: one local lock prevents duplicate platform submissions;
         # use per-account locks only if publish throughput becomes relevant.
@@ -6566,6 +6900,143 @@ class WebApp:
         self.scheduler = PublishScheduler(database, self.publish, interval_seconds=15)
         self._restore_accounts()
         self._restore_github_token()
+
+    def _resource_repository(self) -> object:
+        """Use the DB v4 resource seam when present, otherwise keep loopback usable."""
+        required = ("save_resource_set", "get_resource_set", "list_resource_sets")
+        if all(callable(getattr(self.database, name, None)) for name in required):
+            return self.database
+        return self._resource_memory_repository
+
+    def _resource_github_adapter(self, query: str, *, limit: int) -> dict[str, object]:
+        getter = self.github_fetcher or default_github_get
+        url = "https://api.github.com/search/repositories?" + urlencode(
+            {"q": query, "sort": "stars", "order": "desc", "per_page": str(limit)}
+        )
+        payload = getter(url)
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            return {"results": [], "degraded": True, "cause_code": "invalid_response"}
+        return {"results": [dict(item, source="github", kind="repo") for item in payload["items"] if isinstance(item, dict)]}
+
+    def _resource_skill_adapter(self, query: str, *, limit: int) -> dict[str, object]:
+        getter = self.github_fetcher or default_github_get
+        rows: list[dict[str, object]] = []
+        rows.extend(_github_search(f"SKILL.md {query}", getter)[:limit])
+        rows.extend(_skills_sh_search(query, getter)[:limit])
+        return {"results": rows[:limit]}
+
+    def _resource_web_adapter(self, query: str, *, limit: int) -> dict[str, object]:
+        searcher = self.skill_web_search
+        if callable(searcher):
+            result = searcher(query)
+            return result if isinstance(result, dict) else {"results": list(result or [])}
+        # Reuse the existing bounded related-news parser as the default web
+        # adapter; it keeps upstream payloads out of the ResourceSet diagnostics.
+        from .background import search_related_news
+
+        report = search_related_news(query, fetcher=self.workbench.page_fetcher, limit=limit)
+        rows = [dict(item, source="web", kind="website") for item in report.results]
+        return {
+            "results": rows,
+            "degraded": bool(report.degraded),
+            "cause_code": report.cause_code,
+        }
+
+    def _build_resource_discovery(self) -> ResourceDiscoveryService:
+        return ResourceDiscoveryService(
+            github_adapter=self._resource_github_adapter,
+            skill_adapter=self._resource_skill_adapter,
+            web_adapter=self._resource_web_adapter,
+            repository=self._resource_repository(),
+        )
+
+    @staticmethod
+    def _resource_set_payload(resource_set: object) -> dict[str, object]:
+        if hasattr(resource_set, "to_dict"):
+            payload = resource_set.to_dict()
+        else:
+            payload = resource_set
+        if not isinstance(payload, dict):
+            raise ResourceDiscoveryError("resource_set_invalid")
+        return {"ok": True, "resource_set": payload}
+
+    def discover_resources(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("resource payload must be a JSON object")
+        query = payload.get("query", "")
+        if query is not None and not isinstance(query, str):
+            raise ValueError("query must be a string")
+        pasted_text = payload.get("pasted_text", "")
+        if not isinstance(pasted_text, str):
+            raise ValueError("pasted_text must be a string")
+        if len(pasted_text) > MAX_PASTE_CHARS:
+            raise ValueError(f"pasted_text must be at most {MAX_PASTE_CHARS} characters")
+        source_event_ids = payload.get("source_event_ids", ())
+        if not isinstance(source_event_ids, (list, tuple)) or any(
+            not isinstance(item, str) for item in source_event_ids
+        ):
+            raise ValueError("source_event_ids must be a list of strings")
+        adapters = payload.get("adapters")
+        if adapters is not None:
+            if not isinstance(adapters, (list, tuple)) or any(
+                not isinstance(item, str) for item in adapters
+            ):
+                raise ValueError("adapters must be a list of strings")
+            if not adapters:
+                raise ValueError("adapters must not be empty")
+        limit = payload.get("limit")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100
+        ):
+            raise ValueError("limit must be between 1 and 100")
+        persist = payload.get("persist", True)
+        if not isinstance(persist, bool):
+            raise ValueError("persist must be boolean")
+        preset = payload.get("preset", "")
+        if not isinstance(preset, str):
+            raise ValueError("preset must be a string")
+        kwargs = {
+            "pasted_text": pasted_text,
+            "source_event_ids": source_event_ids,
+            "adapters": adapters or ("github", "skills", "web"),
+            "limit": limit,
+            "persist": persist,
+        }
+        if preset.strip():
+            result = self.resource_discovery.discover_preset(preset, **kwargs)
+        else:
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("query must be 1-200 characters")
+            result = self.resource_discovery.discover(query, **kwargs)
+        return self._resource_set_payload(result)
+
+    def list_resource_sets(self, limit: int = 20) -> dict[str, object]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        repository = getattr(self.resource_discovery, "repository", None)
+        if repository is None or not callable(getattr(repository, "list_resource_sets", None)):
+            raise ResourceDiscoveryError("resource_repository_not_configured")
+        rows = repository.list_resource_sets(limit)
+        return {
+            "ok": True,
+            "resource_sets": [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in rows
+                if isinstance(item, dict) or hasattr(item, "to_dict")
+            ],
+        }
+
+    def get_resource_set(self, set_id: str) -> dict[str, object]:
+        return self._resource_set_payload(self.resource_discovery.restore(set_id))
+
+    def refresh_resource_set(self, set_id: str) -> dict[str, object]:
+        return self._resource_set_payload(self.resource_discovery.refresh(set_id))
+
+    def delete_resource_set(self, set_id: str) -> dict[str, object]:
+        repository = getattr(self.resource_discovery, "repository", None)
+        if repository is None or not callable(getattr(repository, "delete_resource_set", None)):
+            raise ResourceDiscoveryError("resource_repository_not_configured")
+        return {"ok": bool(repository.delete_resource_set(set_id)), "set_id": set_id}
 
     def _restore_github_token(self) -> None:
         """Hand the saved GitHub token to the HTTP layer; the value stays secret."""
@@ -7171,6 +7642,34 @@ class WebApp:
     def approve(self, draft_id: str, reviewer: str) -> dict[str, object]:
         self.workflow.approve_draft(draft_id, reviewer)
         return {"ok": True, "draft_id": draft_id, "status": self.database.get_draft(draft_id)["status"]}
+
+    def list_drafts(self, limit: int = 20) -> dict[str, object]:
+        """Publishing-center listing: safe draft summaries plus latest attempt."""
+        rows = self.database.list_drafts(limit)
+        drafts = [
+            {
+                "draft_id": str(row["draft_id"]),
+                "event_id": str(row["event_id"]),
+                "platform": str(row["platform"]),
+                "title": str(row["title"]),
+                "status": str(row["status"]),
+                "approved_by": str(row.get("approved_by") or ""),
+                "approved_at": str(row.get("approved_at") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "updated_at": str(row.get("updated_at") or ""),
+                "attempt_status": str(row.get("attempt_status") or ""),
+                "attempt_at": str(row.get("attempt_at") or ""),
+            }
+            for row in rows
+        ]
+        return {"ok": True, "drafts": drafts}
+
+    def open_draft(self, draft_id: str) -> dict[str, object]:
+        """Load one persisted draft into the creation editor without re-generating."""
+        identifier = str(draft_id or "").strip()
+        if not identifier:
+            raise ValueError("draft_id required")
+        return self._draft_view(self.database.get_draft(identifier))
 
     def edit_article(self, draft_id: str, title: str, body: str) -> dict[str, object]:
         draft = self.workflow.edit_draft(draft_id, title, body)
@@ -8569,6 +9068,34 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         raise ValueError("dossier_id required")
                     self._send_json(200, app.get_research(dossier_id))
                     return
+                if parsed.path == "/api/resources":
+                    raw_limit = (parse_qs(parsed.query).get("limit") or ["20"])[0]
+                    try:
+                        limit = int(raw_limit)
+                    except ValueError as exc:
+                        raise ValueError("limit must be an integer") from exc
+                    self._send_json(200, app.list_resource_sets(limit))
+                    return
+                if parsed.path.startswith("/api/resources/"):
+                    set_id = parsed.path.rsplit("/", 1)[-1].strip()
+                    if not set_id:
+                        raise ValueError("set_id required")
+                    self._send_json(200, app.get_resource_set(set_id))
+                    return
+                if parsed.path == "/api/drafts":
+                    raw_limit = (parse_qs(parsed.query).get("limit") or ["20"])[0]
+                    try:
+                        limit = int(raw_limit)
+                    except ValueError as exc:
+                        raise ValueError("limit must be an integer") from exc
+                    self._send_json(200, app.list_drafts(limit))
+                    return
+                if parsed.path.startswith("/api/drafts/"):
+                    draft_id = parsed.path.rsplit("/", 1)[-1].strip()
+                    if not draft_id:
+                        raise ValueError("draft_id required")
+                    self._send_json(200, app.open_draft(draft_id))
+                    return
                 if parsed.path == "/api/github-weekly":
                     self._send_json(200, app.github_weekly())
                     return
@@ -8707,6 +9234,13 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     if query is not None and not isinstance(query, str):
                         raise ResearchError("query_invalid")
                     result = app.research(event_ids, query)
+                elif self.path == "/api/resources/discover":
+                    result = app.discover_resources(payload)
+                elif self.path.startswith("/api/resources/") and self.path.endswith("/refresh"):
+                    set_id = self.path[len("/api/resources/") : -len("/refresh")].strip("/")
+                    if not set_id:
+                        raise ValueError("set_id required")
+                    result = app.refresh_resource_set(set_id)
                 elif self.path == "/api/collect":
                     hours = payload.get("hours", 4) if isinstance(payload, dict) else 4
                     if isinstance(hours, bool) or not isinstance(hours, int):
@@ -8908,6 +9442,11 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                 payload = self._read_json_body()
                 if self.path == "/api/favorites":
                     result = app.delete_favorite(self._require_string(payload, "item_id"))
+                elif self.path.startswith("/api/resources/"):
+                    set_id = self.path.rsplit("/", 1)[-1].strip()
+                    if not set_id:
+                        raise ValueError("set_id required")
+                    result = app.delete_resource_set(set_id)
                 else:
                     raise KeyError(self.path)
                 self._send_json(200, result)

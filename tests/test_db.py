@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from autoposting.content import Draft
+from autoposting.decision.contracts import PlannerResult, ResearchIntent, SearchPlan
 from autoposting.db import Database
 from autoposting.models import Source
+from autoposting.resource_discovery import ResourceCandidate, ResourceSet, ResourceStatus
 
 
 class HotspotFavoriteTests(unittest.TestCase):
@@ -245,7 +247,7 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
 
     def test_user_version_migration_is_idempotent_and_sanitizes_legacy_error(self) -> None:
         with self.db.connect() as connection:
-            self.assertEqual(3, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(4, connection.execute("PRAGMA user_version").fetchone()[0])
             connection.execute(
                 "INSERT INTO sources (source_id, name, type, url_or_handle, tier, topics_json, "
                 "enabled, fetch_interval_minutes, created_at, updated_at, last_error) "
@@ -376,6 +378,167 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
                 ).fetchall(),
             )
             self.assertEqual(0, connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+class ResourceSetPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "autoposting.db"
+        self.db = Database(self.path)
+        self.db.initialize()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _resource_set(set_id: str = "set-1", created_at: str = "2026-09-22T00:00:00+00:00") -> ResourceSet:
+        intent = ResearchIntent(
+            goal="Find browser automation resources",
+            concepts=("browser automation",),
+            search_repo=True,
+            search_skill=True,
+            search_web=False,
+            preferred_signals=("recent",),
+            source_event_ids=("event-1",),
+        )
+        plan = SearchPlan("browser automation", ("github", "skills"), max_candidates=10)
+        candidate = ResourceCandidate(
+            resource_id="repo:acme/tool",
+            kind="repo",
+            name="Tool",
+            url="https://github.com/acme/tool?access_token=ignored",
+            source="github",
+            description="A useful tool",
+            metadata={"full_name": "acme/tool"},
+            objective_score=88,
+            selected=True,
+            source_ids=("event-1",),
+        )
+        return ResourceSet(
+            set_id=set_id,
+            query="browser automation",
+            plan=PlannerResult(intent=intent, plan=plan),
+            preset="github_weekly",
+            candidates=(candidate,),
+            adapter_status={
+                "github": {
+                    "status": "ok",
+                    "count": 1,
+                    "cause_code": "",
+                    "note": "token=SUPERSECRET",
+                    "headers": {"Authorization": "Bearer SUPERSECRET"},
+                }
+            },
+            status=ResourceStatus.OK,
+            degraded=False,
+            diagnostics=({"code": "resource_warning", "detail": "token=SUPERSECRET"},),
+            created_at=created_at,
+        )
+
+    def test_v4_round_trip_keeps_candidates_and_redacts_secrets(self) -> None:
+        resource_set = self._resource_set()
+        self.db.save_resource_set(resource_set)
+
+        payload = self.db.get_resource_set("set-1")
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("resource-set-v1", payload["schema_version"])
+        self.assertEqual("credential=<redacted>", payload["diagnostics"][0]["detail"])
+        self.assertEqual("credential=<redacted>", payload["adapter_status"]["github"]["note"])
+        # An absent adapter cause must survive persistence as "", not as the
+        # sanitized-detail fallback "unknown_error" (round-trip fidelity).
+        self.assertEqual("", payload["adapter_status"]["github"]["cause_code"])
+        restored = ResourceSet.from_dict(payload)
+        self.assertEqual("repo:acme/tool", restored.candidates[0].resource_id)
+        self.assertEqual(1, restored.counts["repo"])
+
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM resource_sets WHERE set_id = 'set-1'"
+            ).fetchone()
+            self.assertEqual(4, connection.execute("PRAGMA user_version").fetchone()[0])
+            envelope = json.loads(row["resource_set_json"])
+            self.assertEqual("resource-set-envelope-v1", envelope["schema_version"])
+            self.assertIn("candidates", envelope["data"])
+            self.assertNotIn("SUPERSECRET", row["resource_set_json"])
+            self.assertNotIn("headers", row["resource_set_json"])
+
+    def test_restart_list_limit_and_delete(self) -> None:
+        self.db.save_resource_set(self._resource_set())
+        self.db.save_resource_set(
+            self._resource_set("set-2", "2026-09-22T01:00:00+00:00")
+        )
+
+        reopened = Database(self.path)
+        reopened.initialize()
+        self.assertEqual("set-1", reopened.get_resource_set("set-1")["set_id"])
+        self.assertEqual(["set-2"], [item["set_id"] for item in reopened.list_resource_sets(1)])
+        self.assertTrue(reopened.delete_resource_set("set-1"))
+        self.assertFalse(reopened.delete_resource_set("set-1"))
+        self.assertIsNone(reopened.get_resource_set("set-1"))
+        with self.assertRaisesRegex(ValueError, "resource_set_limit_invalid"):
+            reopened.list_resource_sets(0)
+
+    def test_unknown_or_corrupt_payload_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "resource_set_unknown_schema_version"):
+            self.db.save_resource_set({"schema_version": "future-v9"})
+        with self.assertRaisesRegex(ValueError, "resource_set_id_required"):
+            self.db.get_resource_set("")
+
+        self.db.save_resource_set(self._resource_set())
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE resource_sets SET resource_set_json = ? WHERE set_id = 'set-1'",
+                ('{"schema_version":"future-v9","data":{}}',),
+            )
+        with self.assertRaisesRegex(ValueError, "resource_set_unknown_schema_version"):
+            self.db.get_resource_set("set-1")
+        with self.assertRaisesRegex(ValueError, "resource_set_unknown_schema_version"):
+            self.db.list_resource_sets()
+
+
+class DraftListingTests(unittest.TestCase):
+    """The publishing-center listing stays a basic, ordered persistence query."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp_dir.name) / "autoposting.db")
+        self.db.initialize()
+        self.event_id = self.db.create_event("Publish", "tests", "TEST", "publish:db")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _draft(self, draft_id: str, platform: str = "wechat", title: str = "标题") -> None:
+        self.db.upsert_draft(
+            Draft(draft_id, self.event_id, platform, title, "正文 AIGC", (), ("source",))
+        )
+
+    def test_list_drafts_orders_by_activity_and_joins_latest_attempt(self) -> None:
+        self._draft("draft-a", title="第一篇")
+        self._draft("draft-b", platform="xiaohongshu", title="第二篇")
+        self.db.record_publication_attempt(
+            "attempt-1", "draft-a", "wechat", False, "DRY_RUN", None, 0
+        )
+
+        rows = self.db.list_drafts(10)
+        by_id = {row["draft_id"]: row for row in rows}
+        self.assertEqual({"draft-a", "draft-b"}, set(by_id))
+        self.assertEqual("DRY_RUN", by_id["draft-a"]["attempt_status"])
+        self.assertEqual("", str(by_id["draft-b"]["attempt_status"] or ""))
+        self.assertEqual("DRAFTED", by_id["draft-a"]["status"])
+        self.assertEqual("wechat", by_id["draft-a"]["platform"])
+        self.assertEqual("第二篇", by_id["draft-b"]["title"])
+        # Newest activity first: draft-b was written last.
+        self.assertEqual("draft-b", rows[0]["draft_id"])
+
+        self.db.approve_draft("draft-a", "human")
+        self.assertEqual("APPROVED", {row["draft_id"]: row for row in self.db.list_drafts(10)}["draft-a"]["status"])
+
+        with self.assertRaisesRegex(ValueError, "draft_limit_invalid"):
+            self.db.list_drafts(0)
+        with self.assertRaisesRegex(ValueError, "draft_limit_invalid"):
+            self.db.list_drafts(True)
 
 
 class CollectionRunTests(unittest.TestCase):

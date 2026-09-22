@@ -210,6 +210,97 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(200, status2)
         self.assertEqual(payload["repos"][0]["full_name"], saved["repos"][0]["full_name"])
 
+    def test_resource_discovery_loopback_mixed_set_persists_and_refreshes(self) -> None:
+        calls: list[str] = []
+
+        def getter(url: str) -> object:
+            calls.append(url)
+            if "api.github.com/search/repositories" in url:
+                return {
+                    "items": [
+                        {
+                            "full_name": "acme/ppt-agent",
+                            "html_url": "https://github.com/acme/ppt-agent",
+                            "description": "AI agent for making presentations",
+                            "stargazers_count": 42,
+                            "topics": ["ai", "ppt"],
+                        }
+                    ]
+                }
+            return {"skills": []}
+
+        self.app.github_fetcher = getter
+        self.app.skill_web_search = lambda _query: [
+            {
+                "title": "Presentation workflow guide",
+                "url": "https://docs.example/ppt-agent",
+                "snippet": "A practical web guide.",
+            }
+        ]
+        status, payload = self._request(
+            "POST",
+            "/api/resources/discover",
+            {
+                "query": "制作 PPT 的 AI agent",
+                "pasted_text": "https://github.com/acme/ppt-agent/tree/main/skills/slides",
+                "adapters": ["repo", "skill", "web"],
+                "limit": 10,
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        resource_set = payload["resource_set"]
+        self.assertEqual("resource-set-v1", resource_set["schema_version"])
+        self.assertEqual("制作 PPT 的 AI agent", resource_set["query"])
+        self.assertEqual({"github", "skills", "web"}, set(resource_set["adapter_status"]))
+        self.assertGreaterEqual(resource_set["counts"]["repo"], 1)
+        self.assertGreaterEqual(resource_set["counts"]["skill"], 1)
+        self.assertGreaterEqual(resource_set["counts"]["website"], 1)
+        self.assertTrue(any(row["source"] == "pasted" for row in resource_set["candidates"]))
+        self.assertNotIn("token", json.dumps(resource_set, ensure_ascii=False).lower())
+        set_id = resource_set["set_id"]
+
+        call_count = len(calls)
+        restored_status, restored = self._request("GET", "/api/resources/" + set_id)
+        self.assertEqual(200, restored_status)
+        self.assertEqual(resource_set, restored["resource_set"])
+        listed_status, listed = self._request("GET", "/api/resources?limit=20")
+        self.assertEqual(200, listed_status)
+        self.assertEqual(set_id, listed["resource_sets"][0]["set_id"])
+
+        refresh_status, refreshed = self._request(
+            "POST", "/api/resources/" + set_id + "/refresh", {}
+        )
+        self.assertEqual(200, refresh_status)
+        self.assertEqual(resource_set, refreshed["resource_set"])
+        self.assertEqual(call_count, len(calls), "refresh must restore, not re-run adapters")
+
+    def test_resource_discovery_github_weekly_preset_is_a_resource_set(self) -> None:
+        def getter(_url: str) -> object:
+            return {
+                "items": [
+                    {
+                        "full_name": "acme/weekly-ai",
+                        "html_url": "https://github.com/acme/weekly-ai",
+                        "description": "A weekly AI project",
+                        "stargazers_count": 9,
+                    }
+                ]
+            }
+
+        self.app.github_fetcher = getter
+        status, payload = self._request(
+            "POST",
+            "/api/resources/discover",
+            {"preset": "github_weekly", "adapters": ["repo"], "limit": 5},
+        )
+        self.assertEqual(200, status)
+        resource_set = payload["resource_set"]
+        self.assertEqual("github_weekly", resource_set["preset"])
+        self.assertEqual("本周 AI 新项目", resource_set["query"])
+        self.assertEqual(1, resource_set["counts"]["repo"])
+        self.assertEqual(0, resource_set["counts"]["skill"])
+
     def test_github_weekly_refresh_does_not_call_image_model(self) -> None:
         """D5/D8 regression guard: no image-model surface may come back."""
         self.app.github_fetcher = (
@@ -363,7 +454,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("3.1.0", payload["version"])
+        self.assertEqual("3.2.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -2017,6 +2108,51 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(payload["manual_required"])
         self.assertEqual("DRAFTED", self.db.get_draft(wechat["draft_id"])["status"])
 
+    def test_publishing_center_lists_drafts_and_opens_them(self) -> None:
+        item_id = self._insert_item(
+            self.sources[0], "w1", "Model One news", "https://lab.example/w1"
+        )
+        _, wechat = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
+        )
+        _, xiaohongshu = self._request(
+            "POST", "/api/articles", {"item_id": item_id, "platform": "xiaohongshu"}
+        )
+        self._request(
+            "POST", "/api/approve", {"draft_id": wechat["draft_id"], "reviewer": "human"}
+        )
+        self._request(
+            "POST",
+            "/api/publish",
+            {"draft_id": xiaohongshu["draft_id"], "platform": "xiaohongshu", "live": True},
+        )
+
+        status, payload = self._request("GET", "/api/drafts?limit=20")
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        drafts = {row["draft_id"]: row for row in payload["drafts"]}
+        self.assertEqual({wechat["draft_id"], xiaohongshu["draft_id"]}, set(drafts))
+        self.assertEqual("APPROVED", drafts[wechat["draft_id"]]["status"])
+        self.assertEqual("wechat", drafts[wechat["draft_id"]]["platform"])
+        self.assertEqual("human", drafts[wechat["draft_id"]]["approved_by"])
+        self.assertEqual("DRAFTED", drafts[xiaohongshu["draft_id"]]["status"])
+        self.assertIn("attempt_status", drafts[xiaohongshu["draft_id"]])
+        serialized = json.dumps(payload, ensure_ascii=False).lower()
+        for secret in ("app_secret", "access_token", "bearer", "api_key"):
+            self.assertNotIn(secret, serialized)
+
+        open_status, opened = self._request("GET", "/api/drafts/" + wechat["draft_id"])
+        self.assertEqual(200, open_status)
+        self.assertTrue(opened["ok"])
+        self.assertEqual(wechat["draft_id"], opened["draft_id"])
+        self.assertEqual(wechat["title"], opened["title"])
+        self.assertEqual(wechat["body"], opened["body"])
+        self.assertEqual(wechat["source_ids"], opened["source_ids"])
+        self.assertEqual("wechat", opened["platform"])
+
+        missing_status, _ = self._request("GET", "/api/drafts/does-not-exist")
+        self.assertEqual(404, missing_status)
+
     def test_publish_platform_mismatch_is_rejected(self) -> None:
         item_id = self._insert_item(self.sources[0], "w1", "Model One news", "https://lab.example/w1")
         _, article = self._request("POST", "/api/articles", {"item_id": item_id, "platform": "wechat"})
@@ -2285,27 +2421,31 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('data-platform="wechat"', html)
         self.assertIn('data-platform="xiaohongshu"', html)
 
-    def test_top_nav_holds_lanes_and_platforms(self) -> None:
+    def test_top_nav_holds_primary_pages_and_platform_switcher(self) -> None:
+        """Iteration 2: the four legacy lane tabs are gone; the primary nav and
+        the platform switcher are the only top-bar controls, while the retained
+        weekly/skill capabilities live inside the creation page studios."""
         html = self._index()
         self.assertIn('id="app-nav"', html)
-        self.assertIn('data-lane="hotspots"', html)
-        self.assertIn('data-lane="viewpoints"', html)
-        self.assertIn('data-lane="github"', html)
-        self.assertIn('data-lane="skills"', html)
-        self.assertIn("Skill查找器", html)
+        self.assertNotIn('id="legacy-lane-tabs"', html)
+        self.assertNotIn('data-lane="hotspots"', html)
+        self.assertNotIn('data-lane="viewpoints"', html)
+        self.assertNotIn('data-lane="github"', html)
+        self.assertNotIn('data-lane="skills"', html)
         nav = html[html.index('id="app-nav"') : html.index('id="wait-banner"')]
-        self.assertIn('data-lane="skills"', nav)
+        for page in ("home", "news", "resources", "creation", "publishing", "sources", "runs", "settings"):
+            self.assertIn(f'data-app-page-target="{page}"', nav)
         self.assertIn('data-platform="wechat"', nav)
         self.assertIn('data-platform="xiaohongshu"', nav)
-        self.assertNotIn('data-lane="skills"', html[html.index('id="hotspots-panel"') : html.index('id="article-panel"')])
         self.assertLess(html.index('id="app-nav"'), html.index('id="wait-banner"'))
         self.assertGreater(html.index('id="wait-banner"'), html.index("</header>"))
         self.assertLess(html.index('id="wait-banner"'), html.index("<main>"))
-        self.assertIn("lane === \"skills\"", html)
-        self.assertIn("body.lane-skills", html)
+        # Retained capabilities: the unified search API and the poster galleries.
         self.assertIn("/api/skills/search", html)
         self.assertIn('id="skill-query"', html)
         self.assertIn('id="skills-gallery"', html)
+        self.assertIn('id="github-studio"', html)
+        self.assertIn('id="skills-studio"', html)
 
     def test_iteration_one_information_architecture_and_compatibility(self) -> None:
         html = self._index()
@@ -2313,10 +2453,12 @@ class IndexPageContractTests(unittest.TestCase):
         for page in pages:
             self.assertIn(f'data-app-page-target="{page}"', html)
             self.assertIn(f'id="page-{page}"', html)
-        primary = html[html.index('id="primary-nav"') : html.index('id="legacy-lane-tabs"')]
+        primary = html[html.index('id="primary-nav"') : html.index('id="platform-switcher"')]
         self.assertNotIn("热点候选", primary)
         self.assertNotIn("观点候选", primary)
-        self.assertIn('id="legacy-lane-tabs" hidden', html)
+        # Iteration 2 removed the retired lane tab bar entirely instead of
+        # leaving it hidden in the DOM.
+        self.assertNotIn('legacy-lane-tabs', html)
         self.assertIn('id="source-health-wrap"', html)
         self.assertIn('#source-health-wrap{display:none !important;}', html)
         self.assertIn('id="source-registry-list"', html)
@@ -2326,7 +2468,13 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="research-btn"', html)
         self.assertIn('id="research-run-btn"', html)
         self.assertIn('id="settings-github-token"', html)
-        self.assertIn('data-resource-discovery-slot="pending"', html)
+        # Iteration 2: the resource page slot is live ("unified") instead of the
+        # Iteration-1 "pending" wiring stub; the unified ResourceSet renderer and
+        # search entry point are part of the new IA contract. The legacy skill /
+        # github renderers must keep existing for legacy slots only.
+        self.assertIn('data-resource-discovery-slot="unified"', html)
+        self.assertIn('function renderResourceSet(resourceSet)', html)
+        self.assertIn('function discoverResources(preset)', html)
         self.assertIn('id="settings-open-model"', html)
         self.assertIn('function setAppPage(page)', html)
         self.assertIn('function renderResourceResults(skills)', html)
@@ -2343,8 +2491,22 @@ class IndexPageContractTests(unittest.TestCase):
         for legacy_route in ('/api/status', '/api/hotspots?hours=', '/api/collect'):
             self.assertIn(legacy_route, html)
 
-    def test_skill_result_notes_are_scoped_to_the_skills_lane(self) -> None:
-        """The source block and degraded note live in the shared pane, so CSS owns the lane."""
+    def test_publishing_center_has_draft_list_and_actions(self) -> None:
+        html = self._index()
+        self.assertIn('id="publishing-draft-list"', html)
+        self.assertIn('id="publishing-refresh-btn"', html)
+        self.assertIn('/api/drafts?limit=20', html)
+        self.assertIn('function loadPublishingDrafts()', html)
+        self.assertIn('function renderPublishingDrafts(drafts)', html)
+        self.assertIn('function openDraftForPublishing(draftId, action)', html)
+        self.assertIn('PUBLISHING_STATUS_LABELS', html)
+        self.assertIn('"待审批"', html)
+        self.assertIn('"已审批"', html)
+        self.assertIn('id="schedule-at"', html)
+
+    def test_skill_surfaces_follow_the_iteration_two_layout(self) -> None:
+        """Lane-era skill search blocks stay retired, while both poster studios
+        are reachable inside the creation page."""
         html = self._index()
         # 1.4.0 merged the stage chips + gap note into one source block.
         # 1.4.3 puts the collected-skill list back, with checkboxes, below it.
@@ -2355,13 +2517,13 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertNotIn('id="skill-gap-note"', html)
         self.assertIn('id="skill-list"', html)
         style = html.split("</style>", 1)[0]
-        # The whole block is off by default, like every other skill-only block.
+        # The retired lane-era search/source blocks stay hidden by default.
         self.assertRegex(
             style,
-            r"#skill-search-row,[^{]*#skill-source-bar[^{]*#skills-studio[^{]*"
+            r"#skill-search-row,[^{]*#skill-source-bar[^{]*"
             r"#skill-degraded-note[^{]*\{[^}]*display:none",
         )
-        # ...and only the skills lane turns it back on.
+        # Their lane-scoped reveal rules are vestigial but still well-formed.
         self.assertRegex(
             style,
             r"body\.lane-skills #skill-source-bar:not\(\[hidden\]\),\s*"
@@ -2373,6 +2535,13 @@ class IndexPageContractTests(unittest.TestCase):
                 style,
                 r"body\.lane-(?:hotspots|viewpoints|github)[^{]*#" + note,
             )
+        # Iteration 2: the weekly 3:4 studio and the skill poster studio are
+        # always available in the creation page instead of lane-gated.
+        self.assertRegex(style, r"#github-studio,#skills-studio\{display:flex")
+        self.assertIn("#github-render-controls{display:flex;", style)
+        self.assertRegex(style, r"\.studio-heading\{")
+        self.assertIn('id="github-fetch-btn"', html)
+        self.assertIn('id="skills-fetch-btn"', html)
 
     def test_github_cover_css_is_three_by_four(self) -> None:
         html = self._index()
@@ -2468,18 +2637,23 @@ class IndexPageContractTests(unittest.TestCase):
         for element in ("article-title", "article-body", "article-sources", "draft_id"):
             self.assertIn(element, html)
 
-    def test_hotspot_candidate_wording_and_note(self) -> None:
+    def test_news_discovery_wording_and_weekly_studio(self) -> None:
         html = self._index()
-        self.assertIn("热点候选", html)
-        self.assertIn("观点候选", html)
-        self.assertIn('data-lane="viewpoints"', html)
+        # Iteration 2 retired the 热点候选 / 观点候选 wording and lanes entirely.
+        self.assertNotIn("热点候选", html)
+        self.assertNotIn("观点候选", html)
+        self.assertNotIn('data-lane="viewpoints"', html)
+        self.assertIn("资讯探索", html)
+        self.assertIn("按综合分、时效与独立来源聚合资讯事件", html)
+        self.assertIn("研究已选事件", html)
         self.assertIn("function setLane(", html)
-        self.assertIn("热度看独立来源数和讨论量", html)
-        self.assertIn("GitHub 周榜", html)
+        # The weekly 3:4 capability stays, now as a creation-page studio.
+        self.assertIn("GitHub 周榜出图工作台", html)
         self.assertIn("GitHub AI 项目周榜", html)
         self.assertNotIn("GitHub AI项目周榜", html)
         self.assertIn("body.lane-github .rank-toolbar", html)
-        self.assertIn('data-lane="github"', html)
+        self.assertIn('id="github-studio"', html)
+        self.assertIn('id="github-fetch-btn"', html)
         self.assertIn("榜单模型", html)
         self.assertIn("用于榜单", html)
         self.assertIn("本周爆火ai工具", html)
@@ -2565,7 +2739,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("3.1.0", html)
+        self.assertIn("3.2.0", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2892,8 +3066,10 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("function setSettingsPlatform", html)
         self.assertIn('data-settings-platform="x"', html)
         self.assertIn('name="x_bearer_token"', html)
-        self.assertIn("社区帖过阈会升温", html)
-        self.assertIn("某某称", html)
+        # Iteration 2: community posts are folded into the unified news radar,
+        # so the retired S4 wording is gone instead of hidden.
+        self.assertNotIn("社区帖过阈会升温", html)
+        self.assertNotIn("某某称", html)
         self.assertIn("function loadHotspots", html)
         self.assertIn("/api/hotspots?hours=", html)
         self.assertNotIn("renderHotspots([])", html)
