@@ -271,7 +271,7 @@ class RSSCollector:
         self.fetcher = fetcher or _default_fetcher
 
     def collect(self, source: Source) -> CollectionResult:
-        if source.type != "rss":
+        if source.adapter_type != "rss":
             raise ValueError(f"RSSCollector cannot collect source type: {source.type}")
         try:
             items = [
@@ -401,7 +401,7 @@ class SitemapNewsCollector:
         self.fetcher = fetcher or _default_fetcher
 
     def collect(self, source: Source) -> CollectionResult:
-        if source.type != "sitemap":
+        if source.adapter_type != "sitemap":
             raise ValueError(f"SitemapNewsCollector cannot collect source type: {source.type}")
         try:
             items = [
@@ -423,7 +423,7 @@ class AggregateCollector:
         self.fetcher = fetcher or _default_fetcher
 
     def collect(self, source: Source) -> CollectionResult:
-        if source.type != "web":
+        if source.adapter_type != "html":
             raise ValueError(f"AggregateCollector cannot collect source type: {source.type}")
         try:
             items = parse_aggregate_page(

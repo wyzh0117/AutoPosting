@@ -83,6 +83,36 @@ class ConfigAndPipelineTests(unittest.TestCase):
             self.assertEqual(15, sources[0].fetch_interval_minutes)
             self.assertEqual(("models",), sources[0].topics)
 
+    def test_source_registry_accepts_canonical_type_fields_without_legacy_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sources.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "official_blog",
+                                "name": "Official blog",
+                                "source_type": "official",
+                                "adapter_type": "rss",
+                                "url_or_handle": "https://example.com/feed.xml",
+                                "tier": "S1",
+                                "topics": ["models"],
+                                "enabled": True,
+                                "fetch_interval": "15m",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            source = load_sources(path)[0]
+
+            self.assertEqual("rss", source.type)
+            self.assertEqual("official", source.source_type)
+            self.assertEqual("rss", source.adapter_type)
+
     def test_enabled_x_source_requires_manual_identity_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "sources.json"
@@ -214,8 +244,46 @@ class ConfigAndPipelineTests(unittest.TestCase):
             self.assertEqual("unreachable", first.errors["broken"]["cause_code"])
             self.assertIn("simulated feed outage", first.errors["broken"]["detail"])
             self.assertTrue(first.errors["broken"]["degraded"])
+            self.assertTrue(first.run_id)
+            self.assertEqual(("working", "broken"), first.requested_sources)
+            first_run = db.get_collection_run(first.run_id)
+            self.assertEqual("FAILED", first_run["status"])
+            self.assertEqual(first.items_fetched, first_run["items_fetched"])
+            self.assertEqual(first.items_after_dedupe, first_run["items_after_dedupe"])
+            self.assertEqual(
+                {"working": "SUCCESS", "broken": "FAILED"},
+                {row["source_id"]: row["status"] for row in first_run["source_attempts"]},
+            )
             self.assertEqual(2, second.skipped_not_due)
             self.assertIn("simulated feed outage", db.get_source("broken")["last_error"])
+
+    def test_database_runtime_source_state_is_not_overwritten_by_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(Path(temp_dir) / "autoposting.db")
+            db.initialize()
+            runtime = Source(
+                "runtime",
+                "Runtime source",
+                "rss",
+                "https://example.com/feed.xml",
+                "S2",
+                ("models",),
+                True,
+                15,
+                source_type="official",
+                adapter_type="rss",
+            )
+            db.upsert_source(runtime)
+            db.set_source_enabled("runtime", False)
+            db.set_source_fetch_interval("runtime", 60)
+
+            db.upsert_source(runtime)
+
+            row = db.get_source("runtime")
+            self.assertEqual(0, row["enabled"])
+            self.assertEqual(60, row["fetch_interval_minutes"])
+            self.assertEqual("official", row["source_type"])
+            self.assertEqual("rss", row["adapter_type"])
 
     def test_example_registry_uses_first_party_feeds(self) -> None:
         sources = load_sources(

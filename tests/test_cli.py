@@ -24,6 +24,69 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertTrue(payload["ok"])
 
+    def test_collect_cli_fixture_reports_mixed_collection_run(self) -> None:
+        feed = (
+            b"<rss version='2.0'><channel><title>Fixture</title>"
+            b"<item><guid>fixture-1</guid><title>Model One news</title>"
+            b"<link>https://www.reddit.com/r/LocalLLaMA/comments/fixture1/discussion</link>"
+            b"<description>Model One news content</description></item>"
+            b"</channel></rss>"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "autoposting.db"
+            sources_path = root / "sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "lab_blog",
+                                "name": "AI Lab",
+                                "type": "rss",
+                                "url_or_handle": "https://example.com/feed.xml",
+                                "tier": "S1",
+                                "topics": ["models"],
+                                "enabled": True,
+                                "fetch_interval": "15m",
+                            },
+                            {
+                                "source_id": "reddit_ai",
+                                "name": "Reddit AI",
+                                "type": "reddit",
+                                "url_or_handle": "LocalLLaMA",
+                                "tier": "S4",
+                                "topics": ["models"],
+                                "enabled": True,
+                                "fetch_interval": "15m",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "autoposting.ingestion._default_fetcher", return_value=feed
+            ), patch("autoposting.reddit._default_reddit_fetcher", return_value=feed):
+                init_code, _ = self._run(
+                    ["init", "--db", str(db_path), "--sources", str(sources_path)]
+                )
+                collect_code, result = self._run(
+                    ["collect", "--db", str(db_path), "--sources", str(sources_path)]
+                )
+
+            self.assertEqual(0, init_code)
+            self.assertEqual(0, collect_code)
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                {"lab_blog", "reddit_ai"}, set(result["requested_sources"])
+            )
+            self.assertEqual(
+                {"lab_blog", "reddit_ai"}, set(result["successful_sources"])
+            )
+            self.assertEqual(2, len(result["source_attempts"]))
+            self.assertTrue(result["run_id"])
+
     def test_visual_render_example_writes_html(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             exit_code, payload = self._run(

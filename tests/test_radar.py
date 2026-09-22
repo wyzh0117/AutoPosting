@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from autoposting.decision import DecisionService
+from autoposting.decision.adapters.jev import JevAdapter
 from autoposting.db import Database
 from autoposting.models import FeedItem, Source
 from autoposting.radar import build_radar, cluster_candidates, engagement_by_platform
@@ -73,6 +75,116 @@ class RadarTests(unittest.TestCase):
         self.assertEqual("official-1", event["canonical_item_id"])
         self.assertEqual("supporting", event["supporting_sources"][0]["role"])
         self.assertEqual("discussion", event["discussion_sources"][0]["role"])
+
+    def test_official_and_reddit_sources_share_a_stable_cluster(self):
+        candidates = [
+            candidate(
+                "official-orion",
+                "OpenAI launches Orion model",
+                [
+                    source(
+                        "official",
+                        "https://openai.com/news/orion",
+                        "canonical",
+                        "official",
+                        "S1",
+                    )
+                ],
+                "2026-09-19T10:00:00+00:00",
+            ),
+            candidate(
+                "reddit-orion",
+                "OpenAI launches Orion model",
+                [
+                    source(
+                        "reddit-local-llm",
+                        "https://www.reddit.com/r/LocalLLaMA/comments/abc/orion",
+                        "discussion",
+                        "reddit",
+                        "S4",
+                    )
+                ],
+                "2026-09-19T11:00:00+00:00",
+            ),
+        ]
+
+        first = cluster_candidates(candidates)[0]
+        refreshed = cluster_candidates(candidates)[0]
+
+        self.assertEqual(1, len(cluster_candidates(candidates)))
+        self.assertEqual(first["event_id"], refreshed["event_id"])
+        self.assertEqual({"official", "reddit-local-llm"}, set(first["source_ids"]))
+        self.assertEqual(2, first["independent_source_count"])
+        self.assertEqual("canonical", first["canonical_source"]["role"])
+        self.assertEqual("discussion", first["discussion_sources"][0]["role"])
+
+    def test_jev_participates_in_unified_ranking_with_sixty_forty_mix(self):
+        candidates = [
+            candidate(
+                "objective-high",
+                "OpenAI announces global security model release",
+                [source("openai", "https://openai.com/security", "canonical", tier="S1")],
+                NOW,
+            ),
+            candidate(
+                "semantic-high",
+                "Developers discuss a new tool",
+                [source("media", "https://media.example/tool", "supporting", tier="S3")],
+                NOW,
+            ),
+        ]
+
+        def fake_jev(payload):
+            score = 100 if payload["candidate"]["title"].startswith("Developers") else 0
+            return {
+                "schema_version": "jev-assessment-v1",
+                "score": score,
+                "confidence": 0.95,
+                "decision": "include",
+                "reasons": ["fake Jev ranking"],
+            }
+
+        events = build_radar(
+            candidates,
+            now=NOW,
+            decision_service=DecisionService(JevAdapter(fake_jev)),
+        )
+
+        self.assertEqual("Developers discuss a new tool", events[0]["title"])
+        decision = events[0]["decision"]
+        self.assertEqual("ok", decision["status"])
+        self.assertFalse(decision["degraded"])
+        self.assertEqual(
+            round(0.6 * decision["objective_score"] + 0.4 * decision["semantic_score"], 4),
+            decision["final_score"],
+        )
+        self.assertEqual(decision["final_score"], events[0]["priority_score"])
+
+    def test_jev_failure_keeps_objective_ranking_and_emits_degraded_diagnostic(self):
+        def broken_jev(_payload):
+            raise TimeoutError("Authorization: Bearer radar-secret https://example.invalid/jev")
+
+        event = build_radar(
+            [
+                candidate(
+                    "objective-only",
+                    "OpenAI announces global security model release",
+                    [source("openai", "https://openai.com/security", "canonical", tier="S1")],
+                    NOW,
+                )
+            ],
+            now=NOW,
+            decision_service=DecisionService(JevAdapter(broken_jev)),
+        )[0]
+
+        decision = event["decision"]
+        self.assertTrue(decision["degraded"])
+        self.assertEqual("timeout", decision["diagnostics"][0]["cause_code"])
+        self.assertEqual(decision["objective_score"], decision["final_score"])
+        self.assertEqual(decision["final_score"], event["priority_score"])
+        detail = str(decision["diagnostics"][0]["detail"])
+        self.assertNotIn("radar-secret", detail)
+        self.assertNotIn("https://example.invalid/jev", detail)
 
     def test_scores_are_separate_and_evidence_statuses_do_not_mix(self):
         events = build_radar(

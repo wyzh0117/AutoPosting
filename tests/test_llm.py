@@ -225,7 +225,7 @@ class OpenAICompatibleRunnerTests(unittest.TestCase):
 
         self.assertEqual("/v1/chat/completions", requests[0][0])
         self.assertEqual("Bearer test-api-key", requests[0][1])
-        self.assertEqual("AutoPosting/3.0.0", requests[0][2])
+        self.assertEqual("AutoPosting/3.1.0", requests[0][2])
         self.assertEqual("remote-model", requests[0][3]["model"])
         self.assertEqual("REAL PROMPT", requests[0][3]["messages"][0]["content"])
 

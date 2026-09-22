@@ -19,6 +19,7 @@ from autoposting.images import default_page_fetcher
 from autoposting.llm import LLMService
 from autoposting.models import FeedItem, Source
 from autoposting.publishing import PublicationError, PublicationService
+from autoposting.reddit import reddit_hot_url, reddit_rss_url
 from autoposting.web import INDEX_HTML, WebApp, create_server
 
 from test_github_weekly import TRENDING_HTML
@@ -362,7 +363,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("3.0.0", payload["version"])
+        self.assertEqual("3.1.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -396,6 +397,187 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn("ghp_do_not_leak", rendered)
         self.assertNotIn("https://private.example/feed", rendered)
         self.assertNotIn("SELECT * FROM secrets", rendered)
+
+    def test_source_registry_routes_use_runtime_db_state(self) -> None:
+        status, payload = self._request("GET", "/api/sources")
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        source = next(item for item in payload["sources"] if item["source_id"] == "lab_blog")
+        self.assertEqual("rss", source["adapter_type"])
+        self.assertIn("source_type", source)
+        self.assertTrue(source["enabled"])
+
+        status, payload = self._request(
+            "POST", "/api/sources/enabled", {"source_id": "lab_blog", "enabled": False}
+        )
+        self.assertEqual(200, status)
+        source = next(item for item in payload["sources"] if item["source_id"] == "lab_blog")
+        self.assertFalse(source["enabled"])
+
+        status, payload = self._request(
+            "POST", "/api/sources/fetch-interval", {"source_id": "lab_blog", "minutes": 45}
+        )
+        self.assertEqual(200, status)
+        source = next(item for item in payload["sources"] if item["source_id"] == "lab_blog")
+        self.assertEqual(45, source["fetch_interval_minutes"])
+        self.assertFalse(self.db.get_source("lab_blog")["enabled"])
+        self.assertEqual(45, self.db.get_source("lab_blog")["fetch_interval_minutes"])
+
+        status, payload = self._request(
+            "POST", "/api/sources/enabled", {"source_id": "lab_blog", "enabled": "false"}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("enabled must be boolean", payload["error"])
+
+    def test_collection_run_routes_expose_actual_source_attempts(self) -> None:
+        status, collected = self._request("POST", "/api/collect", {"hours": 24})
+        self.assertEqual(200, status)
+        self.assertIn("collection", collected)
+
+        status, payload = self._request("GET", "/api/collection-runs?limit=5")
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertGreaterEqual(len(payload["runs"]), 1)
+        run = payload["runs"][0]
+        self.assertTrue(run["run_id"])
+        self.assertIn("source_attempts", run)
+        self.assertEqual(2, len(run["source_attempts"]))
+
+        status, detail = self._request("GET", "/api/collection-runs/" + run["run_id"])
+        self.assertEqual(200, status)
+        self.assertEqual(run["run_id"], detail["run"]["run_id"])
+        self.assertEqual(run["source_attempts"], detail["run"]["source_attempts"])
+
+    def test_mixed_collection_api_returns_unified_candidates_and_run(self) -> None:
+        reddit = Source(
+            "reddit_ai",
+            "Reddit AI",
+            "reddit",
+            "r/LocalLLaMA",
+            "S4",
+            ("models",),
+            True,
+            15,
+        )
+        self.db.upsert_source(reddit)
+        reddit_feed = _feed(
+            [
+                (
+                    "reddit1",
+                    "Model One news",
+                    "https://www.reddit.com/r/LocalLLaMA/comments/reddit1/discussion",
+                    5,
+                )
+            ]
+        )
+        fetcher = {
+            "https://lab.example/feed.xml": _feed(
+                [("lab1", "Model One news", "https://lab.example/model-one", 10)]
+            ),
+            reddit_hot_url("LocalLLaMA"): b"not-json",
+            reddit_rss_url("LocalLLaMA"): reddit_feed,
+        }
+        self.app.hotspots.sources = (self.sources[0], reddit)
+        self.app.hotspots.fetcher = fetcher.get
+
+        status, payload = self._request(
+            "POST", "/api/collect", {"hours": 24, "lane": "mixed"}
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("DONE", payload["collection_run"]["status"])
+        self.assertEqual(
+            {"lab_blog", "reddit_ai"},
+            set(payload["collection_run"]["requested_sources"]),
+        )
+        self.assertEqual(2, len(payload["collection_run"]["source_attempts"]))
+        event = payload["radar"]["events"][0]
+        self.assertEqual({"lab_blog", "reddit_ai"}, set(event["source_ids"]))
+        self.assertEqual(2, event["independent_source_count"])
+
+    def test_research_routes_run_and_restore_multi_selected_dossier(self) -> None:
+        collect_status, collected = self._request("POST", "/api/collect", {"hours": 24})
+        self.assertEqual(200, collect_status)
+        radar_events = (collected.get("radar") or {}).get("events") or []
+        event_ids = [
+            str(item["event_id"])
+            for item in radar_events
+            if isinstance(item, dict) and item.get("event_id")
+        ][:2]
+        if len(event_ids) < 2:
+            event_ids = [
+                self.db.create_event("模型发布", "models", "HOTSPOT_ITEM", "web-research-1"),
+                self.db.create_event("行业反应", "models", "HOTSPOT_ITEM", "web-research-2"),
+            ]
+        first, second = event_ids
+
+        class Search:
+            def search(self, query: str, *, adapters: tuple[str, ...], limit: int) -> dict[str, object]:
+                return {
+                    "query": query,
+                    "adapters": list(adapters),
+                    "results": [
+                        {
+                            "title": "官方研究说明",
+                            "url": "https://example.com/research",
+                            "snippet": "研究摘要",
+                        }
+                    ],
+                }
+
+        class Reader:
+            def read(self, candidate: object) -> dict[str, object]:
+                return {
+                    "status": "full",
+                    "title": getattr(candidate, "title", "证据"),
+                    "text": "研究正文",
+                    "quality_score": 0.9,
+                }
+
+        service = self.app.workbench.research_service
+        service.search_adapter = Search()
+        service.reader = Reader()
+        status, created = self._request(
+            "POST",
+            "/api/research",
+            {"event_ids": [first, second], "query": "模型发布研究"},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(created["ok"])
+        dossier = created["dossier"]
+        self.assertEqual([first, second], dossier["event_ids"])
+        self.assertIn(dossier["status"], {"ok", "degraded"})
+        self.assertTrue(dossier["evidence"])
+
+        status, restored = self._request(
+            "GET", "/api/research/" + dossier["dossier_id"]
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(dossier["dossier_id"], restored["dossier"]["dossier_id"])
+        self.assertEqual(dossier["event_ids"], restored["dossier"]["event_ids"])
+
+        status, listed = self._request("GET", "/api/research?limit=5")
+        self.assertEqual(200, status)
+        self.assertTrue(any(row["dossier_id"] == dossier["dossier_id"] for row in listed["dossiers"]))
+
+    def test_research_routes_reject_invalid_selection_without_internal_error(self) -> None:
+        status, payload = self._request("POST", "/api/research", {"event_ids": []})
+        self.assertEqual(400, status)
+        self.assertEqual("event_ids_count_invalid", payload["error"])
+
+    def test_settings_status_reports_only_github_token_configuration(self) -> None:
+        token = "ghp_web_settings_secret"
+        status, payload = self._request(
+            "POST", "/api/skills/github-token", {"token": token}
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload["configured"])
+        self.assertNotIn(token, json.dumps(payload))
+        status, status_payload = self._request("GET", "/api/status")
+        self.assertEqual(200, status)
+        self.assertTrue(status_payload["github_token_configured"])
+        self.assertNotIn(token, json.dumps(status_payload))
+        self._request("POST", "/api/skills/github-token", {"token": ""})
 
     def test_collect_forces_collection_and_returns_candidates(self) -> None:
         status, payload = self._request("POST", "/api/collect", {"hours": 24})
@@ -441,6 +623,33 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("hours", payload["error"])
         status, payload = self._request("POST", "/api/collect", {"hours": 721})
         self.assertEqual(400, status)
+
+    def test_mixed_collect_route_returns_collection_run_contract(self) -> None:
+        status, payload = self._request(
+            "POST", "/api/collect", {"hours": 24, "lane": "mixed"}
+        )
+        self.assertEqual(200, status)
+        collection = payload["collection"]
+        self.assertTrue(collection["run_id"])
+        self.assertEqual({"lab_blog", "media_feed"}, set(collection["requested_sources"]))
+        self.assertIn("source_attempts", collection)
+        self.assertIn("collection_run", payload)
+        self.assertEqual(collection["run_id"], payload["collection_run"]["run_id"])
+
+        status, clusters = self._request(
+            "GET", "/api/hotspots?hours=24&lane=mixed"
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(clusters["ok"])
+        self.assertIn("radar", clusters)
+        self.assertTrue(clusters["radar"]["events"])
+
+        status, reopened = self._request(
+            "GET", "/api/collection-runs/" + collection["run_id"]
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(collection["run_id"], reopened["run"]["run_id"])
+        self.assertTrue(reopened["run"]["source_attempts"])
 
     def test_hotspots_get_lists_existing_items_without_collect(self) -> None:
         self._insert_item(self.sources[0], "now-1", "最新模型发布", "https://lab.example/now-1")
@@ -2098,6 +2307,42 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="skill-query"', html)
         self.assertIn('id="skills-gallery"', html)
 
+    def test_iteration_one_information_architecture_and_compatibility(self) -> None:
+        html = self._index()
+        pages = ("home", "news", "resources", "creation", "publishing", "sources", "runs", "settings")
+        for page in pages:
+            self.assertIn(f'data-app-page-target="{page}"', html)
+            self.assertIn(f'id="page-{page}"', html)
+        primary = html[html.index('id="primary-nav"') : html.index('id="legacy-lane-tabs"')]
+        self.assertNotIn("热点候选", primary)
+        self.assertNotIn("观点候选", primary)
+        self.assertIn('id="legacy-lane-tabs" hidden', html)
+        self.assertIn('id="source-health-wrap"', html)
+        self.assertIn('#source-health-wrap{display:none !important;}', html)
+        self.assertIn('id="source-registry-list"', html)
+        self.assertIn('id="collection-run-sources"', html)
+        self.assertIn('id="resource-results"', html)
+        self.assertIn('id="page-research"', html)
+        self.assertIn('id="research-btn"', html)
+        self.assertIn('id="research-run-btn"', html)
+        self.assertIn('id="settings-github-token"', html)
+        self.assertIn('data-resource-discovery-slot="pending"', html)
+        self.assertIn('id="settings-open-model"', html)
+        self.assertIn('function setAppPage(page)', html)
+        self.assertIn('function renderResourceResults(skills)', html)
+        self.assertIn('function renderResourceGithubResults(repos)', html)
+        self.assertIn('function loadSourceRegistry()', html)
+        self.assertIn('function loadCollectionRuns()', html)
+        self.assertIn('/api/sources', html)
+        self.assertIn('/api/sources/enabled', html)
+        self.assertIn('/api/sources/fetch-interval', html)
+        self.assertIn('/api/collection-runs?limit=20', html)
+        self.assertIn('/api/research', html)
+        self.assertIn('/api/research/" + encodeURIComponent', html)
+        self.assertIn('lane !== "mixed"', html)
+        for legacy_route in ('/api/status', '/api/hotspots?hours=', '/api/collect'):
+            self.assertIn(legacy_route, html)
+
     def test_skill_result_notes_are_scoped_to_the_skills_lane(self) -> None:
         """The source block and degraded note live in the shared pane, so CSS owns the lane."""
         html = self._index()
@@ -2320,7 +2565,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("3.0.0", html)
+        self.assertIn("3.1.0", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)

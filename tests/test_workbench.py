@@ -12,10 +12,13 @@ from unittest.mock import patch
 
 from autoposting.background import derive_related_query
 from autoposting.content import FactValidationError
+from autoposting.decision import DecisionService
+from autoposting.decision.adapters import JevAdapter
 from autoposting.db import Database
 from autoposting.llm import LLMError, LLMService
 from autoposting.models import FeedItem, Source
 from autoposting.publishing import PublicationError
+from autoposting.reddit import reddit_hot_url, reddit_rss_url
 from autoposting.workbench import HotspotService, WeChatPublisher, Workbench
 
 
@@ -171,6 +174,87 @@ class WorkbenchTests(unittest.TestCase):
             )
             self.assertTrue(candidate["summary"])
         self.assertEqual(2, self.db.count_items())
+
+    def test_mixed_lane_collects_both_source_families_and_embeds_collection_run(self) -> None:
+        reddit = Source(
+            "reddit_ai",
+            "Reddit AI",
+            "reddit",
+            "r/LocalLLaMA",
+            "S4",
+            ("models",),
+            True,
+            15,
+        )
+        self.db.upsert_source(reddit)
+        reddit_feed = _feed(
+            [
+                (
+                    "reddit1",
+                    "Model One news",
+                    "https://www.reddit.com/r/LocalLLaMA/comments/reddit1/discussion",
+                    5,
+                )
+            ]
+        )
+        fetcher = {
+            "https://lab.example/feed.xml": _feed(
+                [("lab1", "Model One news", "https://lab.example/model-one", 10)]
+            ),
+            reddit_hot_url("LocalLLaMA"): b"not-json",
+            reddit_rss_url("LocalLLaMA"): reddit_feed,
+        }
+        service = HotspotService(
+            self.db,
+            (*self.sources[:1], reddit),
+            fetcher=fetcher.get,
+        )
+
+        payload = service.collect(24, lane="mixed")
+
+        self.assertIn("collection_run", payload)
+        collection = payload["collection"]
+        run = payload["collection_run"]
+        self.assertEqual(run["run_id"], collection["run_id"])
+        self.assertEqual({"lab_blog", "reddit_ai"}, set(run["requested_sources"]))
+        self.assertEqual({"lab_blog", "reddit_ai"}, set(run["successful_sources"]))
+        self.assertEqual(2, len(run["source_attempts"]))
+        self.assertEqual("DONE", run["status"])
+        self.assertTrue(payload["candidates"])
+        event = payload["radar"]["events"][0]
+        self.assertEqual({"lab_blog", "reddit_ai"}, set(event["source_ids"]))
+        self.assertEqual(2, event["independent_source_count"])
+
+    def test_mixed_lane_rejects_unknown_lane_before_database_query(self) -> None:
+        service = HotspotService(self.db, self.sources, fetcher=lambda _: EMPTY_FEED)
+
+        with self.assertRaisesRegex(ValueError, "lane must be hotspots, viewpoints, or mixed"):
+            service.list_window(24, translate=False, lane="unknown")
+
+    def test_hotspot_production_path_passes_decision_service_to_radar(self) -> None:
+        service = HotspotService(
+            self.db,
+            self.sources[:1],
+            fetcher=lambda _: _feed([("jev-item", "Jev-ranked model release", "https://lab.example/jev", 5)]),
+            decision_service=DecisionService(
+                JevAdapter(
+                    lambda _payload: {
+                        "schema_version": "jev-assessment-v1",
+                        "score": 100,
+                        "confidence": 0.95,
+                        "decision": "include",
+                        "reasons": ["production-path fixture"],
+                    }
+                )
+            ),
+        )
+
+        payload = service.collect(24)
+
+        event = payload["radar"]["events"][0]
+        self.assertEqual("ok", event["decision"]["status"])
+        self.assertEqual(event["decision"]["final_score"], event["priority_score"])
+        self.assertEqual(event["event_id"], service.get_event(event["event_id"])["event_id"])
 
     def test_heat_and_time_rankings_diverge(self) -> None:
         now = datetime.now(timezone.utc)

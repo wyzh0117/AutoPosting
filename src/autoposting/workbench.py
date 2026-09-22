@@ -13,6 +13,9 @@ from urllib.parse import urlencode, urlsplit
 from .content import Claim, ContentWorkflow, Draft, FactList, FactValidationError
 from .article_fuse import fuse_hotspot_items
 from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE, load_article_style_prompt
+from .decision.adapters.jev import JevAdapter
+from .decision.planner import LLMPlanner
+from .decision.service import DecisionService
 from .xhs_cards import build_xhs_cards
 from .db import Database
 from .engagement import (
@@ -53,6 +56,8 @@ from .ingestion import should_hide_candidate
 from .llm import ARTICLE_PROMPT_VERSION, LLMError, LLMService
 from .pipeline import collect_sources
 from .publishing import PublicationError
+from .research.adapters import ReaderServiceEvidenceAdapter
+from .research.service import ResearchService
 from .models import Source
 from .radar import rank_events
 
@@ -470,12 +475,19 @@ class HotspotService:
         sources: tuple[Source, ...],
         fetcher=None,
         llm_service: LLMService | None = None,
+        decision_service: DecisionService | None = None,
     ) -> None:
         self.database = database
         self.sources = tuple(sources)
         self.fetcher = fetcher
         self.llm_service = llm_service
+        self.decision_service = decision_service
+        self._events_by_id: dict[str, dict[str, object]] = {}
         self.x_bearer_token = ""
+
+    def get_event(self, event_id: str) -> dict[str, object] | None:
+        event = self._events_by_id.get(str(event_id).strip())
+        return dict(event) if event is not None else None
 
     def source_health(
         self, now: datetime | None = None, *, persist: bool = True
@@ -501,11 +513,59 @@ class HotspotService:
         return health
 
     def _sources_for_lane(self, lane: str) -> tuple[Source, ...]:
-        if lane not in {"hotspots", "viewpoints"}:
-            raise ValueError("lane must be hotspots or viewpoints")
+        if lane not in {"hotspots", "viewpoints", "mixed"}:
+            raise ValueError("lane must be hotspots, viewpoints, or mixed")
+        if lane == "mixed":
+            return self.sources
         if lane == "viewpoints":
             return tuple(source for source in self.sources if source.type == "reddit")
         return tuple(source for source in self.sources if source.type != "reddit")
+
+    def _candidate_rows(
+        self,
+        since: str,
+        *,
+        limit: int,
+        sort: str,
+        pool: int,
+        lane: str,
+    ) -> list[dict[str, object]]:
+        """Read one lane or merge the two legacy DB lanes for the unified view."""
+        if lane not in {"hotspots", "viewpoints", "mixed"}:
+            raise ValueError("lane must be hotspots, viewpoints, or mixed")
+        lanes = ("hotspots", "viewpoints") if lane == "mixed" else (lane,)
+        rows_by_id: dict[str, dict[str, object]] = {}
+        for source_lane in lanes:
+            for row in self.database.list_hotspot_candidates(
+                since,
+                limit=limit,
+                sort=sort,
+                pool=pool,
+                lane=source_lane,
+            ):
+                rows_by_id.setdefault(str(row.get("item_id") or ""), row)
+        rows = [row for item_id, row in rows_by_id.items() if item_id]
+        if lane != "mixed":
+            return rows
+        if sort == "heat":
+            rows.sort(
+                key=lambda row: (
+                    len(row.get("source_ids") or ()),
+                    int(row.get("engagement_weight") or 0),
+                    str(row.get("observed_at") or ""),
+                ),
+                reverse=True,
+            )
+        else:
+            rows.sort(
+                key=lambda row: (
+                    str(row.get("observed_at") or ""),
+                    len(row.get("source_ids") or ()),
+                    int(row.get("engagement_weight") or 0),
+                ),
+                reverse=True,
+            )
+        return rows[:limit]
 
     def collect(
         self,
@@ -533,15 +593,30 @@ class HotspotService:
         payload = self.list_window(hours, translate=False, lane=lane)
         self._persist_radar_snapshots(payload)
         payload["collection"] = {
+            "run_id": batch.run_id,
+            "started_at": batch.started_at,
+            "finished_at": batch.finished_at,
+            "requested_sources": list(batch.requested_sources),
+            "attempted_sources": list(batch.attempted_sources),
+            "successful_sources": list(batch.successful_sources),
+            "failed_sources": list(batch.failed_sources),
+            "items_fetched": batch.items_fetched,
             "inserted": batch.inserted,
             "duplicates": batch.duplicates,
+            "items_inserted": batch.inserted,
+            "items_after_dedupe": batch.items_after_dedupe,
+            "clusters_created_or_updated": batch.clusters_created_or_updated,
             "failed": batch.failed,
             "skipped_disabled": batch.skipped_disabled,
             "skipped_not_due": batch.skipped_not_due,
             "errors": batch.errors,
+            "diagnostics": list(batch.diagnostics.values()),
+            "degraded": batch.degraded,
+            "source_attempts": list(batch.source_attempts),
             "forced": force,
             "source_id": source_id,
         }
+        payload["collection_run"] = self.database.get_collection_run(batch.run_id)
         return payload
 
     def _persist_radar_snapshots(self, payload: dict[str, object]) -> None:
@@ -592,7 +667,7 @@ class HotspotService:
         since = now - timedelta(hours=hours)
         time_rows = [
             row
-            for row in self.database.list_hotspot_candidates(
+            for row in self._candidate_rows(
                 since.isoformat(),
                 limit=HOTSPOT_LIMIT,
                 sort="time",
@@ -603,7 +678,7 @@ class HotspotService:
         ]
         heat_rows = [
             row
-            for row in self.database.list_hotspot_candidates(
+            for row in self._candidate_rows(
                 since.isoformat(),
                 limit=HOTSPOT_LIMIT,
                 sort="heat",
@@ -632,7 +707,17 @@ class HotspotService:
         ]
         rows_by_id = {str(row["item_id"]): row for row in radar_rows}
         snapshots = self.database.list_engagement_snapshots()
-        radar_events = rank_events(radar_rows, snapshots=snapshots, now=now)
+        radar_events = rank_events(
+            radar_rows,
+            snapshots=snapshots,
+            now=now,
+            decision_service=self.decision_service,
+        )
+        self._events_by_id = {
+            str(event["event_id"]): dict(event)
+            for event in radar_events
+            if isinstance(event, dict) and str(event.get("event_id") or "").strip()
+        }
         event_by_id = {
             str(event["event_id"]): event
             for event in radar_events
@@ -696,12 +781,72 @@ class Workbench:
         page_fetcher=None,
         image_fetcher=None,
         render_fetcher=None,
+        planner: LLMPlanner | None = None,
+        decision_service: DecisionService | None = None,
+        research_reader=None,
+        dossier_repository=None,
+        event_resolver=None,
     ) -> None:
         self.database = database
         self.llm_service = llm_service
         self.page_fetcher = page_fetcher
         self.image_fetcher = image_fetcher
         self.render_fetcher = render_fetcher
+        llm_provider = None
+        if llm_service is not None:
+            settings = getattr(llm_service, "settings", None)
+            if str(getattr(settings, "base_url", "") or "").strip():
+                llm_provider = llm_service
+        planner = planner or LLMPlanner(llm_provider)
+        decision_service = decision_service or DecisionService(
+            JevAdapter(llm_provider) if llm_provider is not None else None
+        )
+        def resolve_event(event_id: str):
+            if callable(event_resolver):
+                try:
+                    value = event_resolver(event_id)
+                except KeyError:
+                    value = None
+                if value is not None:
+                    return value
+            try:
+                return self.database.get_event(event_id)
+            except KeyError:
+                return None
+
+        self.research_service = ResearchService(
+            planner,
+            decision_service,
+            resolve_event,
+            reader=research_reader or ReaderServiceEvidenceAdapter(),
+            repository=dossier_repository or self.database,
+        )
+
+    def research(self, event_ids: list[str] | tuple[str, ...], query: str | None = None) -> dict[str, object]:
+        """Run the unified research path and return the JSON-safe dossier."""
+        return self.research_service.research(event_ids, query=query).to_dict()
+
+    def get_research(self, dossier_id: str) -> dict[str, object]:
+        return self.research_service.restore(dossier_id).to_dict()
+
+    def list_research(self, limit: int = 20) -> list[dict[str, object]]:
+        if self.research_service.repository is None:
+            return []
+        rows = self.research_service.repository.list_dossiers(limit)
+        result: list[dict[str, object]] = []
+        for row in rows:
+            if hasattr(row, "to_dict") and callable(row.to_dict):
+                result.append(row.to_dict())
+            elif isinstance(row, dict):
+                result.append(dict(row))
+        return result
+
+    def delete_research(self, dossier_id: str) -> bool:
+        repository = self.research_service.repository
+        deleter = getattr(repository, "delete_dossier", None)
+        if not callable(deleter):
+            raise ValueError("dossier_delete_not_supported")
+        return bool(deleter(dossier_id))
 
     def find_hooks(self, item_id: str, searcher=None) -> dict[str, object]:
         item = self.database.get_item(item_id)

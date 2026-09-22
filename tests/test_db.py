@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from autoposting.content import Draft
 from autoposting.db import Database
+from autoposting.models import Source
 
 
 class HotspotFavoriteTests(unittest.TestCase):
@@ -244,7 +245,7 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
 
     def test_user_version_migration_is_idempotent_and_sanitizes_legacy_error(self) -> None:
         with self.db.connect() as connection:
-            self.assertEqual(1, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(3, connection.execute("PRAGMA user_version").fetchone()[0])
             connection.execute(
                 "INSERT INTO sources (source_id, name, type, url_or_handle, tier, topics_json, "
                 "enabled, fetch_interval_minutes, created_at, updated_at, last_error) "
@@ -375,3 +376,79 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
                 ).fetchall(),
             )
             self.assertEqual(0, connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+class CollectionRunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "autoposting.db"
+        self.db = Database(self.path)
+        self.db.initialize()
+        self.db.upsert_source(
+            Source(
+                "official",
+                "Official feed",
+                "rss",
+                "https://example.com/feed.xml",
+                "S1",
+                ("models",),
+                True,
+                15,
+                source_type="official",
+                adapter_type="rss",
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_collection_run_attempts_and_diagnostics_survive_reopen(self) -> None:
+        run_id = self.db.start_collection_run(
+            ("official",), started_at="2026-09-22T08:00:00+00:00"
+        )
+        self.assertEqual("RUNNING", self.db.get_collection_run(run_id)["status"])
+        self.assertEqual(
+            "PENDING", self.db.get_collection_run(run_id)["source_attempts"][0]["status"]
+        )
+
+        self.db.record_collection_source_attempt(run_id, "official", "RUNNING")
+        self.db.record_collection_source_attempt(
+            run_id,
+            "official",
+            "FAILED",
+            items_fetched=4,
+            items_inserted=2,
+            items_after_dedupe=2,
+            diagnostic={
+                "code": "source_fetch_failed",
+                "cause_code": "unreachable",
+                "source": "official",
+                "stage": "collect",
+                "detail": "feed outage",
+            },
+        )
+        finished = self.db.finish_collection_run(
+            run_id,
+            status="FAILED",
+            finished_at="2026-09-22T08:00:03+00:00",
+            clusters_created_or_updated=3,
+        )
+
+        self.assertEqual("FAILED", finished["status"])
+        self.assertEqual(["official"], finished["attempted_sources"])
+        self.assertEqual(["official"], finished["failed_sources"])
+        self.assertEqual(4, finished["items_fetched"])
+        self.assertEqual(2, finished["items_after_dedupe"])
+        self.assertEqual(3, finished["clusters_created_or_updated"])
+        self.assertTrue(finished["degraded"])
+        self.assertEqual("unreachable", finished["diagnostics"][0]["cause_code"])
+
+        reopened = Database(self.path)
+        reopened.initialize()
+        restored = reopened.get_collection_run(run_id)
+        self.assertEqual(finished["status"], restored["status"])
+        self.assertEqual(finished["diagnostics"], restored["diagnostics"])
+        self.assertEqual(
+            "FAILED", restored["source_attempts"][0]["status"]
+        )
+        self.assertEqual([run_id], [row["run_id"] for row in reopened.list_collection_runs()])

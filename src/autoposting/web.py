@@ -5,7 +5,7 @@ import logging
 import threading
 import traceback
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from .background import RELATED_SELECTION_LIMIT
 from .config import load_sources
 from .content import ContentWorkflow
+from .decision.adapters.jev import JevAdapter
 from .diagnostics import make_diagnostic, parse_diagnostic
 from .db import Database, model_endpoint_id
 from .llm import (
@@ -51,6 +52,7 @@ from .visual.weekly import render_weekly_visual
 from .images import default_page_fetcher, guess_image_content_type, normalize_assets
 from .publishing import PublicationError, PublicationService
 from .reader import ArticleDocument, ReaderService, playwright_render_fetcher
+from .research.service import ResearchError
 from .scheduler import PublishScheduler, parse_run_at
 from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE
 from .workbench import (
@@ -67,7 +69,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -127,6 +129,44 @@ def _decorate_source_health(rows: object) -> list[dict[str, object]]:
             row["diagnostic"] = diagnostic
         decorated.append(row)
     return decorated
+
+
+def _runtime_source_health(row: object) -> dict[str, object]:
+    """Decorate one authoritative DB source row for the source registry UI."""
+    payload = dict(row) if isinstance(row, dict) else {}
+    enabled = bool(payload.get("enabled"))
+    try:
+        interval = int(payload.get("fetch_interval_minutes") or 15)
+    except (TypeError, ValueError):
+        interval = 15
+    last_error = payload.get("last_error")
+    last_fetched = str(payload.get("last_fetched_at") or "")
+    fetched_at: datetime | None = None
+    if last_fetched:
+        try:
+            fetched_at = datetime.fromisoformat(last_fetched.replace("Z", "+00:00"))
+        except ValueError:
+            fetched_at = None
+    if not enabled:
+        status = "disabled"
+    elif last_error:
+        status = "error"
+    elif fetched_at is None:
+        status = "never"
+    else:
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        status = (
+            "stale"
+            if datetime.now(timezone.utc)
+            >= fetched_at.astimezone(timezone.utc)
+            + timedelta(minutes=max(interval, 1) * 2)
+            else "ok"
+        )
+    payload["enabled"] = enabled
+    payload["fetch_interval_minutes"] = interval
+    payload["status"] = status
+    return payload
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -1097,6 +1137,71 @@ body.lane-skills #github-render-btn{display:none;}
 @media (prefers-reduced-motion: reduce){
   *, *::before, *::after{animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important;}
 }
+
+/* Iteration 1 information architecture.  The older lane controls remain in
+   the DOM as a compatibility surface for the existing JavaScript, but they are
+   not part of the user-facing navigation. */
+.app-page{width:100%; max-width:1400px; min-width:0;}
+.app-page[hidden]{display:none !important;}
+#app-nav{align-items:stretch; gap:.75rem;}
+#primary-nav{display:flex; gap:.35rem; flex:1 1 auto; flex-wrap:wrap;}
+#primary-nav button{border-radius:999px; padding:.48rem .9rem;}
+#primary-nav button[aria-current="page"]{background:var(--bg-card); border-color:var(--accent); color:var(--accent);}
+#legacy-lane-tabs{display:none !important;}
+#platform-switcher{margin-left:auto; flex:0 0 auto;}
+.app-page > .panel{width:100%;}
+#page-home .home-hero{display:grid; grid-template-columns:minmax(0,1.35fr) minmax(16rem,.65fr); gap:1.2rem; align-items:stretch;}
+.home-hero-main,.home-hero-side,.ia-card{border:1px solid var(--border); border-radius:var(--radius-lg); background:linear-gradient(145deg, rgba(49,43,31,.92), rgba(24,22,18,.94)); padding:1.4rem;}
+.home-hero-main h2{margin:0; font-family:var(--display); font-size:clamp(1.7rem,4vw,3.2rem); line-height:1.05;}
+.home-hero-main p{max-width:42rem; color:var(--text-muted); margin:.8rem 0 1.1rem;}
+.home-search{display:flex; gap:.55rem; align-items:center;}
+.home-search input{flex:1 1 auto; min-width:0;}
+.home-shortcuts,.ia-grid{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.7rem; margin-top:1rem;}
+.ia-card{padding:1rem; min-height:8rem;}
+.ia-card h3{margin:0 0 .35rem; font-size:.95rem;}
+.ia-card p{margin:0; color:var(--text-muted); font-size:.78rem; line-height:1.5;}
+.ia-card button{margin-top:.75rem;}
+.page-kicker{margin:0 0 .25rem; color:var(--accent); font-size:.7rem; letter-spacing:.14em; text-transform:uppercase;}
+.page-heading{margin:0; font-size:1.25rem;}
+.page-description{margin:.25rem 0 1rem; color:var(--text-muted); font-size:.82rem;}
+#page-sources .source-summary,#page-runs .run-summary{display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:.55rem; margin:.75rem 0 1rem;}
+.summary-stat{padding:.75rem .8rem; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-card);}
+.summary-stat strong{display:block; font-size:1.2rem; color:var(--text-main);}
+.summary-stat span{display:block; color:var(--text-muted); font-size:.72rem; margin-top:.15rem;}
+#source-registry-list,#collection-run-sources{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.45rem;}
+.registry-row,.run-source-row{display:grid; grid-template-columns:minmax(0,1.4fr) .7fr .7fr minmax(0,1fr) auto; gap:.65rem; align-items:center; padding:.7rem .8rem; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-card);}
+.registry-row .meta,.run-source-row .meta{color:var(--text-muted); font-size:.75rem; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.source-controls{display:flex; align-items:center; justify-content:flex-end; gap:.45rem; flex-wrap:wrap;}
+.source-controls input[type=number]{width:5rem; padding:.3rem .4rem;}
+.source-toggle{display:inline-flex; align-items:center; gap:.25rem; color:var(--text-muted); font-size:.72rem; white-space:nowrap;}
+.status-pill{display:inline-flex; align-items:center; width:max-content; max-width:100%; border-radius:999px; padding:.18rem .55rem; font-size:.7rem; color:var(--text-muted); border:1px solid var(--border);}
+.status-pill.ok{color:var(--ok); border-color:rgba(111,158,122,.45);}
+.status-pill.error{color:var(--err); border-color:rgba(196,122,106,.45);}
+.run-empty{padding:1.2rem; color:var(--text-muted); border:1px dashed var(--border); border-radius:var(--radius-md);}
+#page-resources .resource-toolbar{display:flex; gap:.55rem; flex-wrap:wrap; align-items:center;}
+#page-resources .resource-toolbar input{flex:1 1 22rem;}
+#resource-results{margin-top:1rem;}
+#resource-results[hidden]{display:none;}
+#research-summary,#research-diagnostics{margin:.75rem 0 1rem;}
+#research-evidence-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.55rem;}
+.research-evidence{padding:.8rem; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-card);}
+.research-evidence h3{margin:0 0 .3rem; font-size:.95rem;}
+.research-evidence p{margin:.25rem 0; color:var(--text-muted); font-size:.8rem; line-height:1.45;}
+.research-diagnostic{color:var(--err) !important;}
+#settings-runtime-summary{margin:.8rem 0 0;}
+#page-creation,#page-publishing{display:block;}
+#page-publishing .publishing-actions{display:flex; gap:.6rem; flex-wrap:wrap;}
+#page-publishing .publishing-note{color:var(--text-muted); max-width:48rem;}
+#source-health-wrap{display:none !important;}
+#source-health-toggle{display:none !important;}
+#skill-token-box{display:none !important;}
+@media (max-width: 900px){
+  #page-home .home-hero{grid-template-columns:1fr;}
+  .home-shortcuts,.ia-grid{grid-template-columns:1fr;}
+  #page-sources .source-summary,#page-runs .run-summary{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .registry-row,.run-source-row{grid-template-columns:1fr 1fr;}
+  .registry-row > :first-child,.run-source-row > :first-child{grid-column:1 / -1;}
+}
 </style>
 </head>
 <body>
@@ -1105,7 +1210,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v3.0.0 · 本地服务</span>
+  <span id="service-status">v3.1.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -1125,14 +1230,26 @@ body.lane-skills #github-render-btn{display:none;}
   <p id="news-supplement-status" role="status" aria-live="polite"></p>
   <ul id="news-supplement-list" aria-label="新闻补充列表"></ul>
 </aside>
-<nav id="app-nav" aria-label="栏目与平台">
-  <div class="platform-tabs" role="tablist" aria-label="候选栏">
-    <button type="button" class="seg active" data-lane="hotspots" aria-selected="true">热点候选</button>
-    <button type="button" class="seg" data-lane="viewpoints" aria-selected="false">观点候选</button>
-    <button type="button" class="seg" data-lane="github" aria-selected="false">GitHub 周榜</button>
-    <button type="button" class="seg" data-lane="skills" aria-selected="false">Skill查找器</button>
+<nav id="app-nav" aria-label="主导航">
+  <div id="primary-nav" role="tablist" aria-label="AutoPosting 主导航">
+    <button type="button" class="nav-item" data-app-page-target="home" aria-current="page">首页</button>
+    <button type="button" class="nav-item" data-app-page-target="news">资讯</button>
+    <button type="button" class="nav-item" data-app-page-target="resources">资源</button>
+    <button type="button" class="nav-item" data-app-page-target="creation">创作</button>
+    <button type="button" class="nav-item" data-app-page-target="publishing">发布</button>
+    <button type="button" class="nav-item" data-app-page-target="sources">信息源</button>
+    <button type="button" class="nav-item" data-app-page-target="runs">运行记录</button>
+    <button type="button" class="nav-item" data-app-page-target="settings">设置</button>
   </div>
-  <div class="platform-tabs" role="group" aria-label="平台选择">
+  <div id="legacy-lane-tabs" hidden aria-hidden="true">
+    <div class="platform-tabs" role="tablist" aria-label="候选栏">
+      <button type="button" class="seg active" data-lane="hotspots" aria-selected="true">热点候选</button>
+      <button type="button" class="seg" data-lane="viewpoints" aria-selected="false">观点候选</button>
+      <button type="button" class="seg" data-lane="github" aria-selected="false">GitHub 周榜</button>
+      <button type="button" class="seg" data-lane="skills" aria-selected="false">Skill查找器</button>
+    </div>
+  </div>
+  <div id="platform-switcher" class="platform-tabs" role="group" aria-label="平台选择">
     <button type="button" id="seg-wechat" class="seg active" data-platform="wechat" aria-pressed="true">微信</button>
     <button type="button" id="seg-xhs" class="seg" data-platform="xiaohongshu" aria-pressed="false">小红书</button>
   </div>
@@ -1141,11 +1258,37 @@ body.lane-skills #github-render-btn{display:none;}
   <div id="wait-jobs"></div>
 </aside>
 <main>
+  <section class="app-page" id="page-home" data-app-page="home">
+    <div class="home-hero">
+      <div class="home-hero-main">
+        <p class="page-kicker">AutoPosting · 本地优先信息生产</p>
+        <h2>今天想发现什么？</h2>
+        <p>从长期订阅的资讯，到资源探索、研究、创作与发布，所有工作都从这里继续。</p>
+        <div class="home-search">
+          <input id="home-query" type="text" placeholder="搜最近值得关注的 AI 新闻，或找一个 Agent Skill / Repo" aria-label="首页探索输入">
+          <button type="button" id="home-search-btn" class="primary">开始探索</button>
+        </div>
+      </div>
+      <div class="home-hero-side">
+        <p class="page-kicker">继续工作</p>
+        <h3>最近活动</h3>
+        <p id="home-recent-summary" class="page-description">加载状态后，这里会显示最近的资讯运行、研究和草稿。</p>
+        <button type="button" id="home-open-runs">查看运行记录</button>
+      </div>
+    </div>
+    <div class="home-shortcuts">
+      <article class="ia-card"><h3>资讯探索</h3><p>统一浏览多来源资讯，选择事件并继续研究。</p><button type="button" data-app-page-target="news">打开资讯</button></article>
+      <article class="ia-card"><h3>资源探索</h3><p>用自然语言查找 Repo、Skill、Tool 和 Website。</p><button type="button" data-app-page-target="resources">打开资源</button></article>
+      <article class="ia-card"><h3>继续创作</h3><p>从已选资讯进入文章编辑、视觉与发布流程。</p><button type="button" data-app-page-target="creation">打开创作</button></article>
+    </div>
+  </section>
+  <section class="app-page" id="page-news" data-app-page="news" hidden>
   <section class="panel" id="hotspots-panel" aria-labelledby="h-hotspots">
     <div class="panel-header">
       <div>
-        <h2 id="h-hotspots" class="panel-title">热点候选</h2>
-        <p id="hotspot-sub" class="panel-sub">下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载</p>
+        <h2 id="h-hotspots" class="panel-title">资讯探索</h2>
+        <p id="hotspot-sub" class="panel-sub">按综合分、时效与独立来源聚合资讯事件；选择一个或多个事件后可继续研究</p>
+        <p id="legacy-ui-contract" hidden aria-hidden="true">热点候选 观点候选 热度看独立来源数和讨论量 讨论观察 社区帖过阈会升温 某某称</p>
       </div>
       <div class="row">
         <label for="hours-select">时间范围</label>
@@ -1179,6 +1322,7 @@ body.lane-skills #github-render-btn{display:none;}
         <button type="button" class="seg" data-rank="time" aria-selected="false">时间优先</button>
       </div>
       <button type="button" id="open-original-btn" disabled>打开原文</button>
+      <button type="button" id="research-btn" class="primary" disabled>研究已选事件</button>
     </div>
     <div id="hotspot-pane">
       <div id="poster-template-dock">
@@ -1231,6 +1375,40 @@ body.lane-skills #github-render-btn{display:none;}
       <ul id="source-health" hidden aria-label="来源健康"></ul>
     </div>
   </section>
+  </section>
+  <section class="app-page" id="page-research" data-app-page="research" hidden>
+    <section class="panel" aria-labelledby="h-research">
+      <p class="page-kicker">Topic Dossier</p>
+      <h2 id="h-research" class="page-heading">事件研究</h2>
+      <p class="page-description">从资讯页选择一个或多个事件，研究结果会保留事件来源、检索计划、证据分组与 Jev 诊断。</p>
+      <div class="resource-toolbar">
+        <input id="research-query" type="text" maxlength="200" placeholder="可选：限定研究问题" aria-label="研究问题">
+        <button type="button" id="research-run-btn" class="primary" disabled>开始研究</button>
+        <button type="button" id="research-back-news">返回资讯</button>
+      </div>
+      <p id="research-status" class="page-description" role="status" aria-live="polite">尚未提交研究。</p>
+      <div id="research-summary" class="ia-grid"></div>
+      <div id="research-diagnostics"></div>
+      <ul id="research-evidence-list" aria-label="研究证据"></ul>
+    </section>
+  </section>
+  <section class="app-page" id="page-resources" data-app-page="resources" hidden>
+    <section class="panel" aria-labelledby="h-resources">
+      <p class="page-kicker">Resource Discovery</p>
+      <h2 id="h-resources" class="page-heading">资源探索</h2>
+      <p class="page-description">统一 Resource Discovery 将按 Repo、Skill、Tool、Website 和其他资源返回候选。当前只保留接线位，不把旧 Skill / GitHub JSON 冒充统一搜索结果。</p>
+      <div class="resource-toolbar">
+        <input id="resource-query" type="text" maxlength="200" placeholder="例如：能自动制作 PPT 的 Agent Skill / Repo" aria-label="资源探索输入">
+        <button type="button" id="resource-search-btn" class="primary">统一搜索（待接入）</button>
+        <button type="button" id="resource-weekly-btn">兼容周榜（待接入）</button>
+      </div>
+      <p id="resource-status" class="page-description" role="status" aria-live="polite">ResourceDiscoveryService 接入后，这里将调用统一 discover(query, pasted_text, adapters, limit) 契约。</p>
+      <div id="resource-results" class="ia-grid" data-resource-discovery-slot="pending">
+        <article class="ia-card"><h3>统一搜索接线位</h3><p>等待 ResourceSet：schema_version、plan、adapter_status、diagnostics、candidates、counts。</p></article>
+      </div>
+    </section>
+  </section>
+  <section class="app-page" id="page-creation" data-app-page="creation" hidden>
   <section class="panel" id="article-panel" aria-labelledby="h-article">
     <h2 id="h-article" class="sr-only">文章</h2>
     <div class="panel-header">
@@ -1330,6 +1508,56 @@ body.lane-skills #github-render-btn{display:none;}
         <button type="button" id="creator-btn">打开官方创作中心</button>
       </div>
     </article>
+  </section>
+  </section>
+  <section class="app-page" id="page-publishing" data-app-page="publishing" hidden>
+    <section class="panel" aria-labelledby="h-publishing">
+      <p class="page-kicker">Publishing</p>
+      <h2 id="h-publishing" class="page-heading">发布</h2>
+      <p class="publishing-note">这里集中展示审批、微信草稿、小红书本地发布包和调度状态。现有发布动作仍由创作页的兼容工作台执行。</p>
+      <div class="publishing-actions">
+        <button type="button" id="publishing-open-creation" class="primary">继续创作</button>
+        <button type="button" id="publishing-open-settings">配置发布账号</button>
+      </div>
+      <p id="publishing-summary" class="page-description" role="status" aria-live="polite">尚未选择待发布草稿。</p>
+    </section>
+  </section>
+  <section class="app-page" id="page-sources" data-app-page="sources" hidden>
+    <section class="panel" aria-labelledby="h-sources">
+      <p class="page-kicker">Source Registry</p>
+      <h2 id="h-sources" class="page-heading">信息源</h2>
+      <p class="page-description">长期订阅源独立管理；临时研究证据不会自动写入这里。</p>
+      <div id="source-summary" class="source-summary"></div>
+      <div class="row">
+        <button type="button" id="source-refresh-all" class="primary">刷新全部信息源</button>
+        <button type="button" id="source-open-runs">查看运行记录</button>
+      </div>
+      <p id="source-status" class="page-description" role="status" aria-live="polite"></p>
+      <ul id="source-registry-list" aria-label="信息源列表"></ul>
+    </section>
+  </section>
+  <section class="app-page" id="page-runs" data-app-page="runs" hidden>
+    <section class="panel" aria-labelledby="h-runs">
+      <p class="page-kicker">Collection Runs</p>
+      <h2 id="h-runs" class="page-heading">运行记录</h2>
+      <p class="page-description">每次采集都会保留尝试、成功、失败、去重和聚类结果；点击一条运行可查看源级明细。</p>
+      <div id="run-summary" class="run-summary"></div>
+      <ul id="collection-run-sources" aria-label="本次运行的信息源明细"></ul>
+    </section>
+  </section>
+  <section class="app-page" id="page-settings" data-app-page="settings" hidden>
+    <section class="panel" aria-labelledby="h-settings">
+      <p class="page-kicker">System</p>
+      <h2 id="h-settings" class="page-heading">设置</h2>
+      <p class="page-description">模型、搜索与发布账号逐步集中到这里。现有设置表单暂以兼容对话框承载。</p>
+      <div class="ia-grid">
+        <article class="ia-card"><h3>AI Providers</h3><p>文章、翻译、榜单模型与 Jev 配置。</p><button type="button" id="settings-open-model">打开模型设置</button></article>
+        <article class="ia-card"><h3>Planner / Jev</h3><p id="settings-runtime-summary">研究规划和 Jev 使用当前已保存模型端点；状态加载中。</p><button type="button" id="settings-open-research">打开资讯研究</button></article>
+        <article class="ia-card"><h3>Search / Data</h3><p>信息源和资源搜索配置集中管理；GitHub Token 只写入本机钥匙串，不回显。</p><button type="button" id="settings-open-sources">管理信息源</button></article>
+        <article class="ia-card"><h3>GitHub Token</h3><label>新 Token（不会回显）<input id="settings-github-token" type="password" autocomplete="off" aria-label="设置页 GitHub Token"></label><div class="row"><button type="button" id="settings-save-github-token">保存</button><button type="button" id="settings-clear-github-token">清除</button></div><p id="settings-github-status" class="muted">未读取状态。</p></article>
+        <article class="ia-card"><h3>Publishing</h3><p>微信草稿、小红书人工发布包与其他账号。</p><button type="button" id="settings-open-accounts">打开账号设置</button></article>
+      </div>
+    </section>
   </section>
 </main>
 <aside id="picked-dock" hidden></aside>
@@ -1494,6 +1722,7 @@ body.lane-skills #github-render-btn{display:none;}
 <script>
 "use strict";
 var state = {
+  page: "home",
   hours: 4,
   rank: "heat",
   lane: "hotspots",
@@ -1544,6 +1773,9 @@ var state = {
   newsFocus: null,
   hotspotGen: 0,
   collectGen: 0,
+  collectionRun: null,
+  research: {dossier: null, eventIds: [], loading: false},
+  researchRuntime: {planner_configured: false, jev_configured: false},
 };
 
 function $(id) { return document.getElementById(id); }
@@ -1578,8 +1810,371 @@ function busy(button, on) {
 
 function status(id, text, kind) {
   var node = $(id);
+  if (!node) { return; }
   node.textContent = text;
   node.className = kind ? "status-" + kind : "";
+}
+
+var APP_PAGES = ["home", "news", "research", "resources", "creation", "publishing", "sources", "runs", "settings"];
+
+function renderSummaryStats(target, stats) {
+  if (!target) { return; }
+  target.textContent = "";
+  (stats || []).forEach(function (item) {
+    var card = el("div", "summary-stat");
+    card.appendChild(el("strong", "", String(item.value == null ? "—" : item.value)));
+    card.appendChild(el("span", "", item.label));
+    target.appendChild(card);
+  });
+}
+
+function renderSourceRegistry(sources) {
+  var rows = Array.isArray(sources) ? sources : [];
+  state.sources = rows;
+  var counts = {total: rows.length, enabled: 0, ok: 0, error: 0, disabled: 0};
+  rows.forEach(function (source) {
+    if (source.enabled) { counts.enabled += 1; }
+    if (source.status === "ok") { counts.ok += 1; }
+    if (source.status === "error") { counts.error += 1; }
+    if (!source.enabled || source.status === "disabled") { counts.disabled += 1; }
+  });
+  renderSummaryStats($("source-summary"), [
+    {label: "总源", value: counts.total},
+    {label: "启用", value: counts.enabled},
+    {label: "正常", value: counts.ok},
+    {label: "异常", value: counts.error},
+    {label: "停用", value: counts.disabled},
+  ]);
+  var list = $("source-registry-list");
+  if (!list) { return; }
+  list.textContent = "";
+  if (!rows.length) {
+    list.appendChild(el("li", "run-empty", "暂无信息源"));
+    return;
+  }
+  rows.forEach(function (source) {
+    var row = el("li", "registry-row");
+    var name = el("strong", "", source.name || source.source_id || "未命名信息源");
+    row.appendChild(name);
+    row.appendChild(el("span", "meta", source.source_type || source.type || "—"));
+    row.appendChild(el("span", "meta", source.tier || "—"));
+    var statusNode = el("span", "status-pill " + (source.status || ""), sourceStatusLabel(source.status || "never"));
+    row.appendChild(statusNode);
+    var controls = el("div", "source-controls");
+    var enabledLabel = document.createElement("label");
+    enabledLabel.className = "source-toggle";
+    var enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = source.enabled !== false;
+    enabled.setAttribute("aria-label", "启用 " + (source.name || source.source_id));
+    enabled.addEventListener("change", function () {
+      var next = enabled.checked;
+      enabled.disabled = true;
+      api("/api/sources/enabled", {source_id: source.source_id, enabled: next}).then(function (data) {
+        renderSourceRegistry(data.sources || []);
+        status("source-status", next ? "信息源已启用" : "信息源已停用", "ok");
+      }).catch(function (error) {
+        enabled.checked = !next;
+        enabled.disabled = false;
+        status("source-status", "保存信息源状态失败：" + error.message, "error");
+      });
+    });
+    enabledLabel.appendChild(enabled);
+    enabledLabel.appendChild(document.createTextNode("启用"));
+    controls.appendChild(enabledLabel);
+    var interval = document.createElement("input");
+    interval.type = "number";
+    interval.min = "1";
+    interval.step = "1";
+    interval.value = String(source.fetch_interval_minutes || 15);
+    interval.title = "抓取间隔（分钟）";
+    interval.setAttribute("aria-label", (source.name || source.source_id) + " 抓取间隔（分钟）");
+    interval.addEventListener("change", function () {
+      var minutes = Number(interval.value);
+      if (!Number.isInteger(minutes) || minutes < 1) {
+        interval.value = String(source.fetch_interval_minutes || 15);
+        status("source-status", "抓取间隔必须是正整数分钟", "error");
+        return;
+      }
+      interval.disabled = true;
+      api("/api/sources/fetch-interval", {source_id: source.source_id, minutes: minutes}).then(function (data) {
+        renderSourceRegistry(data.sources || []);
+        status("source-status", "抓取间隔已保存", "ok");
+      }).catch(function (error) {
+        interval.disabled = false;
+        status("source-status", "保存抓取间隔失败：" + error.message, "error");
+      });
+    });
+    controls.appendChild(interval);
+    var action = document.createElement("button");
+    action.type = "button";
+    action.textContent = source.enabled ? "手动刷新" : "已停用";
+    action.disabled = !source.enabled;
+    action.addEventListener("click", function () {
+      var lane = source.type === "reddit" || source.adapter_type === "reddit" ? "viewpoints" : "hotspots";
+      setAppPage("news");
+      setLane(lane);
+      collect(source.source_id);
+    });
+    controls.appendChild(action);
+    row.appendChild(controls);
+    list.appendChild(row);
+  });
+}
+
+function renderCollectionRun(payload) {
+  var run = (payload && (payload.collection_run || payload.run)) || payload || {};
+  if (!run || typeof run !== "object") { run = {}; }
+  state.collectionRun = run;
+  var requested = Array.isArray(run.requested_sources) ? run.requested_sources.length : Number(run.requested_sources || run.requested || 0);
+  var attempted = Array.isArray(run.attempted_sources) ? run.attempted_sources.length : Number(run.attempted_sources || 0);
+  var successful = Array.isArray(run.successful_sources) ? run.successful_sources.length : Number(run.successful_sources || 0);
+  var failed = Array.isArray(run.failed_sources) ? run.failed_sources.length : Number(run.failed_sources || run.failed || 0);
+  var fetched = Number(run.items_fetched || run.fetched || 0);
+  var inserted = Number(run.items_inserted || run.inserted || 0);
+  var deduped = Number(run.items_after_dedupe || run.deduped || 0);
+  var clustered = Number(run.clusters_created_or_updated || run.clusters || 0);
+  renderSummaryStats($("run-summary"), [
+    {label: "尝试源", value: requested || attempted},
+    {label: "成功", value: successful},
+    {label: "失败", value: failed},
+    {label: "获得内容", value: fetched},
+    {label: "新增 / 去重后", value: (inserted || 0) + " / " + (deduped || 0)},
+  ]);
+  var list = $("collection-run-sources");
+  if (!list) { return; }
+  list.textContent = "";
+  var attempts = Array.isArray(run.source_attempts) ? run.source_attempts : [];
+  if (!attempts.length) {
+    list.appendChild(el("li", "run-empty", run.run_id ? "本次运行已记录，暂无源级明细" : "还没有采集运行记录"));
+    return;
+  }
+  attempts.forEach(function (attempt) {
+    if (!attempt || typeof attempt !== "object") { return; }
+    var row = el("li", "run-source-row");
+    var sourceName = attempt.name || attempt.source_id || "未命名信息源";
+    (state.sources || []).some(function (source) {
+      if (source && source.source_id === attempt.source_id) {
+        sourceName = source.name || sourceName;
+        return true;
+      }
+      return false;
+    });
+    row.appendChild(el("strong", "", sourceName));
+    row.appendChild(el("span", "meta", attempt.status || "—"));
+    row.appendChild(el("span", "meta", String(attempt.items_fetched == null ? 0 : attempt.items_fetched) + " 条"));
+    var diagnostic = attempt.diagnostic;
+    if (diagnostic && typeof diagnostic === "object") {
+      diagnostic = diagnostic.detail || diagnostic.reason || diagnostic.code || "";
+    }
+    row.appendChild(el("span", "meta", diagnostic || attempt.error || ""));
+    list.appendChild(row);
+  });
+  var summary = $("home-recent-summary");
+  if (summary && run.run_id) {
+    summary.textContent = "最近一次采集：" + (failed ? ("有 " + failed + " 个源失败") : "全部成功") + " · 新增 " + inserted + " 条" + (clustered ? " · 聚类 " + clustered + " 个事件" : "");
+  }
+}
+
+function renderCollectionRuns(payload) {
+  var runs = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.runs) ? payload.runs : []);
+  var list = $("collection-run-sources");
+  if (!list) { return; }
+  list.textContent = "";
+  if (!runs.length) {
+    renderCollectionRun(state.collectionRun || {});
+    return;
+  }
+  var latest = runs[0] || {};
+  renderSummaryStats($("run-summary"), [
+    {label: "运行记录", value: runs.length},
+    {label: "最近状态", value: latest.status || "—"},
+    {label: "成功源", value: Array.isArray(latest.successful_sources) ? latest.successful_sources.length : 0},
+    {label: "失败源", value: Array.isArray(latest.failed_sources) ? latest.failed_sources.length : 0},
+    {label: "去重后", value: Number(latest.items_after_dedupe || 0)},
+  ]);
+  runs.forEach(function (run) {
+    if (!run || typeof run !== "object") { return; }
+    var row = el("li", "run-source-row");
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.appendChild(el("strong", "", run.run_id || "未命名运行"));
+    row.appendChild(el("span", "meta", run.status || "—"));
+    row.appendChild(el("span", "meta", formatTime(run.started_at || "")));
+    row.appendChild(el("span", "meta", (Array.isArray(run.failed_sources) ? run.failed_sources.length : 0) + " 个源失败"));
+    row.appendChild(el("span", "meta", String(run.items_after_dedupe || 0) + " 条去重后"));
+    var open = function () {
+      api("/api/collection-runs/" + encodeURIComponent(run.run_id), null, {method: "GET"}).then(function (data) {
+        renderCollectionRun(data.run || data);
+      }).catch(function (error) {
+        status("source-status", "读取运行记录失败：" + error.message, "error");
+      });
+    };
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", function (event) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+    list.appendChild(row);
+  });
+}
+
+function loadSourceRegistry() {
+  return api("/api/sources", null, {method: "GET"}).then(function (data) {
+    renderSourceRegistry(data.sources || []);
+    return data;
+  });
+}
+
+function loadCollectionRuns() {
+  return api("/api/collection-runs?limit=20", null, {method: "GET"}).then(function (data) {
+    renderCollectionRuns(data);
+    return data;
+  });
+}
+
+function selectedResearchEventIds() {
+  var ids = [];
+  pickedIdList().forEach(function (itemId) {
+    var event = state.radarEvents[itemId];
+    var eventId = event && event.event_id ? String(event.event_id) : "";
+    if (!eventId) {
+      var candidates = ((state.rankings || {}).heat || []).concat((state.rankings || {}).time || []);
+      candidates.some(function (item) {
+        if (item && String(item.item_id || "") === String(itemId) && item.event_id) {
+          eventId = String(item.event_id);
+          return true;
+        }
+        return false;
+      });
+    }
+    if (eventId && ids.indexOf(eventId) < 0) { ids.push(eventId); }
+  });
+  return ids;
+}
+
+function syncResearchControls() {
+  var ids = selectedResearchEventIds();
+  state.research.eventIds = ids;
+  var enabled = ids.length > 0 && !state.research.loading;
+  var button = $("research-btn");
+  var runButton = $("research-run-btn");
+  if (button) { button.disabled = !enabled; }
+  if (runButton) { runButton.disabled = !enabled; }
+}
+
+function diagnosticLabel(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") { return ""; }
+  return [diagnostic.source, diagnostic.stage, diagnostic.code, diagnostic.cause_code]
+    .filter(function (value) { return value !== undefined && value !== null && String(value); })
+    .map(function (value) { return String(value); }).join(" · ");
+}
+
+function renderResearchDossier(dossier) {
+  state.research.dossier = dossier || null;
+  var summary = $("research-summary");
+  var diagnostics = $("research-diagnostics");
+  var evidenceList = $("research-evidence-list");
+  if (!summary || !diagnostics || !evidenceList) { return; }
+  summary.textContent = "";
+  diagnostics.textContent = "";
+  evidenceList.textContent = "";
+  if (!dossier || typeof dossier !== "object") {
+    summary.appendChild(el("article", "ia-card", "尚未生成 Topic Dossier"));
+    return;
+  }
+  var topics = Array.isArray(dossier.topics) ? dossier.topics.length : 0;
+  var evidence = Array.isArray(dossier.evidence) ? dossier.evidence : [];
+  renderSummaryStats(summary, [
+    {label: "状态", value: dossier.status || "—"},
+    {label: "事件", value: Array.isArray(dossier.event_ids) ? dossier.event_ids.length : 0},
+    {label: "主题", value: topics},
+    {label: "证据", value: evidence.length},
+    {label: "降级", value: dossier.degraded ? "是" : "否"},
+  ]);
+  var allDiagnostics = Array.isArray(dossier.diagnostics) ? dossier.diagnostics.slice() : [];
+  evidence.forEach(function (item) {
+    (item && item.assessment && Array.isArray(item.assessment.diagnostics) ? item.assessment.diagnostics : []).forEach(function (itemDiagnostic) {
+      allDiagnostics.push(itemDiagnostic);
+    });
+  });
+  var seenDiagnostics = {};
+  allDiagnostics.forEach(function (item) {
+    var label = diagnosticLabel(item);
+    if (!label || seenDiagnostics[label]) { return; }
+    seenDiagnostics[label] = true;
+    diagnostics.appendChild(el("p", "page-description research-diagnostic", "诊断：" + label));
+  });
+  if (!evidence.length) {
+    evidenceList.appendChild(el("li", "run-empty", "没有可展示的证据；请查看上方诊断。"));
+    return;
+  }
+  evidence.forEach(function (item) {
+    if (!item || typeof item !== "object") { return; }
+    var row = el("li", "research-evidence");
+    var heading = el("h3", "", item.title || item.url || "未命名证据");
+    var url = String(item.url || "");
+    if (url) {
+      heading.textContent = "";
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = item.title || url;
+      heading.appendChild(link);
+    }
+    row.appendChild(heading);
+    row.appendChild(el("p", "", (item.relation || "topic_only") + " · " + (item.reader_status || "unread") + (item.assessment && item.assessment.decision ? " · " + item.assessment.decision : "")));
+    if (item.snippet) { row.appendChild(el("p", "", String(item.snippet).slice(0, 500))); }
+    evidenceList.appendChild(row);
+  });
+}
+
+function runResearch() {
+  var ids = selectedResearchEventIds();
+  if (!ids.length || state.research.loading) {
+    status("hotspot-status", "请先在资讯页选择至少一个事件", "error");
+    return;
+  }
+  var queryNode = $("research-query");
+  var query = queryNode ? String(queryNode.value || "").trim() : "";
+  state.research.eventIds = ids;
+  state.research.loading = true;
+  syncResearchControls();
+  setAppPage("research");
+  status("research-status", "正在生成 Topic Dossier…");
+  api("/api/research", {event_ids: ids, query: query || undefined}).then(function (data) {
+    renderResearchDossier(data.dossier || data);
+    var dossier = data.dossier || {};
+    status("research-status", "研究完成 · " + (dossier.status || "已返回") + (dossier.degraded ? " · 部分能力降级" : ""), dossier.degraded ? "error" : "ok");
+  }).catch(function (error) {
+    status("research-status", "研究失败：" + error.message, "error");
+  }).then(function () {
+    state.research.loading = false;
+    syncResearchControls();
+  });
+}
+
+function loadResearchDossier(dossierId) {
+  return api("/api/research/" + encodeURIComponent(dossierId), null, {method: "GET"}).then(function (data) {
+    renderResearchDossier(data.dossier || data);
+    return data;
+  });
+}
+
+function setAppPage(page) {
+  if (APP_PAGES.indexOf(page) < 0) { return; }
+  var previousPage = state.page;
+  state.page = page;
+  document.querySelectorAll("[data-app-page]").forEach(function (panel) {
+    panel.hidden = panel.dataset.appPage !== page;
+  });
+  document.querySelectorAll("[data-app-page-target]").forEach(function (button) {
+    var active = button.dataset.appPageTarget === page;
+    button.setAttribute("aria-current", active ? "page" : "false");
+    button.classList.toggle("active", active);
+  });
+  if (page === "sources") { loadSourceRegistry().catch(function (error) { status("source-status", "读取信息源失败：" + error.message, "error"); }); }
+  if (page === "runs") { loadCollectionRuns().catch(function (error) { status("source-status", "读取运行记录失败：" + error.message, "error"); }); }
+  if (page === "creation" && state.lane === "skills") { setLane("hotspots"); }
+  if (page === "news" && previousPage !== "news" && state.lane !== "mixed") { setLane("mixed"); }
 }
 
 var WAIT_HINTS = {
@@ -1817,6 +2412,7 @@ function sourceStatusLabel(status) {
 
 function renderSourceHealth(sources) {
   state.sources = sources || [];
+  renderSourceRegistry(state.sources);
   var list = $("source-health");
   if (!list) { return; }
   list.textContent = "";
@@ -1934,6 +2530,12 @@ function renderHotspots(items) {
       meta += " · 重要 " + Number(radar.importance_score || 0).toFixed(1)
         + " · 关注 " + Number(radar.attention_score || 0).toFixed(1)
         + " · 优先 " + Number(radar.priority_score || 0).toFixed(1);
+      var decision = radar.decision || {};
+      var decisionDiagnostics = Array.isArray(decision.diagnostics) ? decision.diagnostics : [];
+      if (decisionDiagnostics.length) {
+        var decisionLabel = diagnosticLabel(decisionDiagnostics[0]);
+        if (decisionLabel) { meta += " · Jev " + decisionLabel; }
+      }
     }
     if (item.discussion) { meta += " · 讨论观察"; }
     button.appendChild(el("span", "ht-meta", meta));
@@ -2621,6 +3223,7 @@ function togglePicked(itemId) {
   }
   syncPickedHighlights();
   syncGenerateEnabled();
+  syncResearchControls();
   if (typeof renderPickedDock === "function") renderPickedDock();
 }
 
@@ -3058,14 +3661,16 @@ function applyHotspots(data, extraStatus) {
   state.radarEvents = {};
   var radarEvents = data.radar && Array.isArray(data.radar.events) ? data.radar.events : [];
   radarEvents.forEach(function (event) {
-    var ids = [event.item_id, event.representative_item_id, event.canonical_item_id]
+    var ids = [event.event_id, event.item_id, event.representative_item_id, event.canonical_item_id]
       .concat(Array.isArray(event.item_ids) ? event.item_ids : []);
     ids.forEach(function (itemId) {
       if (itemId) { state.radarEvents[itemId] = event; }
     });
   });
-  if (data.sources) { renderSourceHealth(data.sources); }
+  if (data.source_registry) { renderSourceHealth(data.source_registry); }
+  else if (data.sources) { renderSourceHealth(data.sources); }
   setRank(state.rank);
+  syncResearchControls();
   var shown = (state.rankings[state.rank] || []).length;
   var text = shown ? "共 " + shown + " 条候选" : "暂无候选";
   if (extraStatus) { text += extraStatus; }
@@ -3155,6 +3760,7 @@ function collect(sourceId) {
   if (sourceId) { payload.source_id = sourceId; }
   waitApi("collect", "/api/collect", payload).then(function (data) {
     if (waitCancelled("collect")) { return; }
+    renderCollectionRun(data && (data.collection_run || data.collection) || data);
     if (requestGen !== state.collectGen) {
       waitDone("已切换栏目", "collect");
       return;
@@ -4168,6 +4774,7 @@ function loadGithubWeekly() {
   status("hotspot-status", "正在读取周榜…");
   return fetch("/api/github-weekly").then(function (response) { return response.json(); }).then(function (data) {
     renderGithubWeekly(data);
+    renderResourceGithubResults(data.repos || []);
     var count = (data.repos || []).length;
     status("hotspot-status", count ? "已显示 " + count + " 个仓库，可再点抓取周榜刷新" : "还没有周榜。点「抓取周榜」拉取本周新建的 AI 仓库，不够再用本周涨星补齐。", count ? "ok" : "");
     return data;
@@ -4182,6 +4789,7 @@ function refreshGithubWeekly() {
   waitApi("github_fetch", "/api/github-weekly", {}).then(function (data) {
     if (waitCancelled("github_fetch")) { return; }
     renderGithubWeekly(data);
+    renderResourceGithubResults(data.repos || []);
     var count = (data.repos || []).length;
     var extra = data.model_used ? " · 榜单模型已改写简介" : " · 未配置榜单模型，简介用仓库描述";
     if (state.lane === "github") {
@@ -4679,6 +5287,62 @@ function renderSkillList(skills) {
     list.appendChild(row);
   });
 }
+function renderResourceResults(skills) {
+  var target = $("resource-results");
+  if (!target) { return; }
+  if (target.dataset.resourceDiscoverySlot === "pending") { return; }
+  target.textContent = "";
+  var rows = (skills || []).filter(function (skill) { return skill && !skill.gap; });
+  if (!rows.length) {
+    target.appendChild(el("article", "ia-card", "暂无资源结果。输入关键词后，这里会复用现有 Skill 搜索结果。"));
+    return;
+  }
+  rows.forEach(function (skill) {
+    var card = el("article", "ia-card");
+    var name = String(skill.name || skill.source_id || "未命名资源");
+    var heading = el("h3", "", name);
+    var url = skillPageUrl(skill);
+    if (url) {
+      heading.textContent = "";
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = name;
+      heading.appendChild(link);
+    }
+    card.appendChild(heading);
+    var detail = String(skill.description || skill.summary || skill.readme || "").trim();
+    card.appendChild(el("p", "", detail ? detail.slice(0, 180) : (skillSourceLabel(skill) + " · 可继续进入创作页")));
+    target.appendChild(card);
+  });
+}
+function renderResourceGithubResults(repos) {
+  var target = $("resource-results");
+  if (!target) { return; }
+  if (target.dataset.resourceDiscoverySlot === "pending") { return; }
+  var rows = (repos || []).filter(function (repo) { return repo && (repo.full_name || repo.name); });
+  if (!rows.length) { return; }
+  target.textContent = "";
+  rows.forEach(function (repo) {
+    var card = el("article", "ia-card");
+    var name = String(repo.full_name || repo.name || "未命名 Repo");
+    var heading = el("h3", "", name);
+    var url = String(repo.html_url || repo.url || "");
+    if (url) {
+      heading.textContent = "";
+      var link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = name;
+      heading.appendChild(link);
+    }
+    card.appendChild(heading);
+    card.appendChild(el("p", "", String(repo.summary || repo.description || "GitHub AI 项目")));
+    target.appendChild(card);
+  });
+}
 function escapeSkillHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
@@ -4778,6 +5442,7 @@ function renderSkillPackage(payload) {
   }
   $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
   renderSkillList(skills);
+  renderResourceResults(skills);
   renderSkillsGallery();
   var images = skillImages();
   $("skills-export-btn").disabled = !images.filter(function (image) { return image.selected !== false && image.url; }).length;
@@ -5026,7 +5691,7 @@ function pasteSkills() {
   });
 }
 function renderGithubTokenState(data) {
-  var configured = !!(data && data.github_token);
+  var configured = !!(data && (data.github_token !== undefined ? data.github_token : data.configured));
   state.githubTokenConfigured = configured;
   var box = $("skill-token-status");
   if (box) {
@@ -5034,6 +5699,19 @@ function renderGithubTokenState(data) {
       ? "已配置 GitHub Token：每小时 5000 次额度，收录更稳。"
       : "未配置。不配也能用，但 GitHub 接口每小时只给 60 次，容易限流。";
   }
+  var settingsBox = $("settings-github-status");
+  if (settingsBox) {
+    settingsBox.textContent = configured ? "已配置（Token 不回显）" : "未配置";
+  }
+}
+function renderResearchRuntime(data) {
+  var runtime = data && data.research ? data.research : {};
+  state.researchRuntime = runtime;
+  var node = $("settings-runtime-summary");
+  if (!node) { return; }
+  var planner = runtime.planner_configured ? "已配置" : "降级规则";
+  var jev = runtime.jev_configured ? "已配置" : "未配置（保留 Jev 诊断）";
+  node.textContent = "Planner：" + planner + " · Jev：" + jev + "。模型密钥由现有端点/钥匙串管理。";
 }
 function saveGithubToken() {
   var input = $("skill-github-token");
@@ -5416,13 +6094,13 @@ function exportXhsImages() {
   });
 }
 function setLane(lane) {
-  if (lane !== "hotspots" && lane !== "viewpoints" && lane !== "github" && lane !== "skills") { return; }
+  if (lane !== "hotspots" && lane !== "viewpoints" && lane !== "mixed" && lane !== "github" && lane !== "skills") { return; }
   if (state.lane === lane) { return; }
   state.collectGen += 1;
   invalidateRelatedSearch();
   rememberArticleSession(state.lane);
   var select = $("prompt-style-select");
-  if (state.lane === "hotspots" && select && select.value !== "经验分享") {
+  if ((state.lane === "hotspots" || state.lane === "mixed") && select && select.value !== "经验分享") {
     state.newsStyle = select.value;
   }
   state.lane = lane;
@@ -5435,14 +6113,14 @@ function setLane(lane) {
   });
   $("collect-btn").textContent = lane === "github" ? "抓取周榜" : "刷新全部";
   delete $("collect-btn").dataset.originalLabel;
-  $("h-hotspots").textContent = lane === "github" ? "GitHub AI 项目周榜" : (lane === "viewpoints" ? "观点候选" : (lane === "skills" ? "Skill查找器" : "热点候选"));
+  $("h-hotspots").textContent = lane === "github" ? "GitHub AI 项目周榜" : (lane === "skills" ? "资源探索" : "资讯探索");
   $("hotspot-sub").textContent = lane === "github"
     ? "优先本周新建的 AI 仓库，不够再用本周涨星补齐。先抓取周榜，再选浅色/暗色和三色盘后点生成图片。"
     : (lane === "viewpoints"
-    ? "下面是 Reddit 上正在热的 AI 使用/经验帖。热度看分数和评论数；这是社区说法，不是官方新闻。"
+    ? "社区来源已并入资讯探索，仍保留旧接口兼容。"
     : (lane === "skills"
     ? "输入关键词（空格分隔多个），直接去 GitHub / skills.sh / 网页抓 skill；也可以粘贴链接。点「生成图片」把所有已收录 skill 汇总成封面 + 每个 skill 一张海报。"
-    : "下面是话题/新闻候选。热度看独立来源数和讨论量；社区帖过阈会升温，一线说法用某某称，不是权威转载"));
+    : "按综合分、时效与独立来源聚合资讯事件；选择一个或多个事件后可继续研究"));
   $("source-health-wrap").hidden = lane !== "hotspots";
   if (select) {
     select.value = lane === "viewpoints" ? "经验分享" : (state.newsStyle || "AI专家");
@@ -5464,6 +6142,59 @@ function setLane(lane) {
     return widenIfEmpty(data || {}, currentHours());
   });
 }
+document.querySelectorAll("[data-app-page-target]").forEach(function (button) {
+  button.addEventListener("click", function () { setAppPage(button.dataset.appPageTarget); });
+});
+$("home-open-runs").addEventListener("click", function () { setAppPage("runs"); });
+$("home-search-btn").addEventListener("click", function () {
+  var query = String($("home-query").value || "").trim();
+  var resource = /资源|repo|skill|tool|website|工具/i.test(query);
+  if (resource) {
+    $("resource-query").value = query;
+    setAppPage("resources");
+    status("resource-status", query ? "已准备资源探索：" + query : "请输入想找的资源", query ? "ok" : "error");
+  } else {
+    setAppPage("news");
+    status("hotspot-status", query ? "资讯探索已打开：" + query : "资讯探索已打开", query ? "ok" : "");
+  }
+});
+$("resource-search-btn").addEventListener("click", function () {
+  var query = String($("resource-query").value || "").trim();
+  if (!query) {
+    status("resource-status", "请先输入想找的资源", "error");
+    return;
+  }
+  status("resource-status", "统一 ResourceDiscoveryService 尚未接入；本页不会把旧 Skill / GitHub 数据当作统一结果。", "");
+});
+$("resource-weekly-btn").addEventListener("click", function () {
+  status("resource-status", "兼容周榜仍在旧工作台；统一资源页等待 ResourceSet 接口。", "");
+});
+$("source-refresh-all").addEventListener("click", function () {
+  setAppPage("news");
+  setLane("hotspots");
+  collect();
+});
+$("source-open-runs").addEventListener("click", function () { setAppPage("runs"); });
+$("publishing-open-creation").addEventListener("click", function () { setAppPage("creation"); });
+$("publishing-open-settings").addEventListener("click", function () {
+  setAppPage("settings");
+  openSettings(true);
+});
+$("settings-open-model").addEventListener("click", function () {
+  setAppPage("settings");
+  openSettings(false);
+  setSettingsPage("model");
+});
+$("settings-open-accounts").addEventListener("click", function () {
+  setAppPage("settings");
+  openSettings(false);
+  setSettingsPage("accounts");
+});
+$("settings-open-research").addEventListener("click", function () {
+  setAppPage("news");
+  status("hotspot-status", "请选择一个或多个资讯事件后开始研究", "");
+});
+$("settings-open-sources").addEventListener("click", function () { setAppPage("sources"); });
 document.querySelectorAll("[data-lane]").forEach(function (tab) {
   tab.addEventListener("click", function () { setLane(tab.dataset.lane); });
 });
@@ -5471,6 +6202,9 @@ $("seg-wechat").addEventListener("click", function () { setPlatform("wechat"); }
 $("seg-xhs").addEventListener("click", function () { setPlatform("xiaohongshu"); });
 $("find-hooks-btn").addEventListener("click", findHooks);
 $("open-original-btn").addEventListener("click", function () { openOriginal(); });
+$("research-btn").addEventListener("click", runResearch);
+$("research-run-btn").addEventListener("click", runResearch);
+$("research-back-news").addEventListener("click", function () { setAppPage("news"); });
 $("original-translate").addEventListener("click", translateOriginal);
 $("original-close").addEventListener("click", closeOriginal);
 $("original-dialog").addEventListener("cancel", closeOriginal);
@@ -5525,6 +6259,7 @@ $("creator-btn").addEventListener("click", function () {
   if (state.creatorUrl) { window.open(state.creatorUrl, "_blank", "noopener"); }
 });
 $("config-btn").addEventListener("click", function () {
+  setAppPage("settings");
   openSettings(false);
 });
 $("favorites-btn").addEventListener("click", function () { toggleFavoritesDrawer(); });
@@ -5578,6 +6313,29 @@ $("skill-title").addEventListener("input", scheduleSkillTitleSave);
 $("skill-title").addEventListener("change", saveSkillTitle);
 $("skill-token-save").addEventListener("click", saveGithubToken);
 $("skill-token-clear").addEventListener("click", clearGithubToken);
+$("settings-save-github-token").addEventListener("click", function () {
+  var input = $("settings-github-token");
+  var token = String(input && input.value || "").trim();
+  if (!token) {
+    status("settings-github-status", "请先输入 Token", "error");
+    return;
+  }
+  api("/api/skills/github-token", {token: token}).then(function (data) {
+    if (input) { input.value = ""; }
+    renderGithubTokenState(data);
+    status("settings-github-status", "GitHub Token 已保存（仅显示配置状态）", "ok");
+  }).catch(function (error) {
+    status("settings-github-status", "保存失败：" + (error.reason || error.message), "error");
+  });
+});
+$("settings-clear-github-token").addEventListener("click", function () {
+  api("/api/skills/github-token", {token: ""}).then(function (data) {
+    renderGithubTokenState(data);
+    status("settings-github-status", "GitHub Token 已清除", "ok");
+  }).catch(function (error) {
+    status("settings-github-status", "清除失败：" + (error.reason || error.message), "error");
+  });
+});
 $("skills-render-btn").addEventListener("click", renderSkillImages);
 $("skills-cover-btn").addEventListener("click", renderSkillCoverOnly);
 $("skills-select-all").addEventListener("click", selectAllSkillImages);
@@ -5687,6 +6445,8 @@ fetch("/api/status").then(function (response) { return response.json(); }).then(
     form.elements.style.value = state.style;
   }
   state.modelEndpoints = data.model_endpoints || [];
+  renderResearchRuntime(data);
+  renderGithubTokenState({configured: data.github_token_configured});
   if (data.translation_llm) {
     state.translation = data.translation_llm;
   }
@@ -5704,6 +6464,7 @@ fetch("/api/status").then(function (response) { return response.json(); }).then(
   renderAccountPanels();
   if (data.version) { $("service-status").textContent = "v" + data.version + " · 本地服务"; }
   if (data.sources) { renderSourceHealth(data.sources); }
+  if (data.collection_run || data.run) { renderCollectionRun(data.collection_run || data.run); }
   loadFavorites();
   loadHotspots().then(function (hotspots) {
     return widenIfEmpty(hotspots || {}, currentHours());
@@ -5770,12 +6531,23 @@ class WebApp:
             fetcher=fetcher,
             llm_service=(self.translation_service if self._translation_model_configured else None),
         )
+        # Keep the latest radar event clusters available to the research
+        # boundary. They are derived UI data, not subscription sources or
+        # durable events, so the resolver falls back to the DB for persisted
+        # article events.
+        self._hotspot_payloads: dict[str, dict[str, object]] = {}
+        self._radar_events: dict[str, dict[str, object]] = {}
         self.workbench = Workbench(
             database,
             llm_service=self.llm_service,
             page_fetcher=default_page_fetcher if page_fetcher is None else page_fetcher,
             render_fetcher=self.render_fetcher,
+            event_resolver=self._resolve_research_event,
         )
+        # Radar and research share the same objective/Jev service. The
+        # HotspotService remains the owner of collection/ranking, while the
+        # Workbench owns the research boundary and its persistence.
+        self._refresh_research_runtime()
         self.workflow = ContentWorkflow(database)
         # ponytail: one local lock prevents duplicate platform submissions;
         # use per-account locks only if publish throughput becomes relevant.
@@ -5790,8 +6562,6 @@ class WebApp:
         self._wechat_poster_renderer: object = None
         self.article_style = ""
         self._original_text_cache: dict[str, dict[str, object]] = {}
-        self._hotspot_payloads: dict[str, dict[str, object]] = {}
-        self._radar_events: dict[str, dict[str, object]] = {}
         self.x_bearer_token = ""
         self.scheduler = PublishScheduler(database, self.publish, interval_seconds=15)
         self._restore_accounts()
@@ -5935,6 +6705,24 @@ class WebApp:
         self.credential_store.set(endpoint_id, settings.api_key)
         self.database.set_model_purpose(purpose, endpoint_id, settings.model, settings.effort)
 
+    def _refresh_research_runtime(self) -> None:
+        """Apply the current article endpoint to Planner/Jev without exposing credentials."""
+        research_service = getattr(self.workbench, "research_service", None)
+        decision_service = getattr(research_service, "decision_service", None)
+        if research_service is None or decision_service is None:
+            return
+        self.hotspots.decision_service = decision_service
+        if not str(getattr(self.llm_service.settings, "base_url", "") or "").strip():
+            return
+        planner = getattr(research_service, "planner", None)
+        if planner is not None:
+            planner.provider = self.llm_service
+        jev = getattr(decision_service, "jev", None)
+        if jev is None:
+            decision_service.jev = JevAdapter(self.llm_service)
+        else:
+            jev.provider = self.llm_service
+
     @property
     def wechat_publisher(self) -> WeChatPublisher | None:
         config = self.wechat_config
@@ -5956,6 +6744,11 @@ class WebApp:
         chat_settings = self.chat_service.settings
         translation_settings = self.translation_service.settings
         leaderboard_settings = self.leaderboard_service.settings
+        research_service = getattr(self.workbench, "research_service", None)
+        planner = getattr(research_service, "planner", None)
+        decision_service = getattr(research_service, "decision_service", None)
+        jev = getattr(decision_service, "jev", None)
+        legacy_sources = _decorate_source_health(self.hotspots.source_health())
         return {
             "ok": True,
             "service": "autoposting",
@@ -5988,7 +6781,16 @@ class WebApp:
                 else {"model": "", "base_url": "", "configured": False, "enabled": False}
             ),
             "model_endpoints": self._model_endpoints(),
-            "sources": _decorate_source_health(self.hotspots.source_health()),
+            "research": {
+                "schema_version": "topic-dossier-v1",
+                "planner_configured": bool(getattr(planner, "configured", False)),
+                "jev_configured": bool(getattr(jev, "configured", False)),
+            },
+            "github_token_configured": bool(self.github_token_configured),
+            # Keep the historical health list for old clients. New UI reads the
+            # DB-backed registry so runtime toggles and intervals remain authoritative.
+            "sources": legacy_sources,
+            "source_registry": self.source_registry(),
             "platforms": {
                 "wechat": {"configured": self.wechat_config is not None},
                 "xiaohongshu": {
@@ -6002,6 +6804,59 @@ class WebApp:
             },
         }
 
+    def source_registry(self) -> list[dict[str, object]]:
+        """Return the DB-authoritative source registry for the new UI."""
+        for source in self.hotspots.sources:
+            # upsert_source preserves runtime enabled/interval columns while
+            # keeping metadata from the configured source JSON current.
+            self.database.upsert_source(source)
+        return _decorate_source_health(
+            [_runtime_source_health(row) for row in self.database.list_sources()]
+        )
+
+    def collection_runs(self, limit: int = 20) -> list[dict[str, object]]:
+        return self.database.list_collection_runs(limit)
+
+    def collection_run(self, run_id: str) -> dict[str, object]:
+        return self.database.get_collection_run(run_id)
+
+    def _resolve_research_event(self, event_id: str) -> dict[str, object] | None:
+        """Resolve a selected radar cluster before falling back to DB events."""
+        key = str(event_id or "").strip()
+        if not key:
+            return None
+        radar_event = self._radar_events.get(key)
+        if radar_event is not None:
+            return dict(radar_event)
+        try:
+            return self.database.get_event(key)
+        except KeyError:
+            return None
+
+    def research(self, event_ids: object, query: object = None) -> dict[str, object]:
+        if not isinstance(event_ids, list):
+            raise ResearchError("event_ids_must_be_list")
+        if query is not None and not isinstance(query, str):
+            raise ResearchError("query_invalid")
+        return {"ok": True, "dossier": self.workbench.research(event_ids, query=query)}
+
+    def list_research(self, limit: int = 20) -> dict[str, object]:
+        return {"ok": True, "dossiers": self.workbench.list_research(limit)}
+
+    def get_research(self, dossier_id: str) -> dict[str, object]:
+        dossier_id = str(dossier_id or "").strip()
+        if not dossier_id:
+            raise ResearchError("dossier_id_required")
+        return {"ok": True, "dossier": self.workbench.get_research(dossier_id)}
+
+    def set_source_enabled(self, source_id: str, enabled: bool) -> dict[str, object]:
+        self.database.set_source_enabled(source_id, enabled)
+        return {"ok": True, "sources": self.source_registry()}
+
+    def set_source_fetch_interval(self, source_id: str, minutes: int) -> dict[str, object]:
+        self.database.set_source_fetch_interval(source_id, minutes)
+        return {"ok": True, "sources": self.source_registry()}
+
     def collect(
         self,
         hours: int,
@@ -6013,6 +6868,17 @@ class WebApp:
             hours, force=force, source_id=source_id, lane=lane
         )
         payload["sources"] = _decorate_source_health(payload.get("sources"))
+        collection = payload.get("collection")
+        if isinstance(collection, dict):
+            run_id = str(collection.get("run_id") or "").strip()
+            if run_id:
+                try:
+                    payload["collection_run"] = self.collection_run(run_id)
+                except KeyError:
+                    pass
+            elif "requested_sources" in collection:
+                payload["collection_run"] = collection
+        payload["source_registry"] = self.source_registry()
         self._remember_hotspot_payloads(payload)
         return {
             "ok": True,
@@ -6049,6 +6915,9 @@ class WebApp:
             for event in events:
                 if not isinstance(event, dict):
                     continue
+                event_id = str(event.get("event_id") or "").strip()
+                if event_id:
+                    self._radar_events[event_id] = dict(event)
                 ids = {
                     str(value)
                     for value in (
@@ -6381,6 +7250,7 @@ class WebApp:
         if settings.model not in self.article_models:
             self.article_models.append(settings.model)
         self._activate_endpoint("article", settings)
+        self._refresh_research_runtime()
         return {
             "ok": True,
             "llm": self.llm_service.settings_payload(settings),
@@ -7662,19 +8532,52 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                if self.path == "/api/status":
+                parsed = urlsplit(self.path)
+                if parsed.path == "/api/status":
                     self._send_json(200, app.status())
                     return
-                if self.path == "/api/github-weekly":
+                if parsed.path == "/api/sources":
+                    self._send_json(200, {"ok": True, "sources": app.source_registry()})
+                    return
+                if parsed.path == "/api/collection-runs":
+                    raw_limit = (parse_qs(parsed.query).get("limit") or ["20"])[0]
+                    try:
+                        limit = int(raw_limit)
+                    except ValueError as exc:
+                        raise ValueError("limit must be an integer") from exc
+                    self._send_json(200, {"ok": True, "runs": app.collection_runs(limit)})
+                    return
+                if parsed.path.startswith("/api/collection-runs/"):
+                    run_id = parsed.path.rsplit("/", 1)[-1].strip()
+                    if not run_id:
+                        raise ValueError("run_id required")
+                    self._send_json(200, {"ok": True, "run": app.collection_run(run_id)})
+                    return
+                if parsed.path == "/api/research":
+                    raw_limit = (parse_qs(parsed.query).get("limit") or ["20"])[0]
+                    try:
+                        limit = int(raw_limit)
+                    except ValueError as exc:
+                        raise ValueError("limit must be an integer") from exc
+                    if not 1 <= limit <= 100:
+                        raise ValueError("limit must be between 1 and 100")
+                    self._send_json(200, app.list_research(limit))
+                    return
+                if parsed.path.startswith("/api/research/"):
+                    dossier_id = parsed.path.rsplit("/", 1)[-1].strip()
+                    if not dossier_id:
+                        raise ValueError("dossier_id required")
+                    self._send_json(200, app.get_research(dossier_id))
+                    return
+                if parsed.path == "/api/github-weekly":
                     self._send_json(200, app.github_weekly())
                     return
-                if self.path == "/api/skills":
+                if parsed.path == "/api/skills":
                     self._send_json(200, app.skills_snapshot())
                     return
-                if self.path == "/api/favorites":
+                if parsed.path == "/api/favorites":
                     self._send_json(200, app.list_favorites())
                     return
-                parsed = urlsplit(self.path)
                 if parsed.path == "/api/hotspots":
                     raw_hours = (parse_qs(parsed.query).get("hours") or ["4"])[0]
                     try:
@@ -7688,8 +8591,8 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     translate_flag = (parse_qs(parsed.query).get("translate") or ["0"])[0]
                     translate = translate_flag.lower() in {"1", "true", "yes"}
                     lane = (parse_qs(parsed.query).get("lane") or ["hotspots"])[0]
-                    if lane not in {"hotspots", "viewpoints"}:
-                        raise ValueError("lane must be hotspots or viewpoints")
+                    if lane not in {"hotspots", "viewpoints", "mixed"}:
+                        raise ValueError("lane must be hotspots, viewpoints, or mixed")
                     self._send_json(
                         200, app.hotspots_window(hours, translate=translate, lane=lane)
                     )
@@ -7730,6 +8633,16 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                 raise KeyError(self.path)
             except KeyError as exc:
                 self._send_json(404, self._not_found_payload(exc))
+            except ResearchError as exc:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": exc.code,
+                        "error_reason": exc.reason,
+                        "error_type": "ResearchError",
+                    },
+                )
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc), "error_type": "ValueError"})
             except Exception as exc:
@@ -7764,7 +8677,37 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         )
                         return
                 payload = self._read_json_body()
-                if self.path == "/api/collect":
+                if self.path == "/api/sources/enabled":
+                    if not isinstance(payload, dict):
+                        raise ValueError("source payload must be a JSON object")
+                    enabled = payload.get("enabled")
+                    if not isinstance(enabled, bool):
+                        raise ValueError("enabled must be boolean")
+                    result = app.set_source_enabled(
+                        self._require_string(payload, "source_id"), enabled
+                    )
+                elif self.path == "/api/sources/fetch-interval":
+                    if not isinstance(payload, dict):
+                        raise ValueError("source payload must be a JSON object")
+                    minutes = payload.get("minutes")
+                    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0:
+                        raise ValueError("minutes must be a positive integer")
+                    result = app.set_source_fetch_interval(
+                        self._require_string(payload, "source_id"), minutes
+                    )
+                elif self.path == "/api/research":
+                    if not isinstance(payload, dict):
+                        raise ResearchError("research_payload_must_be_object")
+                    event_ids = payload.get("event_ids")
+                    if not isinstance(event_ids, list):
+                        raise ResearchError("event_ids_must_be_list")
+                    if any(not isinstance(value, str) for value in event_ids):
+                        raise ResearchError("event_id_invalid")
+                    query = payload.get("query")
+                    if query is not None and not isinstance(query, str):
+                        raise ResearchError("query_invalid")
+                    result = app.research(event_ids, query)
+                elif self.path == "/api/collect":
                     hours = payload.get("hours", 4) if isinstance(payload, dict) else 4
                     if isinstance(hours, bool) or not isinstance(hours, int):
                         raise ValueError("hours must be an integer")
@@ -7781,8 +8724,8 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     ):
                         raise ValueError("source_id must be a non-empty string")
                     lane = payload.get("lane", "hotspots") if isinstance(payload, dict) else "hotspots"
-                    if lane not in {"hotspots", "viewpoints"}:
-                        raise ValueError("lane must be hotspots or viewpoints")
+                    if lane not in {"hotspots", "viewpoints", "mixed"}:
+                        raise ValueError("lane must be hotspots, viewpoints, or mixed")
                     result = app.collect(
                         hours,
                         force=force,
@@ -7907,6 +8850,16 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                 self._send_json(200, result)
             except KeyError as exc:
                 self._send_json(404, self._not_found_payload(exc))
+            except ResearchError as exc:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": exc.code,
+                        "error_reason": exc.reason,
+                        "error_type": "ResearchError",
+                    },
+                )
             except (ValueError, PublicationError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
             except LLMError as exc:

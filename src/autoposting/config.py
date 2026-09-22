@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .models import Source
+from .models import ADAPTER_TYPES, SOURCE_TYPES, Source, canonical_source_types
 
 
 class ConfigError(ValueError):
@@ -15,7 +15,6 @@ class ConfigError(ValueError):
 REQUIRED_SOURCE_FIELDS = {
     "source_id",
     "name",
-    "type",
     "url_or_handle",
     "tier",
     "topics",
@@ -49,9 +48,28 @@ def _source_from_mapping(data: object, index: int) -> Source:
     if missing:
         raise ConfigError(f"sources[{index}] missing fields: {', '.join(missing)}")
 
+    legacy_type = data.get("type")
+    source_type = data.get("source_type")
+    adapter_type = data.get("adapter_type")
+    if legacy_type is None and adapter_type is None:
+        raise ConfigError(
+            f"sources[{index}] requires type or adapter_type"
+        )
+    if legacy_type is not None and (
+        not isinstance(legacy_type, str) or not legacy_type.strip()
+    ):
+        raise ConfigError(f"sources[{index}].type must be a non-empty string")
+    if source_type is not None and (
+        not isinstance(source_type, str) or not source_type.strip()
+    ):
+        raise ConfigError(f"sources[{index}].source_type must be a non-empty string")
+    if adapter_type is not None and (
+        not isinstance(adapter_type, str) or not adapter_type.strip()
+    ):
+        raise ConfigError(f"sources[{index}].adapter_type must be a non-empty string")
+
     source_id = data["source_id"]
     name = data["name"]
-    source_type = data["type"]
     location = data["url_or_handle"]
     tier = data["tier"]
     topics = data["topics"]
@@ -63,18 +81,31 @@ def _source_from_mapping(data: object, index: int) -> Source:
         raise ConfigError(f"sources[{index}].source_id is invalid")
     if not isinstance(name, str) or not name.strip():
         raise ConfigError(f"sources[{index}].name is required")
-    if source_type not in {"rss", "web", "x", "sitemap", "reddit"}:
-        raise ConfigError(f"sources[{index}].type must be rss, web, x, sitemap, or reddit")
+    try:
+        canonical_kind, canonical_adapter = canonical_source_types(
+            legacy_type, source_type, adapter_type
+        )
+    except ValueError as exc:
+        field = "source_type" if source_type else "adapter_type"
+        raise ConfigError(f"sources[{index}].{field} is invalid: {exc}") from exc
+    if source_type is not None and source_type.strip().lower() not in SOURCE_TYPES:
+        raise ConfigError(
+            f"sources[{index}].source_type must be one of {', '.join(sorted(SOURCE_TYPES))}"
+        )
+    if adapter_type is not None and adapter_type.strip().lower() not in ADAPTER_TYPES:
+        raise ConfigError(
+            f"sources[{index}].adapter_type must be one of {', '.join(sorted(ADAPTER_TYPES))}"
+        )
     if tier not in {"S1", "S2", "S3", "S4"}:
         raise ConfigError(f"sources[{index}].tier must be S1, S2, S3, or S4")
     if not isinstance(location, str) or not location.strip():
         raise ConfigError(f"sources[{index}].url_or_handle is required")
-    if source_type == "reddit":
+    if canonical_adapter == "reddit":
         handle = location.strip().lstrip("r/").lstrip("/")
         if not re.fullmatch(r"[A-Za-z0-9_]+", handle):
             raise ConfigError(f"sources[{index}].url_or_handle must be a subreddit name")
         location = handle
-    if source_type in {"rss", "web", "sitemap"}:
+    if canonical_adapter in {"rss", "html", "sitemap", "github", "api"}:
         parts = urlsplit(location)
         if parts.scheme not in {"http", "https"} or not parts.netloc:
             raise ConfigError(f"sources[{index}].url_or_handle must be an HTTP(S) URL")
@@ -86,7 +117,7 @@ def _source_from_mapping(data: object, index: int) -> Source:
         raise ConfigError(f"sources[{index}].enabled must be boolean")
     if not isinstance(identity_verified, bool):
         raise ConfigError(f"sources[{index}].identity_verified must be boolean")
-    if source_type == "x" and enabled and not identity_verified and tier in {"S1", "S2"}:
+    if canonical_adapter == "x" and enabled and not identity_verified and tier in {"S1", "S2"}:
         raise ConfigError(
             f"sources[{index}].identity_verified must be true before enabling an S1/S2 X account"
         )
@@ -96,7 +127,7 @@ def _source_from_mapping(data: object, index: int) -> Source:
     return Source(
         source_id=source_id,
         name=name.strip(),
-        type=source_type,
+        type=str(legacy_type or canonical_adapter).strip().lower(),
         url_or_handle=location.strip(),
         tier=tier,
         topics=tuple(dict.fromkeys(topic.strip() for topic in topics)),
@@ -104,6 +135,8 @@ def _source_from_mapping(data: object, index: int) -> Source:
         fetch_interval_minutes=_fetch_interval_minutes(data["fetch_interval"]),
         identity_verified=identity_verified,
         content_filter=content_filter,
+        source_type=canonical_kind,
+        adapter_type=canonical_adapter,
     )
 
 

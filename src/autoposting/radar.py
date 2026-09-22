@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .decision.service import DecisionService
 from .engagement import engagement_from_raw, engagement_kind
 
 
@@ -731,6 +732,7 @@ def score_events(
     *,
     snapshots: Iterable[Mapping[str, object]] = (),
     now: datetime | str | None = None,
+    decision_service: DecisionService | None = None,
 ) -> list[dict[str, object]]:
     current = _now(now)
     snapshot_rows = [row for row in snapshots if isinstance(row, Mapping)]
@@ -739,11 +741,22 @@ def score_events(
         event = dict(raw_event)
         importance, importance_breakdown = calculate_importance_score(event, now=current)
         attention, attention_breakdown = calculate_attention_score(event, snapshots=snapshot_rows, now=current)
-        priority = round(0.55 * importance + 0.45 * attention, 4)
+        objective_score = round(0.55 * importance + 0.45 * attention, 4)
+        priority = objective_score
+        decision_payload: dict[str, object] | None = None
+        if decision_service is not None:
+            assessment = decision_service.assess(
+                event,
+                candidate_id=_text(event.get("event_id")),
+                objective_score=objective_score,
+            )
+            decision_payload = assessment.to_dict()
+            priority = assessment.final_score
         event.update(
             {
                 "importance_score": importance,
                 "attention_score": attention,
+                "objective_score": objective_score,
                 "priority_score": priority,
                 "engagement_by_platform": engagement_by_platform(event),
                 "importance_breakdown": importance_breakdown,
@@ -755,6 +768,8 @@ def score_events(
                 ],
             }
         )
+        if decision_payload is not None:
+            event["decision"] = decision_payload
         event["evidence_pack"] = build_evidence_pack(event)
         scored.append(event)
     scored.sort(key=lambda event: (float(event.get("priority_score") or 0), float(event.get("importance_score") or 0), _text(event.get("latest_seen_at"))), reverse=True)
@@ -768,8 +783,14 @@ def rank_events(
     *,
     snapshots: Iterable[Mapping[str, object]] = (),
     now: datetime | str | None = None,
+    decision_service: DecisionService | None = None,
 ) -> list[dict[str, object]]:
-    return score_events(cluster_candidates(candidates), snapshots=snapshots, now=now)
+    return score_events(
+        cluster_candidates(candidates),
+        snapshots=snapshots,
+        now=now,
+        decision_service=decision_service,
+    )
 
 
 def build_radar(
@@ -777,9 +798,15 @@ def build_radar(
     *,
     snapshots: Iterable[Mapping[str, object]] = (),
     now: datetime | str | None = None,
+    decision_service: DecisionService | None = None,
 ) -> list[dict[str, object]]:
     """Run the complete in-memory on-demand radar pipeline."""
-    return rank_events(candidates, snapshots=snapshots, now=now)
+    return rank_events(
+        candidates,
+        snapshots=snapshots,
+        now=now,
+        decision_service=decision_service,
+    )
 
 
 class EventScoringService:
@@ -794,8 +821,14 @@ class EventScoringService:
         *,
         snapshots: Iterable[Mapping[str, object]] = (),
         now: datetime | str | None = None,
+        decision_service: DecisionService | None = None,
     ) -> list[dict[str, object]]:
-        return score_events(events, snapshots=snapshots, now=now)
+        return score_events(
+            events,
+            snapshots=snapshots,
+            now=now,
+            decision_service=decision_service,
+        )
 
     def rank(
         self,
@@ -803,8 +836,14 @@ class EventScoringService:
         *,
         snapshots: Iterable[Mapping[str, object]] = (),
         now: datetime | str | None = None,
+        decision_service: DecisionService | None = None,
     ) -> list[dict[str, object]]:
-        return build_radar(candidates, snapshots=snapshots, now=now)
+        return build_radar(
+            candidates,
+            snapshots=snapshots,
+            now=now,
+            decision_service=decision_service,
+        )
 
 
 NewsRadar = EventScoringService

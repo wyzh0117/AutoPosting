@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -19,11 +20,11 @@ from .diagnostics import (
     sanitize_detail,
     serialize_diagnostic,
 )
-from .models import FeedItem, Source
+from .models import FeedItem, Source, canonical_source_types
 from .normalize import content_hash
 
 
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 3
 _JSON_VERSIONS = {
     "github_weekly_repos": "github-weekly-repos-v1",
     "github_weekly_images": "github-weekly-images-v1",
@@ -32,6 +33,11 @@ _JSON_VERSIONS = {
     "skill_finder_snapshot": "skill-finder-snapshot-v1",
     "favorite_payload": "favorite-payload-v1",
     "scheduled_result": "scheduled-result-v1",
+    "collection_run_source_ids": "collection-run-source-ids-v1",
+    "collection_run_diagnostics": "collection-run-diagnostics-v1",
+    "collection_run_source_attempt_diagnostic": "collection-run-source-attempt-diagnostic-v1",
+    "topic_dossier": "topic-dossier-envelope-v1",
+    "topic_dossier_event_ids": "topic-dossier-event-ids-v1",
 }
 
 
@@ -127,12 +133,16 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS sources (
     source_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit')),
+    type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit', 'html', 'github', 'api', 'account')),
     url_or_handle TEXT NOT NULL,
     tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
     topics_json TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
     fetch_interval_minutes INTEGER NOT NULL CHECK (fetch_interval_minutes > 0),
+    source_type TEXT NOT NULL DEFAULT 'other' CHECK (source_type IN ('official', 'media', 'community', 'developer', 'research', 'repository', 'other')),
+    adapter_type TEXT NOT NULL DEFAULT 'rss' CHECK (adapter_type IN ('rss', 'sitemap', 'html', 'reddit', 'github', 'api', 'account', 'x')),
+    identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0, 1)),
+    content_filter TEXT NOT NULL DEFAULT '' CHECK (content_filter IN ('', 'ai')),
     last_fetched_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
@@ -315,6 +325,59 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS collection_runs (
+    run_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('RUNNING', 'DONE', 'FAILED')),
+    requested_sources_json TEXT NOT NULL,
+    attempted_sources_json TEXT NOT NULL,
+    successful_sources_json TEXT NOT NULL,
+    failed_sources_json TEXT NOT NULL,
+    items_fetched INTEGER NOT NULL DEFAULT 0 CHECK (items_fetched >= 0),
+    items_inserted INTEGER NOT NULL DEFAULT 0 CHECK (items_inserted >= 0),
+    items_after_dedupe INTEGER NOT NULL DEFAULT 0 CHECK (items_after_dedupe >= 0),
+    clusters_created_or_updated INTEGER NOT NULL DEFAULT 0 CHECK (clusters_created_or_updated >= 0),
+    degraded INTEGER NOT NULL DEFAULT 0 CHECK (degraded IN (0, 1)),
+    diagnostics_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collection_run_sources (
+    run_id TEXT NOT NULL REFERENCES collection_runs(run_id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    status TEXT NOT NULL CHECK (
+        status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'SKIPPED_DISABLED', 'SKIPPED_NOT_DUE')
+    ),
+    started_at TEXT,
+    finished_at TEXT,
+    items_fetched INTEGER NOT NULL DEFAULT 0 CHECK (items_fetched >= 0),
+    items_inserted INTEGER NOT NULL DEFAULT 0 CHECK (items_inserted >= 0),
+    items_after_dedupe INTEGER NOT NULL DEFAULT 0 CHECK (items_after_dedupe >= 0),
+    diagnostic_json TEXT,
+    PRIMARY KEY (run_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collection_runs_started
+    ON collection_runs (started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_collection_run_sources_status
+    ON collection_run_sources (run_id, status);
+
+CREATE TABLE IF NOT EXISTS topic_dossiers (
+    dossier_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    query TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'degraded', 'empty')),
+    degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+    dossier_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_topic_dossiers_created
+    ON topic_dossiers (created_at DESC, dossier_id DESC);
 """
 
 
@@ -379,6 +442,10 @@ class Database:
                     next_version = version + 1
                     if next_version == 1:
                         self._migrate_v1(connection)
+                    elif next_version == 2:
+                        self._migrate_v2(connection)
+                    elif next_version == 3:
+                        self._migrate_v3(connection)
                     else:  # pragma: no cover - guarded by DB_SCHEMA_VERSION
                         raise RuntimeError(f"missing_database_migration:{next_version}")
                     connection.execute(f"PRAGMA user_version = {next_version}")
@@ -390,6 +457,8 @@ class Database:
                     # version.  The existing ensure helpers are idempotent, so use
                     # them as a cheap repair pass without changing the version.
                     self._migrate_v1(connection)
+                    self._migrate_v2(connection)
+                    self._migrate_v3(connection)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -412,6 +481,80 @@ class Database:
         self._ensure_scheduled_result(connection)
         self._ensure_engagement_snapshots(connection)
         self._migrate_legacy_source_errors(connection)
+
+    @staticmethod
+    def _migrate_v2(connection: sqlite3.Connection) -> None:
+        """Add canonical source fields while preserving the legacy ``type`` alias."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sources)").fetchall()
+        }
+        if "source_type" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN source_type TEXT NOT NULL DEFAULT 'other' "
+                "CHECK (source_type IN ('official', 'media', 'community', 'developer', "
+                "'research', 'repository', 'other'))"
+            )
+        if "adapter_type" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN adapter_type TEXT NOT NULL DEFAULT 'rss' "
+                "CHECK (adapter_type IN ('rss', 'sitemap', 'html', 'reddit', 'github', "
+                "'api', 'account', 'x'))"
+            )
+        if "identity_verified" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (identity_verified IN (0, 1))"
+            )
+        if "content_filter" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN content_filter TEXT NOT NULL DEFAULT '' "
+                "CHECK (content_filter IN ('', 'ai'))"
+            )
+
+        # Rows created by the v1 schema have no canonical fields.  Keep the
+        # legacy type readable while filling the new columns deterministically.
+        connection.execute(
+            """
+            UPDATE sources
+            SET source_type = CASE type
+                WHEN 'sitemap' THEN 'official'
+                WHEN 'reddit' THEN 'community'
+                WHEN 'x' THEN 'developer'
+                ELSE 'other'
+            END,
+            adapter_type = CASE type
+                WHEN 'web' THEN 'html'
+                ELSE type
+            END
+            WHERE source_type = 'other' AND adapter_type = 'rss'
+            """
+        )
+
+    @staticmethod
+    def _migrate_v3(connection: sqlite3.Connection) -> None:
+        """Create the durable Topic Dossier store without touching sources."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_dossiers (
+                dossier_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                query TEXT NOT NULL,
+                event_ids_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('ok', 'degraded', 'empty')),
+                degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+                dossier_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_topic_dossiers_created
+            ON topic_dossiers (created_at DESC, dossier_id DESC)
+            """
+        )
 
     @staticmethod
     def _migrate_legacy_source_errors(connection: sqlite3.Connection) -> None:
@@ -452,7 +595,7 @@ class Database:
             CREATE TABLE sources_new (
                 source_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap')),
+                type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit', 'html', 'github', 'api', 'account')),
                 url_or_handle TEXT NOT NULL,
                 tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
                 topics_json TEXT NOT NULL,
@@ -482,7 +625,7 @@ class Database:
             CREATE TABLE sources_new (
                 source_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit')),
+                type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit', 'html', 'github', 'api', 'account')),
                 url_or_handle TEXT NOT NULL,
                 tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
                 topics_json TEXT NOT NULL,
@@ -932,21 +1075,27 @@ class Database:
 
     def upsert_source(self, source: Source) -> None:
         now = _utc_now()
+        source_type, adapter_type = canonical_source_types(
+            source.type, source.source_type, source.adapter_type
+        )
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO sources (
                     source_id, name, type, url_or_handle, tier, topics_json,
-                    enabled, fetch_interval_minutes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    enabled, fetch_interval_minutes, source_type, adapter_type,
+                    identity_verified, content_filter, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     name = excluded.name,
                     type = excluded.type,
                     url_or_handle = excluded.url_or_handle,
                     tier = excluded.tier,
                     topics_json = excluded.topics_json,
-                    enabled = excluded.enabled,
-                    fetch_interval_minutes = excluded.fetch_interval_minutes,
+                    source_type = excluded.source_type,
+                    adapter_type = excluded.adapter_type,
+                    identity_verified = excluded.identity_verified,
+                    content_filter = excluded.content_filter,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -958,10 +1107,402 @@ class Database:
                     json.dumps(source.topics, ensure_ascii=False),
                     int(source.enabled),
                     source.fetch_interval_minutes,
+                    source_type,
+                    adapter_type,
+                    int(source.identity_verified),
+                    source.content_filter,
                     now,
                     now,
                 ),
             )
+
+    def set_source_enabled(self, source_id: str, enabled: bool) -> None:
+        """Update the runtime registry state without rewriting source metadata."""
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            raise ValueError("source_id required")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be boolean")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE sources SET enabled = ?, updated_at = ? WHERE source_id = ?",
+                (int(enabled), _utc_now(), source_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(source_id)
+
+    def set_source_fetch_interval(self, source_id: str, minutes: int) -> None:
+        """Update a source interval in the authoritative runtime registry."""
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            raise ValueError("source_id required")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0:
+            raise ValueError("fetch interval must be a positive integer")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE sources SET fetch_interval_minutes = ?, updated_at = ? "
+                "WHERE source_id = ?",
+                (minutes, _utc_now(), source_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(source_id)
+
+    @staticmethod
+    def _collection_ids_json(values: Iterable[object]) -> str:
+        ids = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        return _json_envelope(_JSON_VERSIONS["collection_run_source_ids"], ids, list)
+
+    @staticmethod
+    def _collection_diagnostics_json(values: Iterable[object]) -> str:
+        diagnostics: list[dict[str, object]] = []
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            diagnostics.append(
+                normalize_diagnostic(
+                    value,
+                    str(value.get("source") or "collection"),
+                    str(value.get("stage") or "collect"),
+                )
+            )
+        return _json_envelope(
+            _JSON_VERSIONS["collection_run_diagnostics"], diagnostics, list
+        )
+
+    def start_collection_run(
+        self,
+        requested_sources: Iterable[object],
+        *,
+        started_at: str | None = None,
+    ) -> str:
+        """Create a durable collection run and one pending attempt per source."""
+        source_ids = list(
+            dict.fromkeys(
+                str(value).strip() for value in requested_sources if str(value).strip()
+            )
+        )
+        run_id = f"run-{uuid.uuid4().hex[:24]}"
+        started = started_at or _utc_now()
+        empty_ids = self._collection_ids_json(())
+        empty_diagnostics = self._collection_diagnostics_json(())
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO collection_runs (
+                    run_id, started_at, status, requested_sources_json,
+                    attempted_sources_json, successful_sources_json,
+                    failed_sources_json, diagnostics_json
+                ) VALUES (?, ?, 'RUNNING', ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    started,
+                    self._collection_ids_json(source_ids),
+                    empty_ids,
+                    empty_ids,
+                    empty_ids,
+                    empty_diagnostics,
+                ),
+            )
+            for source_id in source_ids:
+                connection.execute(
+                    """
+                    INSERT INTO collection_run_sources (
+                        run_id, source_id, status
+                    ) VALUES (?, ?, 'PENDING')
+                    """,
+                    (run_id, source_id),
+                )
+        return run_id
+
+    def record_collection_source_attempt(
+        self,
+        run_id: str,
+        source_id: str,
+        status: str,
+        *,
+        items_fetched: int = 0,
+        items_inserted: int = 0,
+        items_after_dedupe: int = 0,
+        diagnostic: object | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        allowed = {
+            "PENDING",
+            "RUNNING",
+            "SUCCESS",
+            "FAILED",
+            "SKIPPED_DISABLED",
+            "SKIPPED_NOT_DUE",
+        }
+        if status not in allowed:
+            raise ValueError(f"invalid collection source status: {status}")
+        values = (items_fetched, items_inserted, items_after_dedupe)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("collection item counts must be non-negative integers")
+        run_id = str(run_id or "").strip()
+        source_id = str(source_id or "").strip()
+        if not run_id or not source_id:
+            raise ValueError("run_id and source_id required")
+        diagnostic_json: str | None = None
+        if diagnostic is not None:
+            normalized = normalize_diagnostic(diagnostic, source_id, "collect")
+            diagnostic_json = _json_envelope(
+                _JSON_VERSIONS["collection_run_source_attempt_diagnostic"],
+                normalized,
+                dict,
+            )
+        now = _utc_now()
+        attempt_started = started_at or (now if status == "RUNNING" else None)
+        attempt_finished = finished_at or (
+            now if status in {"SUCCESS", "FAILED", "SKIPPED_DISABLED", "SKIPPED_NOT_DUE"} else None
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE collection_run_sources
+                SET status = ?, started_at = COALESCE(started_at, ?),
+                    finished_at = ?, items_fetched = ?, items_inserted = ?,
+                    items_after_dedupe = ?, diagnostic_json = ?
+                WHERE run_id = ? AND source_id = ?
+                """,
+                (
+                    status,
+                    attempt_started,
+                    attempt_finished,
+                    items_fetched,
+                    items_inserted,
+                    items_after_dedupe,
+                    diagnostic_json,
+                    run_id,
+                    source_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"{run_id}:{source_id}")
+
+    @staticmethod
+    def _collection_attempt_diagnostic(raw: object, source_id: str) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        if raw is None:
+            return None, None
+        decoded, issue = _decode_json_envelope(
+            raw,
+            field="collection_run_source_attempt_diagnostic",
+            expected_type=dict,
+            allow_none=True,
+        )
+        if issue is not None:
+            return None, issue
+        return (
+            normalize_diagnostic(decoded, source_id, "collect")
+            if isinstance(decoded, Mapping)
+            else None,
+            None,
+        )
+
+    def _collection_run_payload(self, row: Mapping[str, object]) -> dict[str, object]:
+        issues: list[dict[str, object]] = []
+        decoded_lists: dict[str, list[object]] = {}
+        for field in (
+            "requested_sources",
+            "attempted_sources",
+            "successful_sources",
+            "failed_sources",
+        ):
+            raw_field = f"{field}_json"
+            decoded, issue = _decode_json_envelope(
+                row.get(raw_field),
+                field="collection_run_source_ids",
+                expected_type=list,
+            )
+            decoded_lists[field] = list(decoded) if isinstance(decoded, list) else []
+            if issue is not None:
+                issues.append({**issue, "field": raw_field, "cause_code": f"{raw_field}_{issue['cause_code'].split('_', 2)[-1]}"})
+        diagnostics, issue = _decode_json_envelope(
+            row.get("diagnostics_json"),
+            field="collection_run_diagnostics",
+            expected_type=list,
+        )
+        if issue is not None:
+            issues.append(issue)
+        payload: dict[str, object] = {
+            "run_id": str(row["run_id"]),
+            "started_at": str(row["started_at"]),
+            "finished_at": str(row.get("finished_at") or ""),
+            "status": str(row["status"]),
+            **decoded_lists,
+            "items_fetched": int(row.get("items_fetched") or 0),
+            "items_inserted": int(row.get("items_inserted") or 0),
+            "items_after_dedupe": int(row.get("items_after_dedupe") or 0),
+            "clusters_created_or_updated": int(row.get("clusters_created_or_updated") or 0),
+            "degraded": bool(row.get("degraded")),
+            "diagnostics": list(diagnostics) if isinstance(diagnostics, list) else [],
+            "source_attempts": [],
+        }
+        if issues:
+            _attach_json_issues(payload, issues)
+        return payload
+
+    def get_collection_run(self, run_id: str) -> dict[str, object]:
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id required")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM collection_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            attempts = connection.execute(
+                """
+                SELECT source_id, status, started_at, finished_at, items_fetched,
+                       items_inserted, items_after_dedupe, diagnostic_json
+                FROM collection_run_sources
+                WHERE run_id = ? ORDER BY source_id
+                """,
+                (run_id,),
+            ).fetchall()
+        payload = self._collection_run_payload(dict(row))
+        attempt_issues: list[dict[str, object]] = []
+        source_attempts: list[dict[str, object]] = []
+        for attempt in attempts:
+            source_id = str(attempt["source_id"])
+            diagnostic, issue = self._collection_attempt_diagnostic(
+                attempt["diagnostic_json"], source_id
+            )
+            if issue is not None:
+                attempt_issues.append({**issue, "field": f"{source_id}.diagnostic"})
+            source_attempts.append(
+                {
+                    "source_id": source_id,
+                    "status": str(attempt["status"]),
+                    "started_at": str(attempt["started_at"] or ""),
+                    "finished_at": str(attempt["finished_at"] or ""),
+                    "items_fetched": int(attempt["items_fetched"] or 0),
+                    "items_inserted": int(attempt["items_inserted"] or 0),
+                    "items_after_dedupe": int(attempt["items_after_dedupe"] or 0),
+                    "diagnostic": diagnostic,
+                }
+            )
+        payload["source_attempts"] = source_attempts
+        if attempt_issues:
+            _attach_json_issues(payload, attempt_issues)
+        return payload
+
+    def list_collection_runs(self, limit: int = 20) -> list[dict[str, object]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM collection_runs ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self.get_collection_run(str(row["run_id"])) for row in rows]
+
+    def finish_collection_run(
+        self,
+        run_id: str,
+        *,
+        status: str = "DONE",
+        finished_at: str | None = None,
+        clusters_created_or_updated: int = 0,
+        diagnostics: Iterable[object] = (),
+    ) -> dict[str, object]:
+        if status not in {"DONE", "FAILED"}:
+            raise ValueError("collection run status must be DONE or FAILED")
+        if isinstance(clusters_created_or_updated, bool) or not isinstance(
+            clusters_created_or_updated, int
+        ) or clusters_created_or_updated < 0:
+            raise ValueError("clusters_created_or_updated must be non-negative integer")
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id required")
+        now = finished_at or _utc_now()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM collection_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            attempts = connection.execute(
+                """
+                SELECT source_id, status, items_fetched, items_inserted,
+                       items_after_dedupe, diagnostic_json
+                FROM collection_run_sources WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchall()
+            attempted = [
+                str(item["source_id"])
+                for item in attempts
+                if str(item["status"]) in {"RUNNING", "SUCCESS", "FAILED"}
+            ]
+            successful = [
+                str(item["source_id"])
+                for item in attempts
+                if str(item["status"]) == "SUCCESS"
+            ]
+            failed = [
+                str(item["source_id"])
+                for item in attempts
+                if str(item["status"]) == "FAILED"
+            ]
+            diagnostic_rows: list[dict[str, object]] = []
+            for item in attempts:
+                if item["diagnostic_json"] is None:
+                    continue
+                diagnostic, _issue = self._collection_attempt_diagnostic(
+                    item["diagnostic_json"], str(item["source_id"])
+                )
+                if diagnostic is not None:
+                    diagnostic_rows.append(diagnostic)
+            diagnostic_rows.extend(
+                value for value in diagnostics if isinstance(value, Mapping)
+            )
+            diagnostic_rows = [
+                normalize_diagnostic(value, str(value.get("source") or "collection"), "collect")
+                for value in diagnostic_rows
+            ]
+            # Stable de-duplication keeps repeated diagnostics from inflating UI counts.
+            unique_diagnostics: list[dict[str, object]] = []
+            seen_diagnostics: set[str] = set()
+            for diagnostic in diagnostic_rows:
+                key = json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)
+                if key not in seen_diagnostics:
+                    seen_diagnostics.add(key)
+                    unique_diagnostics.append(diagnostic)
+            items_fetched = sum(int(item["items_fetched"] or 0) for item in attempts)
+            items_inserted = sum(int(item["items_inserted"] or 0) for item in attempts)
+            items_after_dedupe = sum(
+                int(item["items_after_dedupe"] or 0) for item in attempts
+            )
+            degraded = bool(failed or unique_diagnostics)
+            connection.execute(
+                """
+                UPDATE collection_runs SET finished_at = ?, status = ?,
+                    attempted_sources_json = ?, successful_sources_json = ?,
+                    failed_sources_json = ?, items_fetched = ?, items_inserted = ?,
+                    items_after_dedupe = ?, clusters_created_or_updated = ?,
+                    degraded = ?, diagnostics_json = ?
+                WHERE run_id = ?
+                """,
+                (
+                    now,
+                    status,
+                    self._collection_ids_json(attempted),
+                    self._collection_ids_json(successful),
+                    self._collection_ids_json(failed),
+                    items_fetched,
+                    items_inserted,
+                    items_after_dedupe,
+                    clusters_created_or_updated,
+                    int(degraded),
+                    self._collection_diagnostics_json(unique_diagnostics),
+                    run_id,
+                ),
+            )
+        return self.get_collection_run(run_id)
 
     def get_source(self, source_id: str) -> dict[str, object]:
         with self.connect() as connection:
@@ -1259,6 +1800,151 @@ class Database:
         if row is None:
             raise KeyError(event_id)
         return dict(row)
+
+    @staticmethod
+    def _dossier_payload(dossier: object) -> dict[str, object]:
+        """Validate the JSON boundary without importing the research service."""
+        serializer = getattr(dossier, "to_dict", None)
+        payload = serializer() if callable(serializer) else dossier
+        if not isinstance(payload, Mapping):
+            raise TypeError("topic_dossier_must_be_object")
+        normalized = dict(payload)
+        if normalized.get("schema_version") != "topic-dossier-v1":
+            raise ValueError("topic_dossier_unknown_schema_version")
+        for field in ("dossier_id", "title", "query", "created_at"):
+            value = normalized.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"topic_dossier_{field}_required")
+        event_ids = normalized.get("event_ids")
+        if (
+            not isinstance(event_ids, list)
+            or not event_ids
+            or any(not isinstance(item, str) or not item.strip() for item in event_ids)
+        ):
+            raise ValueError("topic_dossier_event_ids_invalid")
+        status = normalized.get("status")
+        if status not in {"ok", "degraded", "empty"}:
+            raise ValueError("topic_dossier_status_invalid")
+        if not isinstance(normalized.get("degraded"), bool):
+            raise ValueError("topic_dossier_degraded_invalid")
+        diagnostics = normalized.get("diagnostics", ())
+        if not isinstance(diagnostics, (list, tuple)):
+            raise ValueError("topic_dossier_diagnostics_invalid")
+        normalized["diagnostics"] = [
+            normalize_diagnostic(item, "dossier_store", "dossier_persist")
+            for item in diagnostics
+        ]
+        evidence = normalized.get("evidence", ())
+        if not isinstance(evidence, (list, tuple)):
+            raise ValueError("topic_dossier_evidence_invalid")
+        safe_evidence: list[object] = []
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                raise ValueError("topic_dossier_evidence_item_invalid")
+            candidate = dict(item)
+            assessment = candidate.get("assessment")
+            if isinstance(assessment, Mapping):
+                assessment_copy = dict(assessment)
+                assessment_diagnostics = assessment_copy.get("diagnostics", ())
+                if not isinstance(assessment_diagnostics, (list, tuple)):
+                    raise ValueError("topic_dossier_assessment_diagnostics_invalid")
+                assessment_copy["diagnostics"] = [
+                    normalize_diagnostic(item, "dossier_store", "dossier_persist")
+                    for item in assessment_diagnostics
+                ]
+                candidate["assessment"] = assessment_copy
+            safe_evidence.append(candidate)
+        normalized["evidence"] = safe_evidence
+        return normalized
+
+    def save_dossier(self, dossier: object) -> None:
+        """Persist one Topic Dossier; evidence URLs never become sources."""
+        payload = self._dossier_payload(dossier)
+        event_ids = list(dict.fromkeys(str(item).strip() for item in payload["event_ids"]))
+        now = _utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO topic_dossiers (
+                    dossier_id, title, query, event_ids_json, status, degraded,
+                    dossier_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dossier_id) DO UPDATE SET
+                    title = excluded.title,
+                    query = excluded.query,
+                    event_ids_json = excluded.event_ids_json,
+                    status = excluded.status,
+                    degraded = excluded.degraded,
+                    dossier_json = excluded.dossier_json,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["dossier_id"],
+                    payload["title"],
+                    payload["query"],
+                    _json_envelope(
+                        _JSON_VERSIONS["topic_dossier_event_ids"], event_ids, list
+                    ),
+                    payload["status"],
+                    int(payload["degraded"]),
+                    _json_envelope(_JSON_VERSIONS["topic_dossier"], payload, dict),
+                    payload["created_at"],
+                    now,
+                ),
+            )
+
+    def get_dossier(self, dossier_id: str) -> dict[str, object] | None:
+        dossier_id = str(dossier_id or "").strip()
+        if not dossier_id:
+            raise ValueError("dossier_id_required")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT dossier_json FROM topic_dossiers WHERE dossier_id = ?",
+                (dossier_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload, issue = _decode_json_envelope(
+            row["dossier_json"],
+            field="topic_dossier",
+            expected_type=dict,
+        )
+        if issue or not isinstance(payload, dict):
+            raise ValueError(str(issue["cause_code"] if issue else "topic_dossier_invalid_json"))
+        return payload
+
+    def list_dossiers(self, limit: int = 20) -> list[dict[str, object]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("dossier_limit_invalid")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT dossier_json FROM topic_dossiers
+                ORDER BY created_at DESC, dossier_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            payload, issue = _decode_json_envelope(
+                row["dossier_json"], field="topic_dossier", expected_type=dict
+            )
+            if issue or not isinstance(payload, dict):
+                continue
+            result.append(payload)
+        return result
+
+    def delete_dossier(self, dossier_id: str) -> bool:
+        dossier_id = str(dossier_id or "").strip()
+        if not dossier_id:
+            raise ValueError("dossier_id_required")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM topic_dossiers WHERE dossier_id = ?", (dossier_id,)
+            )
+        return cursor.rowcount == 1
 
     def update_event_status(
         self, event_id: str, status: str, error_message: str | None = None
@@ -1566,8 +2252,10 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT source_id, name, type, tier, enabled, fetch_interval_minutes,
-                       last_fetched_at, last_error
+                SELECT source_id, name, type, source_type, adapter_type, tier,
+                       identity_verified, content_filter, enabled,
+                       fetch_interval_minutes, last_fetched_at, last_error,
+                       created_at, updated_at
                 FROM sources
                 ORDER BY name, source_id
                 """
