@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import os
 import re
 import socket
@@ -14,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Callable
+
+from .diagnostics import log_diagnostic, make_diagnostic
 
 XHS_TITLE = "本周值得关注的github ai项目前10"
 TRENDING_URL = "https://github.com/trending?since=weekly"
@@ -55,6 +58,7 @@ KIND_RULES = (
 )
 
 Getter = Callable[[str], object]
+LOGGER = logging.getLogger(__name__)
 
 
 def week_window_start(now: datetime | None = None) -> str:
@@ -464,11 +468,29 @@ def fetch_weekly_ai_repos(
     getter: Getter | None = None,
     now: datetime | None = None,
     limit: int = 10,
+    diagnostics: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     fetch = getter or default_github_get
     week_start = week_window_start(now)
     collected: list[dict[str, object]] = []
     seen: set[str] = set()
+
+    def degrade(stage: str, error: object = None, *, detail: object = None) -> None:
+        diagnostic = make_diagnostic(
+            "github",
+            stage,
+            error,
+            code="github_fetch_failed",
+            cause_code="invalid_response" if detail is not None else None,
+            detail=detail,
+        )
+        if diagnostics is not None:
+            diagnostics.append(diagnostic)
+        log_diagnostic(
+            LOGGER,
+            diagnostic,
+            error if isinstance(error, BaseException) else None,
+        )
 
     def _extend(batch: list[dict[str, object]]) -> None:
         for repo in batch:
@@ -480,21 +502,37 @@ def fetch_weekly_ai_repos(
 
     try:
         payload = fetch(_search_url(week_start, max(limit, 10)))
-    except RuntimeError:
+    except Exception as exc:
+        degrade("search", exc)
         payload = {"items": []}
     if isinstance(payload, dict):
-        _extend(parse_github_search(payload))
+        try:
+            if "items" not in payload:
+                raise ValueError("github_search_items_missing")
+            _extend(parse_github_search(payload))
+        except Exception as exc:
+            degrade("search", exc)
+    elif payload is not None:
+        degrade("search", detail="github_search_response_not_object")
 
     if len(collected) < limit:
         try:
             trending = fetch(TRENDING_URL)
-        except RuntimeError:
-            trending = ""
+        except Exception as exc:
+            degrade("trending", exc)
+            trending = None
         if isinstance(trending, str):
-            extras = parse_trending_html(trending)
-            for repo in extras:
-                repo["fresh"] = False
-            _extend(extras)
+            try:
+                if not trending.strip():
+                    raise ValueError("github_trending_response_empty")
+                extras = parse_trending_html(trending)
+                for repo in extras:
+                    repo["fresh"] = False
+                _extend(extras)
+            except Exception as exc:
+                degrade("trending", exc)
+        elif trending is not None:
+            degrade("trending", detail="github_trending_response_not_text")
 
     max_stars = max((int(repo["stars"]) for repo in collected), default=1) or 1
     ranked: list[dict[str, object]] = []

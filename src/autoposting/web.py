@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import traceback
+import uuid
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -10,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from .background import RELATED_SELECTION_LIMIT
 from .config import load_sources
 from .content import ContentWorkflow
+from .diagnostics import make_diagnostic, parse_diagnostic
 from .db import Database, model_endpoint_id
 from .llm import (
     LLM_EFFORT,
@@ -63,7 +67,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -86,10 +90,43 @@ MAX_PASTE_CHARS = 20000
 MAX_PASTE_REJECTS = 20
 
 
+def _json_default(value: object) -> object:
+    """Serialize the non-JSON values deliberately exposed by web payloads."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _looks_english(text: str) -> bool:
     cjk = sum("\u3400" <= char <= "\u9fff" for char in text)
     latin = sum(char.isascii() and char.isalpha() for char in text)
     return latin > cjk
+
+
+def _decorate_source_health(rows: object) -> list[dict[str, object]]:
+    decorated: list[dict[str, object]] = []
+    if not isinstance(rows, list):
+        return decorated
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        last_error = row.get("last_error")
+        diagnostic = parse_diagnostic(last_error)
+        if diagnostic is None and last_error:
+            diagnostic = make_diagnostic(
+                str(row.get("source_id") or "unknown"),
+                "collect",
+                code="legacy_source_error",
+                cause_code="legacy_error",
+                detail=last_error,
+            )
+        if diagnostic is not None:
+            row["diagnostic"] = diagnostic
+        decorated.append(row)
+    return decorated
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -1068,7 +1105,7 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v2.0.0 · 本地服务</span>
+  <span id="service-status">v3.0.0 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
   <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
@@ -5951,7 +5988,7 @@ class WebApp:
                 else {"model": "", "base_url": "", "configured": False, "enabled": False}
             ),
             "model_endpoints": self._model_endpoints(),
-            "sources": self.hotspots.source_health(),
+            "sources": _decorate_source_health(self.hotspots.source_health()),
             "platforms": {
                 "wechat": {"configured": self.wechat_config is not None},
                 "xiaohongshu": {
@@ -5975,6 +6012,7 @@ class WebApp:
         payload = self.hotspots.collect(
             hours, force=force, source_id=source_id, lane=lane
         )
+        payload["sources"] = _decorate_source_health(payload.get("sources"))
         self._remember_hotspot_payloads(payload)
         return {
             "ok": True,
@@ -5986,6 +6024,7 @@ class WebApp:
         self, hours: int, translate: bool = False, lane: str = "hotspots"
     ) -> dict[str, object]:
         payload = self.hotspots.list_window(hours, translate=translate, lane=lane)
+        payload["sources"] = _decorate_source_health(payload.get("sources"))
         self._remember_hotspot_payloads(payload)
         return {
             "ok": True,
@@ -6454,11 +6493,28 @@ class WebApp:
                 "images": [],
                 "visual": {},
                 "count": 0,
+                "degraded": False,
+                "degraded_reasons": [],
+                "result_status": "empty",
             }
-        return {"ok": True, "count": len(snapshot["repos"]), **snapshot}
+        degraded = bool(snapshot.get("degraded"))
+        return {
+            "ok": True,
+            "count": len(snapshot["repos"]),
+            "degraded": degraded,
+            "degraded_reasons": snapshot.get("degraded_reasons", []),
+            "result_status": (
+                "degraded" if degraded else ("ok" if snapshot["repos"] else "empty")
+            ),
+            **snapshot,
+        }
 
     def github_weekly_refresh(self) -> dict[str, object]:
-        repos = fetch_weekly_ai_repos(getter=self.github_fetcher)
+        diagnostics: list[dict[str, object]] = []
+        repos = fetch_weekly_ai_repos(
+            getter=self.github_fetcher,
+            diagnostics=diagnostics,
+        )
         model_used = ""
         if self._leaderboard_model_configured:
             repos = self.leaderboard_service.enrich_github_repos(repos)
@@ -6466,9 +6522,22 @@ class WebApp:
         title, body = build_xhs_copy(repos)
         images = build_weekly_render_plan(repos)
         saved = self.database.save_github_weekly(
-            week_window_start(), repos, title, body, model_used, images
+            week_window_start(),
+            repos,
+            title,
+            body,
+            model_used,
+            images,
+            diagnostics=diagnostics,
         )
-        return {"ok": True, "count": len(repos), **saved}
+        return {
+            "ok": True,
+            "count": len(repos),
+            "degraded": bool(diagnostics),
+            "degraded_reasons": diagnostics,
+            "result_status": "degraded" if diagnostics else ("empty" if not repos else "ok"),
+            **saved,
+        }
 
     def github_weekly_render(self, payload: object) -> dict[str, object]:
         snapshot = self.database.get_github_weekly()
@@ -6509,6 +6578,11 @@ class WebApp:
             str(snapshot.get("model_used") or ""),
             images,
             visual=visual,
+            diagnostics=(
+                list(snapshot.get("degraded_reasons") or [])
+                if isinstance(snapshot.get("degraded_reasons"), list)
+                else None
+            ),
         )
         return {"ok": True, "count": len(repos), **saved}
 
@@ -6601,7 +6675,8 @@ class WebApp:
         snapshot["article"] = restored
         if restored.get("title"):
             snapshot["title"] = restored["title"]
-        self.database.save_skill_finder(snapshot)
+        if not snapshot.get("degraded"):
+            self.database.save_skill_finder(snapshot)
         return snapshot
 
     def _skill_source_payload(self) -> dict[str, object]:
@@ -7176,6 +7251,11 @@ class WebApp:
             str(snapshot.get("model_used") or ""),
             updated,
             visual=visual if isinstance(visual, dict) else {},
+            diagnostics=(
+                list(snapshot.get("degraded_reasons") or [])
+                if isinstance(snapshot.get("degraded_reasons"), list)
+                else None
+            ),
         )
         return {"ok": True, **rendered[0], "count": len(saved["repos"])}
 
@@ -7451,17 +7531,25 @@ class WebApp:
     def list_schedule(self) -> dict[str, object]:
         jobs = []
         for job in self.database.list_scheduled_jobs():
-            jobs.append(
-                {
-                    "job_id": job["job_id"],
-                    "draft_id": job["draft_id"],
-                    "platform": job["platform"],
-                    "live": bool(job["live"]),
-                    "run_at": job["run_at"],
-                    "status": job["status"],
-                    "error_message": job["error_message"],
-                }
-            )
+            item = {
+                "job_id": job["job_id"],
+                "draft_id": job["draft_id"],
+                "platform": job["platform"],
+                "live": bool(job["live"]),
+                "run_at": job["run_at"],
+                "status": job["status"],
+                "error_message": job["error_message"],
+                "result": job.get("result"),
+            }
+            if job.get("degraded"):
+                item.update(
+                    {
+                        "degraded": True,
+                        "degraded_reasons": job.get("degraded_reasons", []),
+                        "cause_code": job.get("cause_code"),
+                    }
+                )
+            jobs.append(item)
         return {"ok": True, "jobs": jobs}
 
     def cancel_schedule(self, payload: object) -> dict[str, object]:
@@ -7474,12 +7562,73 @@ class WebApp:
 def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
     class ApiHandler(BaseHTTPRequestHandler):
         def _send_json(self, code: int, payload: object) -> None:
-            body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _request_id(self) -> str:
+            request_id = getattr(self, "_autoposting_request_id", "")
+            if not request_id:
+                request_id = uuid.uuid4().hex
+                self._autoposting_request_id = request_id
+            return request_id
+
+        def _request_route(self) -> str:
+            try:
+                route = urlsplit(self.path).path or "/"
+            except ValueError:
+                route = "/<invalid>"
+            return route
+
+        def _not_found_payload(self, exc: KeyError) -> dict[str, object]:
+            detail = str(exc)
+            if exc.args and exc.args[0] == self.path:
+                try:
+                    if urlsplit(self.path).query:
+                        detail = str(KeyError(self._request_route()))
+                except ValueError:
+                    detail = str(KeyError("/<invalid>"))
+            return {"ok": False, "error": f"not_found:{detail}", "error_type": "KeyError"}
+
+        def _send_internal_error(self, exc: BaseException) -> None:
+            request_id = self._request_id()
+            method = str(getattr(self, "command", "") or "")
+            route = self._request_route()
+            stack = "".join(traceback.format_tb(exc.__traceback__)).strip()
+            safe_traceback = (
+                "Traceback (most recent call last):\n" + stack
+                if stack
+                else "Traceback unavailable"
+            )
+            logging.getLogger(__name__).error(
+                "unhandled HTTP exception method=%s route=%s request_id=%s "
+                "exception_type=%s traceback=%s",
+                method,
+                route,
+                request_id,
+                type(exc).__name__,
+                safe_traceback,
+                extra={
+                    "method": method,
+                    "route": route,
+                    "request_id": request_id,
+                    "exception_type": type(exc).__name__,
+                    "traceback": safe_traceback,
+                },
+            )
+            self._send_json(
+                500,
+                {
+                    "ok": False,
+                    "error": "internal_error",
+                    "error_code": "internal_error",
+                    "error_type": "InternalServerError",
+                    "request_id": request_id,
+                },
+            )
 
         def _read_json_body(self) -> object:
             length = int(self.headers.get("Content-Length") or 0)
@@ -7503,6 +7652,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
             return payload[field]
 
         def do_GET(self) -> None:
+            self._request_id()
             try:
                 if urlsplit(self.path).path == "/":
                     body = INDEX_HTML.encode("utf-8")
@@ -7579,13 +7729,14 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     return
                 raise KeyError(self.path)
             except KeyError as exc:
-                self._send_json(404, {"ok": False, "error": f"not_found:{exc}", "error_type": "KeyError"})
+                self._send_json(404, self._not_found_payload(exc))
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc), "error_type": "ValueError"})
             except Exception as exc:
-                self._send_json(500, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+                self._send_internal_error(exc)
 
         def do_POST(self) -> None:
+            self._request_id()
             try:
                 if self.headers.get_content_type() != "application/json":
                     raise ValueError("content_type_must_be_application_json")
@@ -7755,7 +7906,7 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     raise KeyError(self.path)
                 self._send_json(200, result)
             except KeyError as exc:
-                self._send_json(404, {"ok": False, "error": f"not_found:{exc}", "error_type": "KeyError"})
+                self._send_json(404, self._not_found_payload(exc))
             except (ValueError, PublicationError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
             except LLMError as exc:
@@ -7771,9 +7922,10 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     },
                 )
             except Exception as exc:
-                self._send_json(500, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+                self._send_internal_error(exc)
 
         def do_DELETE(self) -> None:
+            self._request_id()
             try:
                 if self.headers.get_content_type() != "application/json":
                     raise ValueError("content_type_must_be_application_json")
@@ -7807,14 +7959,23 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                     raise KeyError(self.path)
                 self._send_json(200, result)
             except KeyError as exc:
-                self._send_json(404, {"ok": False, "error": f"not_found:{exc}", "error_type": "KeyError"})
+                self._send_json(404, self._not_found_payload(exc))
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc), "error_type": "ValueError"})
             except Exception as exc:
-                self._send_json(500, {"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+                self._send_internal_error(exc)
 
         def log_message(self, format: str, *args: object) -> None:
-            pass
+            status = args[1] if len(args) > 1 else ""
+            size = args[2] if len(args) > 2 else ""
+            logging.getLogger(__name__).info(
+                "http request method=%s route=%s request_id=%s status=%s bytes=%s",
+                str(getattr(self, "command", "") or ""),
+                self._request_route(),
+                self._request_id(),
+                status,
+                size,
+            )
 
     return ApiHandler
 

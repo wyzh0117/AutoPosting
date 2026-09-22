@@ -1279,13 +1279,45 @@ class WeChatPublisher:
         )
         try:
             with (self.opener or urllib.request.urlopen)(request) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (OSError, urllib.error.URLError) as exc:
-            raise PublicationError("wechat_api_unavailable") from exc
-        errcode = payload.get("errcode", 0)
+                raw = response.read()
+        except Exception:
+            raise PublicationError("wechat_api_unavailable") from None
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = bytes(raw).decode("utf-8")
+            except UnicodeDecodeError:
+                raise PublicationError("wechat_api_invalid_json") from None
+        if not isinstance(raw, str):
+            raise PublicationError("wechat_api_invalid_response")
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            raise PublicationError("wechat_api_invalid_json") from None
+        if not isinstance(payload, dict):
+            raise PublicationError("wechat_api_invalid_response")
+        raw_errcode = payload.get("errcode")
+        if raw_errcode is None:
+            return payload
+        if isinstance(raw_errcode, bool):
+            raise PublicationError("wechat_api_invalid_response")
+        try:
+            errcode = int(raw_errcode)
+        except (TypeError, ValueError):
+            raise PublicationError("wechat_api_invalid_response") from None
+        if str(raw_errcode).strip() != str(errcode):
+            raise PublicationError("wechat_api_invalid_response")
         if errcode:
             raise PublicationError(WECHAT_ERRCODES.get(errcode, f"wechat_api_error:{errcode}"))
         return payload
+
+    @staticmethod
+    def _required_response_string(
+        payload: dict[str, object], field: str, error_code: str
+    ) -> str:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PublicationError(error_code)
+        return value.strip()
 
     def _asset_bundle(self, draft: dict[str, object]) -> dict[str, object]:
         raw = draft.get("assets")
@@ -1329,10 +1361,7 @@ class WeChatPublisher:
             f"?access_token={access_token}&type=image",
             header + image_bytes + footer,
         )
-        media_id = payload.get("media_id")
-        if not isinstance(media_id, str) or not media_id:
-            raise PublicationError("wechat_thumb_upload_failed")
-        return media_id
+        return self._required_response_string(payload, "media_id", "wechat_thumb_upload_failed")
 
     def _upload_image(self, access_token: str, image_bytes: bytes, filename: str) -> str:
         boundary = "----AutoPostingBoundary"
@@ -1348,10 +1377,7 @@ class WeChatPublisher:
             f"?access_token={access_token}",
             header + image_bytes + footer,
         )
-        url = payload.get("url")
-        if not isinstance(url, str) or not url:
-            raise PublicationError("wechat_image_upload_failed")
-        return url
+        return self._required_response_string(payload, "url", "wechat_image_upload_failed")
 
     def _filled_content(self, draft: dict[str, object], access_token: str) -> str:
         body = strip_image_credits(str(draft["body"]))
@@ -1425,7 +1451,9 @@ class WeChatPublisher:
                 }
             ),
         )
-        access_token = str(token["access_token"])
+        access_token = self._required_response_string(
+            token, "access_token", "wechat_access_token_missing"
+        )
         content = self._filled_content(draft, access_token)
         thumb_media_id = self._resolve_thumb_media_id(draft, access_token)
         if not thumb_media_id:
@@ -1446,7 +1474,9 @@ class WeChatPublisher:
             f"?access_token={access_token}",
             json.dumps({"articles": [article]}, ensure_ascii=False),
         )
-        media_id = str(draft_result["media_id"])
+        media_id = self._required_response_string(
+            draft_result, "media_id", "wechat_draft_media_id_missing"
+        )
         return {
             "status": "DRAFT_SAVED",
             "reference": media_id,

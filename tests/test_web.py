@@ -362,7 +362,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("2.0.0", payload["version"])
+        self.assertEqual("3.0.0", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -378,6 +378,24 @@ class WebApiTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertIn("text/html", response.headers["Content-Type"])
         self.assertIn("autoposting", html.lower())
+
+    def test_status_source_health_exposes_redacted_diagnostic(self) -> None:
+        secret = "token=ghp_do_not_leak https://private.example/feed SELECT * FROM secrets"
+        self.db.record_fetch_result("lab_blog", secret)
+
+        status, payload = self._request("GET", "/api/status")
+        self.assertEqual(200, status)
+        source = next(item for item in payload["sources"] if item["source_id"] == "lab_blog")
+        diagnostic = source["diagnostic"]
+        self.assertEqual("source_fetch_failed", diagnostic["code"])
+        self.assertEqual("unknown_error", diagnostic["cause_code"])
+        self.assertTrue(diagnostic["degraded"])
+        self.assertEqual("lab_blog", diagnostic["source"])
+        self.assertEqual("collect", diagnostic["stage"])
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("ghp_do_not_leak", rendered)
+        self.assertNotIn("https://private.example/feed", rendered)
+        self.assertNotIn("SELECT * FROM secrets", rendered)
 
     def test_collect_forces_collection_and_returns_candidates(self) -> None:
         status, payload = self._request("POST", "/api/collect", {"hours": 24})
@@ -1868,6 +1886,69 @@ class WebApiTests(unittest.TestCase):
         self.assertIn(b" 400 ", status_line)
         self.assertEqual("request_body_too_large", json.loads(body)["error"])
 
+    def test_unknown_http_errors_are_sanitized_and_logged(self) -> None:
+        cases = (
+            ("GET", "/api/status", None, "status"),
+            ("POST", "/api/collect", {}, "collect"),
+            ("DELETE", "/api/favorites", {"item_id": "item-1"}, "delete_favorite"),
+        )
+        for method, path, payload, method_name in cases:
+            secret = "token=super-secret https://private.example/sql?key=hidden"
+            with self.subTest(method=method), patch.object(
+                self.app,
+                method_name,
+                side_effect=RuntimeError(secret),
+            ), self.assertLogs("autoposting.web", level="ERROR") as captured:
+                status, response = self._request(method, path, payload)
+
+            self.assertEqual(500, status)
+            self.assertFalse(response["ok"])
+            self.assertEqual("internal_error", response["error"])
+            self.assertEqual("internal_error", response["error_code"])
+            self.assertEqual("InternalServerError", response["error_type"])
+            request_id = response.get("request_id")
+            self.assertIsInstance(request_id, str)
+            self.assertTrue(request_id)
+
+            log_output = "\n".join(captured.output)
+            self.assertIn(method, log_output)
+            self.assertIn(path, log_output)
+            self.assertIn(request_id, log_output)
+            self.assertIn("RuntimeError", log_output)
+            self.assertIn("Traceback", log_output)
+            self.assertNotIn(secret, log_output)
+            self.assertNotIn("super-secret", log_output)
+            self.assertNotIn("private.example", log_output)
+
+    def test_web_json_serializes_known_non_basic_values(self) -> None:
+        when = datetime(2026, 9, 19, 12, 34, 56, tzinfo=timezone.utc)
+        with patch.object(
+            self.app,
+            "status",
+            return_value={
+                "ok": True,
+                "path": self.root / "snapshot.json",
+                "day": when.date(),
+                "when": when,
+            },
+        ):
+            status, payload = self._request("GET", "/api/status")
+
+        self.assertEqual(200, status)
+        self.assertEqual(str(self.root / "snapshot.json"), payload["path"])
+        self.assertEqual(when.date().isoformat(), payload["day"])
+        self.assertEqual(when.isoformat(), payload["when"])
+
+    def test_unknown_web_json_value_becomes_sanitized_500(self) -> None:
+        with patch.object(self.app, "status", return_value={"ok": True, "value": object()}):
+            with self.assertLogs("autoposting.web", level="ERROR") as captured:
+                status, payload = self._request("GET", "/api/status")
+
+        self.assertEqual(500, status)
+        self.assertEqual("internal_error", payload["error"])
+        self.assertTrue(payload["request_id"])
+        self.assertIn("TypeError", "\n".join(captured.output))
+
     def test_post_rejects_non_json_and_cross_origin_requests(self) -> None:
         request = urllib.request.Request(
             self.base_url + "/api/config",
@@ -2239,7 +2320,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("2.0.0", html)
+        self.assertIn("3.0.0", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)

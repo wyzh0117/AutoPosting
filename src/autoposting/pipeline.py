@@ -3,7 +3,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import logging
 
+from .diagnostics import (
+    log_diagnostic,
+    make_diagnostic,
+    parse_diagnostic,
+)
 from .db import Database
 from .ingestion import (
     AggregateCollector,
@@ -23,7 +29,11 @@ class CollectionBatchResult:
     failed: int = 0
     skipped_disabled: int = 0
     skipped_not_due: int = 0
-    errors: dict[str, str] = field(default_factory=dict)
+    errors: dict[str, dict[str, object]] = field(default_factory=dict)
+    diagnostics: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _is_due(last_fetched_at: object, interval_minutes: int, now: datetime) -> bool:
@@ -49,7 +59,8 @@ def collect_sources(
 ) -> CollectionBatchResult:
     current_time = now or datetime.now(timezone.utc)
     inserted = duplicates = failed = skipped_disabled = skipped_not_due = 0
-    errors: dict[str, str] = {}
+    errors: dict[str, dict[str, object]] = {}
+    diagnostics: dict[str, dict[str, object]] = {}
     due: list[Source] = []
     selected = tuple(sources)
     if only_source_ids is not None:
@@ -72,14 +83,30 @@ def collect_sources(
             continue
         if source.type == "x" and not x_bearer_token and fetcher is None:
             message = "x_bearer_token_required"
-            database.record_fetch_result(source.source_id, message)
-            errors[source.source_id] = message
+            diagnostic = make_diagnostic(
+                source.source_id,
+                "collect",
+                code="source_fetch_failed",
+                cause_code="credential_required",
+                detail=message,
+            )
+            database.record_fetch_result(source.source_id, diagnostic)
+            errors[source.source_id] = diagnostic
+            diagnostics[source.source_id] = diagnostic
             failed += 1
             continue
         if source.type not in {"rss", "web", "x", "sitemap", "reddit"}:
             message = f"collector_not_implemented_for_{source.type}"
-            database.record_fetch_result(source.source_id, message)
-            errors[source.source_id] = message
+            diagnostic = make_diagnostic(
+                source.source_id,
+                "collect",
+                code="source_fetch_failed",
+                cause_code="unsupported_source",
+                detail=message,
+            )
+            database.record_fetch_result(source.source_id, diagnostic)
+            errors[source.source_id] = diagnostic
+            diagnostics[source.source_id] = diagnostic
             failed += 1
             continue
         due.append(source)
@@ -108,7 +135,11 @@ def collect_sources(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for source_id, outcome in pool.map(_run, due):
                 if isinstance(outcome, Exception):
-                    errors[source_id] = str(outcome)
+                    diagnostic = make_diagnostic(source_id, "collect", outcome)
+                    database.record_fetch_result(source_id, diagnostic)
+                    diagnostics[source_id] = diagnostic
+                    errors[source_id] = diagnostic
+                    log_diagnostic(LOGGER, diagnostic, outcome)
                     failed += 1
                     continue
                 inserted += outcome.inserted
@@ -116,8 +147,15 @@ def collect_sources(
                 failed += outcome.failed
                 if outcome.failed:
                     stored = database.get_source(source_id)
-                    message = str(stored.get("last_error") or "source_failed")
-                    errors[source_id] = message
+                    diagnostic = parse_diagnostic(stored.get("last_error")) or make_diagnostic(
+                        source_id,
+                        "collect",
+                        code="source_fetch_failed",
+                        cause_code="collector_reported_failure",
+                        detail="source_failed",
+                    )
+                    diagnostics[source_id] = diagnostic
+                    errors[source_id] = diagnostic
 
     return CollectionBatchResult(
         inserted=inserted,
@@ -126,4 +164,5 @@ def collect_sources(
         skipped_disabled=skipped_disabled,
         skipped_not_due=skipped_not_due,
         errors=errors,
+        diagnostics=diagnostics,
     )

@@ -665,3 +665,46 @@ class GitHubHttpLayerTests(unittest.TestCase):
             getter=getter, now=datetime(2026, 8, 29, tzinfo=timezone.utc), limit=3
         )
         self.assertEqual([], repos)
+
+    def test_fetch_weekly_diagnostics_redact_failures_and_keep_empty_distinct(self) -> None:
+        secret = "token=ghp_do_not_leak path=/Users/youngi/private SELECT * FROM secrets"
+        diagnostics: list[dict[str, object]] = []
+
+        def failing_getter(_url: str) -> object:
+            raise ValueError(secret)
+
+        with self.assertLogs("autoposting.github_weekly", level="ERROR") as captured:
+            repos = fetch_weekly_ai_repos(
+                getter=failing_getter,
+                now=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                limit=3,
+                diagnostics=diagnostics,
+            )
+        self.assertEqual([], repos)
+        self.assertEqual(2, len(diagnostics))
+        for diagnostic in diagnostics:
+            self.assertEqual("github_fetch_failed", diagnostic["code"])
+            self.assertEqual("invalid_response", diagnostic["cause_code"])
+            self.assertTrue(diagnostic["degraded"])
+            self.assertEqual("github", diagnostic["source"])
+            self.assertIn(diagnostic["stage"], {"search", "trending"})
+        rendered = json.dumps(diagnostics, ensure_ascii=False) + "\n".join(captured.output)
+        self.assertNotIn("ghp_do_not_leak", rendered)
+        self.assertNotIn("/Users/youngi", rendered)
+        self.assertNotIn("SELECT * FROM secrets", rendered)
+
+        empty_diagnostics: list[dict[str, object]] = []
+
+        def empty_getter(url: str) -> object:
+            return {"items": []} if "api.github.com" in url else "<html></html>"
+
+        self.assertEqual(
+            [],
+            fetch_weekly_ai_repos(
+                getter=empty_getter,
+                now=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                limit=3,
+                diagnostics=empty_diagnostics,
+            ),
+        )
+        self.assertEqual([], empty_diagnostics)

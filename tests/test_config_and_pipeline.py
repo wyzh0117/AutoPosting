@@ -210,7 +210,10 @@ class ConfigAndPipelineTests(unittest.TestCase):
 
             self.assertEqual(1, first.inserted)
             self.assertEqual(1, first.failed)
-            self.assertIn("simulated feed outage", first.errors["broken"])
+            self.assertEqual("source_fetch_failed", first.errors["broken"]["code"])
+            self.assertEqual("unreachable", first.errors["broken"]["cause_code"])
+            self.assertIn("simulated feed outage", first.errors["broken"]["detail"])
+            self.assertTrue(first.errors["broken"]["degraded"])
             self.assertEqual(2, second.skipped_not_due)
             self.assertIn("simulated feed outage", db.get_source("broken")["last_error"])
 
@@ -254,7 +257,8 @@ class ConfigAndPipelineTests(unittest.TestCase):
             source = Source("x_watch", "X watch", "x", "@sama", "S4", ("models",), True, 15)
             result = collect_sources(db, (source,), force=True)
             self.assertEqual(1, result.failed)
-            self.assertEqual("x_bearer_token_required", result.errors["x_watch"])
+            self.assertEqual("credential_required", result.errors["x_watch"]["cause_code"])
+            self.assertEqual("x_bearer_token_required", result.errors["x_watch"]["detail"])
             self.assertIn("x_bearer_token_required", str(db.get_source("x_watch")["last_error"]))
 
     def test_existing_database_gains_sitemap_source_type(self) -> None:

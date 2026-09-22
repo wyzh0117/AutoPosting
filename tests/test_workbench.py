@@ -1001,6 +1001,20 @@ class WechatStubHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _WechatResponse:
+    def __init__(self, body: bytes | str) -> None:
+        self.body = body
+
+    def __enter__(self) -> "_WechatResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes | str:
+        return self.body
+
+
 class WeChatPublisherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1090,6 +1104,73 @@ class WeChatPublisherTests(unittest.TestCase):
 
         self.assertEqual("wechat_api_unavailable", str(raised.exception))
         self.assertNotIn("s3cr3t-value", str(raised.exception))
+
+    def test_invalid_json_and_non_object_responses_raise_stable_errors(self) -> None:
+        for response_body, expected in (
+            (b"{", "wechat_api_invalid_json"),
+            (b"[]", "wechat_api_invalid_response"),
+            (b'"ok"', "wechat_api_invalid_response"),
+        ):
+            with self.subTest(response_body=response_body):
+                publisher = WeChatPublisher(
+                    "wx_app_id",
+                    "s3cr3t-value",
+                    "thumb-1",
+                    opener=lambda _request, body=response_body: _WechatResponse(body),
+                )
+                with self.assertRaisesRegex(PublicationError, expected):
+                    publisher._api("GET", "/cgi-bin/token")
+
+    def test_generic_network_error_is_stable_and_secret_free(self) -> None:
+        def failing_opener(_request):
+            raise RuntimeError("https://wx.example/cgi-bin/token?secret=s3cr3t-value")
+
+        publisher = WeChatPublisher(
+            "wx_app_id", "s3cr3t-value", "thumb-1", opener=failing_opener
+        )
+
+        with self.assertRaisesRegex(PublicationError, "wechat_api_unavailable") as raised:
+            publisher._api("GET", "/cgi-bin/token")
+
+        self.assertNotIn("s3cr3t-value", str(raised.exception))
+        self.assertNotIn("wx.example", str(raised.exception))
+
+    def test_missing_required_response_fields_raise_stable_errors(self) -> None:
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            opener=lambda _request: _WechatResponse(b"{}"),
+        )
+        with self.assertRaisesRegex(PublicationError, "wechat_access_token_missing"):
+            publisher.publish(self._draft())
+
+        responses = iter((b'{"access_token":"stub-token"}', b"{}"))
+
+        def sequence_opener(_request):
+            return _WechatResponse(next(responses))
+
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            opener=sequence_opener,
+            poster_renderer=lambda _title: b"",
+        )
+        with self.assertRaisesRegex(PublicationError, "wechat_draft_media_id_missing"):
+            publisher.publish(self._draft())
+
+    def test_missing_upload_fields_keep_stable_errors(self) -> None:
+        publisher = WeChatPublisher(
+            "wx_app_id",
+            "s3cr3t-value",
+            "thumb-1",
+            opener=lambda _request: _WechatResponse(b"{}"),
+        )
+        with self.assertRaisesRegex(PublicationError, "wechat_thumb_upload_failed"):
+            publisher._upload_permanent_image("stub-token", b"image", "cover.png")
+        with self.assertRaisesRegex(PublicationError, "wechat_image_upload_failed"):
+            publisher._upload_image("stub-token", b"image", "body.png")
 
     def _asset_draft(
         self,

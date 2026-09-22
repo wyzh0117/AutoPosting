@@ -13,8 +13,112 @@ from .engagement import (
     engagement_from_raw,
     engagement_kind,
 )
+from .diagnostics import (
+    normalize_diagnostic,
+    parse_diagnostic,
+    sanitize_detail,
+    serialize_diagnostic,
+)
 from .models import FeedItem, Source
 from .normalize import content_hash
+
+
+DB_SCHEMA_VERSION = 1
+_JSON_VERSIONS = {
+    "github_weekly_repos": "github-weekly-repos-v1",
+    "github_weekly_images": "github-weekly-images-v1",
+    "github_weekly_visual": "github-weekly-visual-v1",
+    "github_weekly_diagnostics": "github-weekly-diagnostics-v1",
+    "skill_finder_snapshot": "skill-finder-snapshot-v1",
+    "favorite_payload": "favorite-payload-v1",
+    "scheduled_result": "scheduled-result-v1",
+}
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non_finite_json:{value}")
+
+
+def _json_envelope(version: str, data: object, expected_type: type | tuple[type, ...]) -> str:
+    if not isinstance(data, expected_type):
+        raise TypeError(f"{version}_data_type")
+    return json.dumps(
+        {"schema_version": version, "data": data},
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _json_issue(field: str, reason: str) -> dict[str, object]:
+    cause_code = f"{field}_{reason}"
+    return {
+        "field": field,
+        "cause_code": cause_code,
+        "detail": reason,
+        "raw_preserved": True,
+    }
+
+
+def _decode_json_envelope(
+    raw: object,
+    *,
+    field: str,
+    expected_type: type | tuple[type, ...],
+    allow_none: bool = False,
+) -> tuple[object, dict[str, object] | None]:
+    fallback: object = None if allow_none else ({} if expected_type is dict else [])
+    if raw is None and allow_none:
+        return None, None
+    try:
+        parsed = json.loads(str(raw), parse_constant=_reject_json_constant)
+    except (TypeError, ValueError):
+        return fallback, _json_issue(field, "invalid_json")
+    if allow_none and parsed is None:
+        return None, None
+    if isinstance(parsed, dict) and "schema_version" in parsed:
+        if parsed.get("schema_version") != _JSON_VERSIONS[field]:
+            return fallback, _json_issue(field, "unknown_schema_version")
+        if "data" not in parsed:
+            return fallback, _json_issue(field, "missing_data")
+        parsed = parsed["data"]
+        if allow_none and parsed is None:
+            return None, None
+        if not isinstance(parsed, expected_type):
+            return fallback, _json_issue(field, "wrong_data_type")
+        return parsed, None
+    if not isinstance(parsed, expected_type):
+        return fallback, _json_issue(field, "wrong_top_level")
+    return parsed, None
+
+
+def _attach_json_issues(payload: dict[str, object], issues: list[dict[str, object]]) -> dict[str, object]:
+    if not issues:
+        return payload
+    reasons = [str(issue["cause_code"]) for issue in issues]
+    payload["degraded"] = True
+    payload["degraded_reasons"] = reasons
+    payload["cause_code"] = reasons[0]
+    payload["degraded_details"] = issues
+    return payload
+
+
+def _legacy_source_error(value: object) -> str:
+    return f"legacy_source_error:{sanitize_detail(value)}"
+
+
+def _schema_statements(script: str) -> Iterable[str]:
+    """Yield complete schema statements without executescript's implicit COMMIT."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        text = statement.strip()
+        if text:
+            yield text
+        statement = ""
+    if statement.strip():
+        raise RuntimeError("incomplete_schema_statement")
 
 
 SCHEMA = """
@@ -188,7 +292,8 @@ CREATE TABLE IF NOT EXISTS github_weekly (
     xhs_body TEXT NOT NULL,
     model_used TEXT NOT NULL,
     images_json TEXT NOT NULL DEFAULT '[]',
-    visual_json TEXT NOT NULL DEFAULT '{}'
+    visual_json TEXT NOT NULL DEFAULT '{}',
+    diagnostics_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS skill_finder (
@@ -257,17 +362,82 @@ class Database:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.executescript(SCHEMA)
-            self._ensure_sitemap_source_type(connection)
-            self._ensure_reddit_source_type(connection)
-            self._ensure_translation_model_purpose(connection)
-            self._ensure_leaderboard_model_purpose(connection)
-            self._ensure_image_model_purpose(connection)
-            self._ensure_github_weekly_images(connection)
-            self._ensure_github_weekly_visual(connection)
-            self._ensure_skill_finder(connection)
-            self._ensure_hotspot_favorites(connection)
-            self._ensure_engagement_snapshots(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > DB_SCHEMA_VERSION:
+                raise RuntimeError(f"unsupported_database_schema_version:{version}")
+            connection.execute("PRAGMA foreign_keys = OFF")
+            try:
+                connection.execute("BEGIN")
+                for statement in _schema_statements(SCHEMA):
+                    # The schema's PRAGMA would be a no-op inside this transaction;
+                    # foreign keys are restored after the schema and migration commit.
+                    if statement.rstrip(";").strip().upper() == "PRAGMA FOREIGN_KEYS = ON":
+                        continue
+                    connection.execute(statement)
+                migrated = False
+                while version < DB_SCHEMA_VERSION:
+                    next_version = version + 1
+                    if next_version == 1:
+                        self._migrate_v1(connection)
+                    else:  # pragma: no cover - guarded by DB_SCHEMA_VERSION
+                        raise RuntimeError(f"missing_database_migration:{next_version}")
+                    connection.execute(f"PRAGMA user_version = {next_version}")
+                    version = next_version
+                    migrated = True
+                if version == DB_SCHEMA_VERSION and not migrated:
+                    # user_version records completed migrations, but cannot detect
+                    # a partially restored/edited table with an already-current
+                    # version.  The existing ensure helpers are idempotent, so use
+                    # them as a cheap repair pass without changing the version.
+                    self._migrate_v1(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_v1(self, connection: sqlite3.Connection) -> None:
+        """Apply the first idempotent migration and record it only on commit."""
+        self._ensure_sitemap_source_type(connection)
+        self._ensure_reddit_source_type(connection)
+        self._ensure_translation_model_purpose(connection)
+        self._ensure_leaderboard_model_purpose(connection)
+        self._ensure_image_model_purpose(connection)
+        self._ensure_github_weekly_images(connection)
+        self._ensure_github_weekly_visual(connection)
+        self._ensure_github_weekly_diagnostics(connection)
+        self._ensure_skill_finder(connection)
+        self._ensure_hotspot_favorites(connection)
+        self._ensure_scheduled_result(connection)
+        self._ensure_engagement_snapshots(connection)
+        self._migrate_legacy_source_errors(connection)
+
+    @staticmethod
+    def _migrate_legacy_source_errors(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT source_id, last_error FROM sources "
+            "WHERE last_error IS NOT NULL AND TRIM(last_error) <> ''"
+        ).fetchall()
+        for row in rows:
+            current = str(row["last_error"])
+            if current == "legacy_source_error":
+                continue
+            if current.startswith("legacy_source_error:"):
+                normalized = _legacy_source_error(current.split(":", 1)[1])
+            elif current.startswith("code="):
+                parsed = parse_diagnostic(current)
+                normalized = (
+                    serialize_diagnostic(parsed)
+                    if parsed is not None
+                    else _legacy_source_error(current)
+                )
+            else:
+                normalized = _legacy_source_error(current)
+            connection.execute(
+                "UPDATE sources SET last_error = ? WHERE source_id = ?",
+                (normalized, str(row["source_id"])),
+            )
 
     @staticmethod
     def _ensure_sitemap_source_type(connection: sqlite3.Connection) -> None:
@@ -277,8 +447,7 @@ class Database:
         sql = str(row["sql"] if row is not None else "")
         if "sitemap" in sql:
             return
-        connection.execute("PRAGMA foreign_keys = OFF")
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE sources_new (
                 source_id TEXT PRIMARY KEY,
@@ -293,13 +462,12 @@ class Database:
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            INSERT INTO sources_new SELECT * FROM sources;
-            DROP TABLE sources;
-            ALTER TABLE sources_new RENAME TO sources;
+            )
             """
         )
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("INSERT INTO sources_new SELECT * FROM sources")
+        connection.execute("DROP TABLE sources")
+        connection.execute("ALTER TABLE sources_new RENAME TO sources")
 
     @staticmethod
     def _ensure_reddit_source_type(connection: sqlite3.Connection) -> None:
@@ -309,8 +477,7 @@ class Database:
         sql = str(row["sql"] if row is not None else "")
         if "reddit" in sql:
             return
-        connection.execute("PRAGMA foreign_keys = OFF")
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE sources_new (
                 source_id TEXT PRIMARY KEY,
@@ -325,13 +492,12 @@ class Database:
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            INSERT INTO sources_new SELECT * FROM sources;
-            DROP TABLE sources;
-            ALTER TABLE sources_new RENAME TO sources;
+            )
             """
         )
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("INSERT INTO sources_new SELECT * FROM sources")
+        connection.execute("DROP TABLE sources")
+        connection.execute("ALTER TABLE sources_new RENAME TO sources")
 
     @staticmethod
     def _ensure_translation_model_purpose(connection: sqlite3.Connection) -> None:
@@ -342,7 +508,7 @@ class Database:
         sql = str(row["sql"] if row is not None else "")
         if "translation" in sql:
             return
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE model_endpoint_purposes_new (
                 purpose TEXT PRIMARY KEY CHECK (
@@ -352,13 +518,14 @@ class Database:
                 model TEXT NOT NULL,
                 effort TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            INSERT INTO model_endpoint_purposes_new
-                SELECT * FROM model_endpoint_purposes;
-            DROP TABLE model_endpoint_purposes;
-            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            )
             """
         )
+        connection.execute(
+            "INSERT INTO model_endpoint_purposes_new SELECT * FROM model_endpoint_purposes"
+        )
+        connection.execute("DROP TABLE model_endpoint_purposes")
+        connection.execute("ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes")
 
     @staticmethod
     def _ensure_leaderboard_model_purpose(connection: sqlite3.Connection) -> None:
@@ -369,7 +536,7 @@ class Database:
         sql = str(row["sql"] if row is not None else "")
         if "leaderboard" in sql:
             return
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE model_endpoint_purposes_new (
                 purpose TEXT PRIMARY KEY CHECK (
@@ -379,13 +546,14 @@ class Database:
                 model TEXT NOT NULL,
                 effort TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            INSERT INTO model_endpoint_purposes_new
-                SELECT * FROM model_endpoint_purposes;
-            DROP TABLE model_endpoint_purposes;
-            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            )
             """
         )
+        connection.execute(
+            "INSERT INTO model_endpoint_purposes_new SELECT * FROM model_endpoint_purposes"
+        )
+        connection.execute("DROP TABLE model_endpoint_purposes")
+        connection.execute("ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes")
 
     @staticmethod
     def _ensure_image_model_purpose(connection: sqlite3.Connection) -> None:
@@ -396,7 +564,7 @@ class Database:
         sql = str(row["sql"] if row is not None else "")
         if "'image'" in sql:
             return
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE model_endpoint_purposes_new (
                 purpose TEXT PRIMARY KEY CHECK (
@@ -406,13 +574,14 @@ class Database:
                 model TEXT NOT NULL,
                 effort TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            INSERT INTO model_endpoint_purposes_new
-                SELECT * FROM model_endpoint_purposes;
-            DROP TABLE model_endpoint_purposes;
-            ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes;
+            )
             """
         )
+        connection.execute(
+            "INSERT INTO model_endpoint_purposes_new SELECT * FROM model_endpoint_purposes"
+        )
+        connection.execute("DROP TABLE model_endpoint_purposes")
+        connection.execute("ALTER TABLE model_endpoint_purposes_new RENAME TO model_endpoint_purposes")
 
     @staticmethod
     def _ensure_github_weekly_images(connection: sqlite3.Connection) -> None:
@@ -434,6 +603,17 @@ class Database:
         if "visual_json" not in columns:
             connection.execute(
                 "ALTER TABLE github_weekly ADD COLUMN visual_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    @staticmethod
+    def _ensure_github_weekly_diagnostics(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(github_weekly)").fetchall()
+        }
+        if "diagnostics_json" not in columns:
+            connection.execute(
+                "ALTER TABLE github_weekly ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '[]'"
             )
 
     @staticmethod
@@ -464,9 +644,18 @@ class Database:
         )
 
     @staticmethod
+    def _ensure_scheduled_result(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(scheduled_jobs)").fetchall()
+        }
+        if "result_json" not in columns:
+            connection.execute("ALTER TABLE scheduled_jobs ADD COLUMN result_json TEXT")
+
+    @staticmethod
     def _ensure_engagement_snapshots(connection: sqlite3.Connection) -> None:
         """Idempotently add radar-only engagement history to old databases."""
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS engagement_snapshots (
                 snapshot_id TEXT PRIMARY KEY,
@@ -476,10 +665,12 @@ class Database:
                 value REAL NOT NULL CHECK (value >= 0),
                 observed_at TEXT NOT NULL,
                 UNIQUE (event_id, platform, metric, observed_at)
-            );
-            CREATE INDEX IF NOT EXISTS idx_engagement_snapshots_event_time
-                ON engagement_snapshots (event_id, observed_at);
+            )
             """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_engagement_snapshots_event_time "
+            "ON engagement_snapshots (event_id, observed_at)"
         )
 
     def save_github_weekly(
@@ -491,19 +682,32 @@ class Database:
         model_used: str = "",
         images: list[dict[str, object]] | None = None,
         visual: dict[str, object] | None = None,
+        diagnostics: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
         now = _utc_now()
-        payload = json.dumps(repos, ensure_ascii=False)
-        images_json = json.dumps(images or [], ensure_ascii=False)
+        repos_payload = list(repos)
+        images_payload = list(images or [])
         visual_payload = visual or {}
-        visual_json = json.dumps(visual_payload, ensure_ascii=False)
+        diagnostics_payload = list(diagnostics or [])
+        repos_json = _json_envelope(
+            _JSON_VERSIONS["github_weekly_repos"], repos_payload, list
+        )
+        images_json = _json_envelope(
+            _JSON_VERSIONS["github_weekly_images"], images_payload, list
+        )
+        visual_json = _json_envelope(
+            _JSON_VERSIONS["github_weekly_visual"], visual_payload, dict
+        )
+        diagnostics_json = _json_envelope(
+            _JSON_VERSIONS["github_weekly_diagnostics"], diagnostics_payload, list
+        )
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO github_weekly (
                     id, week_start, fetched_at, repos_json, xhs_title, xhs_body,
-                    model_used, images_json, visual_json
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_used, images_json, visual_json, diagnostics_json
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     week_start = excluded.week_start,
                     fetched_at = excluded.fetched_at,
@@ -512,18 +716,29 @@ class Database:
                     xhs_body = excluded.xhs_body,
                     model_used = excluded.model_used,
                     images_json = excluded.images_json,
-                    visual_json = excluded.visual_json
+                    visual_json = excluded.visual_json,
+                    diagnostics_json = excluded.diagnostics_json
                 """,
-                (week_start, now, payload, xhs_title, xhs_body, model_used, images_json, visual_json),
+                (
+                    week_start,
+                    now,
+                    repos_json,
+                    xhs_title,
+                    xhs_body,
+                    model_used,
+                    images_json,
+                    visual_json,
+                    diagnostics_json,
+                ),
             )
         return {
             "week_start": week_start,
             "fetched_at": now,
-            "repos": repos,
+            "repos": repos_payload,
             "xhs_title": xhs_title,
             "xhs_body": xhs_body,
             "model_used": model_used,
-            "images": images or [],
+            "images": images_payload,
             "visual": visual_payload,
         }
 
@@ -532,25 +747,41 @@ class Database:
             row = connection.execute("SELECT * FROM github_weekly WHERE id = 1").fetchone()
         if row is None:
             return None
-        try:
-            repos = json.loads(str(row["repos_json"]))
-        except json.JSONDecodeError:
-            repos = []
-        if not isinstance(repos, list):
-            repos = []
-        try:
-            images = json.loads(str(row["images_json"] if "images_json" in row.keys() else "[]"))
-        except (json.JSONDecodeError, KeyError):
-            images = []
-        if not isinstance(images, list):
-            images = []
-        try:
-            visual = json.loads(str(row["visual_json"] if "visual_json" in row.keys() else "{}"))
-        except (json.JSONDecodeError, KeyError):
-            visual = {}
-        if not isinstance(visual, dict):
-            visual = {}
-        return {
+        issues: list[dict[str, object]] = []
+        repos, issue = _decode_json_envelope(
+            row["repos_json"],
+            field="github_weekly_repos",
+            expected_type=list,
+        )
+        if issue:
+            issues.append(issue)
+        images_raw = row["images_json"] if "images_json" in row.keys() else "[]"
+        images, issue = _decode_json_envelope(
+            images_raw,
+            field="github_weekly_images",
+            expected_type=list,
+        )
+        if issue:
+            issues.append(issue)
+        visual_raw = row["visual_json"] if "visual_json" in row.keys() else "{}"
+        visual, issue = _decode_json_envelope(
+            visual_raw,
+            field="github_weekly_visual",
+            expected_type=dict,
+        )
+        if issue:
+            issues.append(issue)
+        diagnostics_raw = (
+            row["diagnostics_json"] if "diagnostics_json" in row.keys() else "[]"
+        )
+        diagnostics, issue = _decode_json_envelope(
+            diagnostics_raw,
+            field="github_weekly_diagnostics",
+            expected_type=list,
+        )
+        if issue:
+            issues.append(issue)
+        payload = {
             "week_start": str(row["week_start"]),
             "fetched_at": str(row["fetched_at"]),
             "repos": repos,
@@ -560,6 +791,12 @@ class Database:
             "images": images,
             "visual": visual,
         }
+        if diagnostics:
+            payload["degraded"] = True
+            payload["degraded_reasons"] = diagnostics
+        return _attach_json_issues({
+            **payload,
+        }, issues)
 
     def save_skill_finder(self, payload: dict[str, object]) -> dict[str, object]:
         now = _utc_now()
@@ -577,7 +814,13 @@ class Database:
                     fetched_at = excluded.fetched_at,
                     payload_json = excluded.payload_json
                 """,
-                (query, now, json.dumps(body, ensure_ascii=False)),
+                (
+                    query,
+                    now,
+                    _json_envelope(
+                        _JSON_VERSIONS["skill_finder_snapshot"], body, dict
+                    ),
+                ),
             )
         return body
 
@@ -587,15 +830,15 @@ class Database:
             row = connection.execute("SELECT * FROM skill_finder WHERE id = 1").fetchone()
         if row is None:
             return None
-        try:
-            payload = json.loads(str(row["payload_json"]))
-        except json.JSONDecodeError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
+        payload, issue = _decode_json_envelope(
+            row["payload_json"],
+            field="skill_finder_snapshot",
+            expected_type=dict,
+        )
+        issues = [issue] if issue else []
         payload.setdefault("query", str(row["query"]))
         payload.setdefault("fetched_at", str(row["fetched_at"]))
-        return payload
+        return _attach_json_issues(payload, issues)
 
     def add_hotspot_favorite(
         self,
@@ -630,7 +873,9 @@ class Database:
                     item_id,
                     str(title or ""),
                     str(summary or ""),
-                    json.dumps(body, ensure_ascii=False),
+                    _json_envelope(
+                        _JSON_VERSIONS["favorite_payload"], body, dict
+                    ),
                     now,
                 ),
             )
@@ -654,12 +899,12 @@ class Database:
             ).fetchall()
         items: list[dict[str, object]] = []
         for row in rows:
-            try:
-                payload = json.loads(str(row["payload_json"]))
-            except json.JSONDecodeError:
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
+            payload, issue = _decode_json_envelope(
+                row["payload_json"],
+                field="favorite_payload",
+                expected_type=dict,
+            )
+            issues = [issue] if issue else []
             item = dict(payload)
             item.update(
                 {
@@ -670,7 +915,7 @@ class Database:
                     "payload": payload,
                 }
             )
-            items.append(item)
+            items.append(_attach_json_issues(item, issues))
         return items
 
     def remove_hotspot_favorite(self, item_id: str) -> bool:
@@ -781,11 +1026,16 @@ class Database:
             )
             return inserted
 
-    def record_fetch_result(self, source_id: str, error: str | None = None) -> None:
+    def record_fetch_result(self, source_id: str, error: object | None = None) -> None:
+        stored_error = None
+        if error is not None:
+            stored_error = serialize_diagnostic(
+                normalize_diagnostic(error, source_id, "collect")
+            )
         with self.connect() as connection:
             connection.execute(
                 "UPDATE sources SET last_fetched_at = ?, last_error = ?, updated_at = ? WHERE source_id = ?",
-                (_utc_now(), error, _utc_now(), source_id),
+                (_utc_now(), stored_error, _utc_now(), source_id),
             )
 
     def count_items(self) -> int:
@@ -1637,7 +1887,7 @@ class Database:
                 "SELECT * FROM scheduled_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if existing is not None:
-                return dict(existing)
+                return self._scheduled_job_view(existing)
             connection.execute(
                 """
                 INSERT INTO scheduled_jobs (
@@ -1649,6 +1899,18 @@ class Database:
             )
         return self.get_scheduled_job(job_id)
 
+    @staticmethod
+    def _scheduled_job_view(row: sqlite3.Row | Mapping[str, object]) -> dict[str, object]:
+        job = dict(row)
+        result, issue = _decode_json_envelope(
+            job.get("result_json"),
+            field="scheduled_result",
+            expected_type=dict,
+            allow_none=True,
+        )
+        job["result"] = result
+        return _attach_json_issues(job, [issue] if issue else [])
+
     def get_scheduled_job(self, job_id: str) -> dict[str, object]:
         with self.connect() as connection:
             row = connection.execute(
@@ -1656,7 +1918,7 @@ class Database:
             ).fetchone()
         if row is None:
             raise KeyError(job_id)
-        return dict(row)
+        return self._scheduled_job_view(row)
 
     def list_scheduled_jobs(self) -> list[dict[str, object]]:
         with self.connect() as connection:
@@ -1666,7 +1928,7 @@ class Database:
                 ORDER BY run_at ASC, created_at ASC
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._scheduled_job_view(row) for row in rows]
 
     def due_scheduled_jobs(self, now: str) -> list[dict[str, object]]:
         with self.connect() as connection:
@@ -1678,7 +1940,7 @@ class Database:
                 """,
                 (now,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._scheduled_job_view(row) for row in rows]
 
     def claim_scheduled_job(self, job_id: str) -> bool:
         now = _utc_now()
@@ -1699,16 +1961,74 @@ class Database:
         status: str,
         error_message: str | None = None,
         result_json: str | None = None,
-    ) -> None:
+    ) -> bool:
+        if status not in {"DONE", "FAILED"}:
+            return False
+        normalized_result = self._normalize_scheduled_result(result_json)
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE scheduled_jobs
                 SET status = ?, error_message = ?, result_json = ?, updated_at = ?
-                WHERE job_id = ?
+                WHERE job_id = ? AND status = 'RUNNING'
                 """,
-                (status, error_message, result_json, _utc_now(), job_id),
+                (status, error_message, normalized_result, _utc_now(), job_id),
             )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _normalize_scheduled_result(result_json: str | None) -> str | None:
+        if result_json is None:
+            return None
+        result, issue = _decode_json_envelope(
+            result_json,
+            field="scheduled_result",
+            expected_type=dict,
+            allow_none=True,
+        )
+        if issue:
+            raise ValueError(str(issue["cause_code"]))
+        if result is None:
+            return None
+        return _json_envelope(_JSON_VERSIONS["scheduled_result"], result, dict)
+
+    def reconcile_stale_running_jobs(
+        self,
+        cutoff: str,
+        active_job_ids: Iterable[str] = (),
+    ) -> list[str]:
+        """Close abandoned RUNNING rows without touching active or terminal jobs."""
+        active = {str(job_id) for job_id in active_job_ids}
+        repaired: list[str] = []
+        now = _utc_now()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id
+                FROM scheduled_jobs
+                WHERE status = 'RUNNING' AND updated_at < ?
+                ORDER BY updated_at ASC, job_id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                job_id = str(row["job_id"])
+                if job_id in active:
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE scheduled_jobs
+                    SET status = 'FAILED',
+                        error_message = 'scheduler_finish_failed',
+                        result_json = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND status = 'RUNNING' AND updated_at < ?
+                    """,
+                    (now, job_id, cutoff),
+                )
+                if cursor.rowcount == 1:
+                    repaired.append(job_id)
+        return repaired
 
     def cancel_scheduled_job(self, job_id: str) -> dict[str, object]:
         with self.connect() as connection:
