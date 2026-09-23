@@ -281,8 +281,10 @@ class RSSCollector:
             ]
             items = enrich_hn_engagement(items, self.fetcher)
             inserted = sum(self.database.insert_item(source, item) for item in items)
-        except Exception as exc:
-            self.database.record_fetch_result(source.source_id, str(exc))
+        except Exception:
+            # The pipeline owns attempt recording: it holds the richer
+            # diagnostic, and recording here too made one failed attempt
+            # increment consecutive_failures twice.
             raise
         self.database.record_fetch_result(source.source_id)
         return CollectionResult(inserted=inserted, duplicates=len(items) - inserted)
@@ -410,8 +412,10 @@ class SitemapNewsCollector:
                 if item_matches_filter(item, source.content_filter)
             ]
             inserted = sum(self.database.insert_item(source, item) for item in items)
-        except Exception as exc:
-            self.database.record_fetch_result(source.source_id, str(exc))
+        except Exception:
+            # The pipeline owns attempt recording: it holds the richer
+            # diagnostic, and recording here too made one failed attempt
+            # increment consecutive_failures twice.
             raise
         self.database.record_fetch_result(source.source_id)
         return CollectionResult(inserted=inserted, duplicates=len(items) - inserted)
@@ -430,8 +434,10 @@ class AggregateCollector:
                 self.fetcher(source.url_or_handle), source.url_or_handle
             )
             inserted = sum(self.database.insert_item(source, item) for item in items)
-        except Exception as exc:
-            self.database.record_fetch_result(source.source_id, str(exc))
+        except Exception:
+            # The pipeline owns attempt recording: it holds the richer
+            # diagnostic, and recording here too made one failed attempt
+            # increment consecutive_failures twice.
             raise
         self.database.record_fetch_result(source.source_id)
         return CollectionResult(inserted=inserted, duplicates=len(items) - inserted)
@@ -612,8 +618,10 @@ class XCollector:
                     )
                 )
             inserted = sum(self.database.insert_item(source, item) for item in items)
-        except Exception as exc:
-            self.database.record_fetch_result(source.source_id, str(exc))
+        except Exception:
+            # The pipeline owns attempt recording: it holds the richer
+            # diagnostic, and recording here too made one failed attempt
+            # increment consecutive_failures twice.
             raise
         self.database.record_fetch_result(source.source_id)
         return CollectionResult(inserted=inserted, duplicates=len(items) - inserted)

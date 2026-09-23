@@ -79,6 +79,52 @@
 2. 保存 GitHub Token 后应只显示「已配置」，不回显明文；清空后回落环境变量。
 3. 设置里没有「聊天模型」页签，也没有聊天输入框：聊天只剩 API（`POST /api/chat/model`、`POST /api/chat`），见步骤 10。
 
+## 3.2.2 界面重构与硬化验收
+
+按顺序走完，每步都要看到真实结果，不接受只看按钮存在。
+
+### A. 版本与外壳
+
+1. 打开 `http://127.0.0.1:8080/`，徽章应为 `v3.2.2 · 本地服务`；`GET /api/status` 的 `version` 也应为 `3.2.2`。
+2. 顶栏左侧应是「AP」图形标记 + 主标题「AutoPosting」+ 副标题「AI 信息生产工作台」；右侧是「收藏」和「设置」两个按钮，收藏按钮带 `aria-expanded` / `aria-controls="favorites-drawer"`。
+3. 导航八个入口之间应有两处分隔符（`.nav-divider`，共 2 个），把导航分成「首页/资讯/资源」「创作/发布」「信息源/运行记录/设置」三组。
+4. 除首页外，每个页面内容区顶部都应有一致的页头（`.page-head`：标题 + 说明 + 右侧动作区）。资讯页页头应占满整行；创作页应有可见的「Creation Studio」页头，右侧「去发布」按钮点了应跳到发布页。
+5. 页面里不应再有 `#github-canvas`，也不应再有 `drawGithubCover`、`drawGithubPoster`、`stepImagePicker`、`stepGithubGallery`、`stepSkillsGallery`、`renderSettingsModels`、`endpointLabel`、`loadResearchDossier` 这八个已删除函数（在页面源码里搜索应为 0 处）。
+
+### B. 信息源页：健康度与筛选
+
+1. 点「信息源」。统计卡应为六格：总源 / 启用 / 正常 / 待刷新 / 异常 / 停用；「待刷新」在非零时应是琥珀色（`is-warn`），「异常」非零时是红色（`is-err`）。
+2. 统计卡的数字必须和下方每一行的状态胶囊完全一致（停用、该刷新了、还没抓过、抓取失败四种），两张口径都来自后端派生的 `health`，不允许出现统计说 5 个异常、列表只有 3 个失败的情况。
+3. 每行应是数据行：名称 + 等级/类型/主题/语言标签；第二行是「每 N 分钟 · 上次成功/上次抓取 …」；连续失败过的源必须显示「连续失败 N 次」。
+4. 用 `.filter-bar` 的四个胶囊（全部 / 已启用 / 抓取异常 / 已停用）筛：列表条数要跟着变，右侧 `#source-filter-count` 变成 `N / 54 路订阅`；在 `#source-search` 输入 `openai` 应只剩含 openai 的源（名称、id、url、类型、主题、语言都参与匹配）；筛选与搜索都是纯前端，不应触发任何新请求。
+5. 一次真实失败只能算一次：用 `reddit_machinelearning` 之外的一个坏地址跑一轮采集，`consecutive_failures` 应该是 1、2、3 递增，不是 2、4、6。
+
+### C. 运行记录页
+
+1. 点「运行记录」，统计卡应是运行记录 / 最近状态 / 成功源 / 失败源 / 去重后。
+2. 点某条运行记录的「查看明细」，应展开该 run 的每个来源行，每行有 `.outcome-bar`（新增/去重比例）与状态胶囊；失败行要给出中文原因（例：「HTTP Error 429: Too Many Requests」），不是空白。
+
+### D. 资讯页：来源健康条
+
+1. 资讯页的「来源健康」条必须是可见的（`#source-health-wrap` 的 `display` 不是 `none`），折叠按钮 `#source-health-toggle` 文案应形如「14 路该刷新 · 11 路还没抓过 · 18 路停用 · 点开看来源」。
+2. 点开后列出全部源的当前状态；再点收起。展开态要有真实的 `aria-expanded`。
+3. 旧版本用 `#source-health-wrap{display:none !important}` 把它永久藏起来，3.2.2 起不允许再出现这条规则。
+
+### E. 研究页：降级可读
+
+1. 点「资讯」→ 选一个事件 → 点「研究已选事件」，等研究完成。
+2. 在证据清单里，一条被站点拦截（403/429）但本工作台已采集过正文的证据，必须显示琥珀色降级说明，形如「降级读取 · 站点拒绝访问（blocked_http）· 已采集正文 作为正文 · 拦截类型 forbidden」，并且这段文字仍能显示出来（`degraded` 为真、`fallback_source` 为 `feed`）。
+3. 反向检查：本工作台完全没采集过的地址被拦截时，不允许伪造正文，该行不应出现降级徽标（状态是 `blocked`，正文为空）。
+4. `GET /api/research/{dossier_id}` 返回的每条 evidence 应带 `degraded` / `cause_code` / `fallback_source` / `blocked_kind` / `read_method` 五个字段；打开原文（点条目上的「原文」按钮，走 `POST /api/original`）时，被拦截页面应返回已采集正文（`content_source` 为 `feed`）而不是空文档。
+
+### F. 排版与可读性基线（整站）
+
+1. 字号不应小于 `11.5px`；除输入框外的正文不应出现 `13.6px` / `14px` 这类非标尺字号。
+2. 任意页面不应出现文字被截断（`scrollWidth > clientWidth` 且容器 `overflow:hidden`）。已知历史问题：信息源 `STRONG`、运行记录 `.summary-stat`、发布页 H3、首页搜索框。
+3. 全站不应出现未着色的链接：`<a>` 在没有专门样式的地方必须是琥珀色，不能是浏览器默认的深蓝（`rgb(0, 0, 238)`），技能介绍文里的链接尤其要检查。
+4. 深色底上的小字对比度（WCAG AA 4.5:1）要达标；渐变按钮要按渐变最暗的一端算，不能只算中间色。
+5. 焦点与多选必须保持两种视觉语言：卡片焦点（`.hotspot-item.selected`）只是细条 + 表面抬升，**不能**出现金色底或金色内描边；金色（`.is-picked`）只表示「已加入多选」。
+
 ## 步骤
 
 ### 1. 打开首页

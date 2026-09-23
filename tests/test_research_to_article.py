@@ -453,9 +453,9 @@ class RetiredSurfaceTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertEqual(autoposting.__version__, payload["version"])
-        self.assertEqual("3.2.1", payload["version"])
+        self.assertEqual("3.2.2", payload["version"])
         status, html = self._request("GET", "/")
-        self.assertIn("v3.2.1", str(html))
+        self.assertIn("v3.2.2", str(html))
 
 
 if __name__ == "__main__":

@@ -315,6 +315,7 @@ def _source_health_entry(
 ) -> dict[str, object]:
     last_error = row.get("last_error")
     last_fetched = _parse_fetched_at(row.get("last_fetched_at"))
+    last_success = _parse_fetched_at(row.get("last_success_at"))
     interval = int(row.get("fetch_interval_minutes") or source.fetch_interval_minutes or 15)
     if not source.enabled:
         status = "disabled"
@@ -334,6 +335,8 @@ def _source_health_entry(
         "enabled": source.enabled,
         "fetch_interval_minutes": interval,
         "last_fetched_at": last_fetched.isoformat() if last_fetched else "",
+        "last_success_at": last_success.isoformat() if last_success else "",
+        "consecutive_failures": int(row.get("consecutive_failures") or 0),
         "last_error": str(last_error or ""),
         "status": status,
     }
@@ -560,6 +563,14 @@ class HotspotService:
             x_bearer_token=self.x_bearer_token,
         )
         payload = self.list_window(hours, translate=False, scope=scope)
+        # Clusters only exist after the window is clustered: each radar "event"
+        # is one cluster_candidates() group, so its length is the real
+        # "clusters created or updated" this run produced.  The collection run
+        # itself is already finished by collect_sources, hence the narrow setter.
+        radar = payload.get("radar")
+        events = radar.get("events") if isinstance(radar, dict) else None
+        clusters = len(events) if isinstance(events, list) else 0
+        self.database.set_collection_run_clusters(batch.run_id, clusters)
         self._persist_radar_snapshots(payload)
         payload["collection"] = {
             "run_id": batch.run_id,
@@ -574,7 +585,7 @@ class HotspotService:
             "duplicates": batch.duplicates,
             "items_inserted": batch.inserted,
             "items_after_dedupe": batch.items_after_dedupe,
-            "clusters_created_or_updated": batch.clusters_created_or_updated,
+            "clusters_created_or_updated": clusters,
             "failed": batch.failed,
             "skipped_disabled": batch.skipped_disabled,
             "skipped_not_due": batch.skipped_not_due,
@@ -787,7 +798,11 @@ class Workbench:
             planner,
             decision_service,
             resolve_event,
-            reader=research_reader or ReaderServiceEvidenceAdapter(),
+            # The resolver lets a blocked or degraded page read fall back to the
+            # text this workspace already collected, instead of losing the
+            # evidence.  An explicitly injected reader still wins.
+            reader=research_reader
+            or ReaderServiceEvidenceAdapter(fallback_resolver=self.database.get_item_by_url),
             repository=dossier_repository or self.database,
         )
 

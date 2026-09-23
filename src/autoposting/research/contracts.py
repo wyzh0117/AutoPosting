@@ -253,6 +253,23 @@ class EvidenceCandidate:
     reader_status: str = "unread"
     reader_quality: float | None = None
     failure_reason: str | None = None
+    read_method: str = "none"
+    degraded: bool = False
+    cause_code: str | None = None
+    fallback_source: str | None = None
+    blocked_kind: str | None = None
+
+    @property
+    def original_url(self) -> str:
+        """Contract alias: ``url`` stays the canonical payload field."""
+
+        return self.url
+
+    @property
+    def read_status(self) -> str:
+        """Contract alias: ``reader_status`` is the retained read status."""
+
+        return self.reader_status
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id", limit=_MAX_ID_CHARS))
@@ -275,6 +292,13 @@ class EvidenceCandidate:
             object.__setattr__(self, "reader_quality", float(self.reader_quality))
         if self.failure_reason is not None:
             object.__setattr__(self, "failure_reason", _text(self.failure_reason, "failure_reason", limit=200))
+        object.__setattr__(self, "read_method", _text(self.read_method, "read_method", limit=80))
+        if not isinstance(self.degraded, bool):
+            raise ValueError("degraded_must_be_boolean")
+        for name in ("cause_code", "fallback_source", "blocked_kind"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _text(value, name, limit=120, required=False))
 
     def with_assessment(self, assessment: DecisionAssessment, relation: EvidenceRelation | None = None) -> "EvidenceCandidate":
         return replace(
@@ -291,6 +315,11 @@ class EvidenceCandidate:
         reader_quality: float | None = None,
         failure_reason: str | None = None,
         title: str | None = None,
+        read_method: str = "none",
+        degraded: bool = False,
+        cause_code: str | None = None,
+        fallback_source: str | None = None,
+        blocked_kind: str | None = None,
     ) -> "EvidenceCandidate":
         return replace(
             self,
@@ -299,6 +328,11 @@ class EvidenceCandidate:
             reader_status=reader_status,
             reader_quality=reader_quality,
             failure_reason=failure_reason,
+            read_method=read_method,
+            degraded=degraded,
+            cause_code=cause_code,
+            fallback_source=fallback_source,
+            blocked_kind=blocked_kind,
         )
 
     def decision_input(self) -> dict[str, object]:
@@ -328,6 +362,11 @@ class EvidenceCandidate:
             "reader_status": self.reader_status,
             "reader_quality": self.reader_quality,
             "failure_reason": self.failure_reason,
+            "read_method": self.read_method,
+            "degraded": self.degraded,
+            "cause_code": self.cause_code,
+            "fallback_source": self.fallback_source,
+            "blocked_kind": self.blocked_kind,
         }
 
 

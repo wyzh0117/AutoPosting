@@ -9,6 +9,9 @@ from typing import Protocol
 
 from ..diagnostics import cause_code_for, make_diagnostic
 from .contracts import (
+    PLANNER_RESULT_VERSION,
+    RESEARCH_INTENT_VERSION,
+    SEARCH_PLAN_VERSION,
     ContractError,
     PlannerResult,
     ResearchIntent,
@@ -45,13 +48,39 @@ def build_planner_prompt(query: str, *, source_event_ids: tuple[str, ...] = ()) 
     if not isinstance(query, str) or not query.strip() or len(query.strip()) > 200:
         raise ValueError("query must be 1-200 characters")
     event_ids = json.dumps(list(source_event_ids), ensure_ascii=False)
+    skeleton = json.dumps(
+        {
+            "schema_version": PLANNER_RESULT_VERSION,
+            "intent": {
+                "schema_version": RESEARCH_INTENT_VERSION,
+                "goal": "one sentence",
+                "concepts": ["keyword", "keyword"],
+                "search_repo": True,
+                "search_skill": False,
+                "search_web": True,
+                "preferred_signals": ["signal"],
+                "source_event_ids": list(source_event_ids),
+            },
+            "plan": {
+                "schema_version": SEARCH_PLAN_VERSION,
+                "query": "one search query",
+                "adapters": ["repo_search", "web_search"],
+                "max_candidates": 50,
+            },
+        },
+        ensure_ascii=False,
+    )
     return (
         f"You are AutoPosting Query Planner, contract {PLANNER_PROMPT_VERSION}.\n"
-        "Return one JSON object only with keys intent and plan. Do not search, judge, "
-        "or write prose.\n"
-        "intent keys: goal, concepts, search_repo, search_skill, search_web, "
-        "preferred_signals, source_event_ids.\n"
-        "plan keys: query, adapters, max_candidates.\n"
+        "Return one JSON object only. Do not search, judge, or write prose.\n"
+        "Copy this exact shape, including every schema_version and every key:\n"
+        f"{skeleton}\n"
+        "Types are strict: search_repo, search_skill and search_web are true/false "
+        "flags for whether that lane is searched, NOT lists of terms. concepts, "
+        "preferred_signals, adapters and source_event_ids are arrays of strings. "
+        "max_candidates is an integer between 1 and 500. Put search terms in "
+        "concepts and in plan.query, never inside the three flags. "
+        "Set at least one of the three flags to true.\n"
         f"Selected source_event_ids are authoritative: {event_ids}\n"
         f"User request: <request>{query.strip()}</request>"
     )
@@ -81,7 +110,72 @@ def _call_provider(provider: object, prompt: str) -> object:
     runner = getattr(provider, "run", None)
     if callable(runner):
         return runner(prompt)
-    raise PlannerError("planner_invalid_provider", cause_code="not_configured", detail="provider has no callable interface")
+    raise PlannerError("planner_invalid_provider", cause_code="provider_error", detail="provider has no callable interface")
+
+
+_SEARCH_LANES = ("search_repo", "search_skill", "search_web")
+_LIST_FIELDS = ("concepts", "preferred_signals", "source_event_ids", "adapters")
+
+
+def _lane(value: object) -> bool:
+    """A search lane arrives as a bool, or as a term list meaning "use it"."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(str(item).strip() for item in value)
+    if value is None:
+        return False
+    return bool(value)
+
+
+def _as_list(value: object) -> object:
+    """A single string where an array of strings is required."""
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return value
+
+
+def _as_int(value: object) -> object:
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return value
+
+
+def _normalize_provider_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
+    """Make one LLM reply satisfy the strict, storage-pinned contract.
+
+    ``from_dict`` stays strict because it also guards persisted payloads.  The
+    LLM boundary is where a reply is coerced into that contract.  Without this
+    step the Planner could never accept a real reply: the prompt omitted the
+    required ``schema_version``, and the three lane keys read like term lists
+    while the contract types them as booleans, so every call degraded while
+    ``configured`` still reported True.
+    """
+    data = dict(payload)
+    data.setdefault("schema_version", PLANNER_RESULT_VERSION)
+    intent = data.get("intent")
+    if isinstance(intent, Mapping):
+        intent = dict(intent)
+        intent.setdefault("schema_version", RESEARCH_INTENT_VERSION)
+        for lane in _SEARCH_LANES:
+            if lane in intent:
+                intent[lane] = _lane(intent[lane])
+        for field in ("concepts", "preferred_signals", "source_event_ids"):
+            if field in intent:
+                intent[field] = _as_list(intent[field])
+        data["intent"] = intent
+    plan = data.get("plan")
+    if isinstance(plan, Mapping):
+        plan = dict(plan)
+        plan.setdefault("schema_version", SEARCH_PLAN_VERSION)
+        if "adapters" in plan:
+            plan["adapters"] = _as_list(plan["adapters"])
+        if "max_candidates" in plan:
+            plan["max_candidates"] = _as_int(plan["max_candidates"])
+        data["plan"] = plan
+    return data
 
 
 def _validate_result(payload: Mapping[str, object]) -> PlannerResult:
@@ -99,7 +193,7 @@ class LLMPlanner:
 
     @property
     def configured(self) -> bool:
-        return self.provider is not None
+        return callable(self.provider) or callable(getattr(self.provider, "run", None))
 
     def plan(
         self,
@@ -123,7 +217,7 @@ class LLMPlanner:
             elif str(cause) in {"llm_invalid_output", "invalid_response"}:
                 cause = "invalid_response"
             raise PlannerError("planner_failed", cause_code=str(cause), detail=exc) from None
-        result = _validate_result(payload)
+        result = _validate_result(_normalize_provider_payload(payload))
         selected = tuple(source_event_ids)
         if selected and result.intent.source_event_ids != selected:
             result = PlannerResult(result.intent.with_source_event_ids(selected), result.plan)

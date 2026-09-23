@@ -1,6 +1,8 @@
 # AutoPosting MVP
 
-当前版本：`3.2.1`
+当前版本：`3.2.2`
+
+3.2.2 状态：`Product Hardening + Source Expansion + UI Refactor: CLOSED`。本版做了四件事：把订阅源从 37 条扩到 **54 条（36 条启用）** 并给每条健康度（`health` / `last_success_at` / `consecutive_failures` / `topic_scope` / `language`，DB schema v5）；修好 Planner 与 Jev 的 provider 接缝与响应契约（此前每一次真实调用都因契约不匹配而静默降级，`configured` 却报 true）；给 Reader 加抓取失败分类与「已采集正文」合法回退（被 403/429 拦截时不再丢证据，且绝不伪造正文）；整站界面按统一设计标尺重构（信息架构、外壳、页头、数据行、排版与对比度基线）。小红书仍只走人工发布。
 
 两轮重构状态：`Two-Iteration Refactor: CLOSED`。官方链路固定为 **Information Discovery → Event Cluster → Topic Dossier → Creation → Article Generation**：资讯页发现事件，研究页把选中事件变成可持久化的 Topic Dossier，创作页消费 Dossier 生成文章。「找切口」（hooks）、独立的相关搜索入口与 lane 产品机制都已从产品中删除，不再作为能力提供。
 
@@ -25,7 +27,7 @@ PYTHONPATH=src python3 -m autoposting.cli self-check --workspace data/self-check
 
 ## 配置
 
-- `config/sources.example.json`：来源注册表。默认启用一手 RSS（官方实验室 + 可靠媒体）以及 DeepSeek 官方文档 sitemap（`deepseek_official`，S1）。DeepSeek 没有公开 RSS，采集其官方 `api-docs.deepseek.com/sitemap.xml` 里的 `/news/news*` 静态页，不是二手聚合。`ithome` / `hn_frontpage` 带 `content_filter: "ai"`：标题必须是 AI 主题，早报、开售/优惠价、耳机手机汽车等零售稿即使正文里出现 “AI” 也会丢掉。生成文章前会读原文、查库内相关旧闻并做一次公开网页检索，把前因脉络写给没追过这件事的普通人（手动选材的单条 / 多条融合路径仍如此；从 Topic Dossier 生成时不再二次检索，只消费 Dossier 已有证据）。`aihot_aggregate` 保留但关闭。S4 讨论源（HN、可选 X 账号）可以直接写成观察帖；讨论量过阈值后该条升温为 S3 关注级，仍不是官方证实。X 抓取对齐 AIHOT 的方法：官方用户时间线、排除回复、丢掉纯转发、只收推文附图（`pbs.twimg.com/media`），不爬 X 网页、不把头像当配图。Bearer 只留进程内存；示例表登记了实验室官方号和观察号，默认关闭，填令牌后再启用。S4 讨论号可不做身份核验，S1/S2 仍要 `identity_verified=true`。成稿配图会丢掉头像、页眉图标和过小的方图。公众号没有公开 RSS，本仓库不抓。
+- `config/sources.example.json`：来源注册表，54 条（36 条启用）。等级映射为 A→S1、B→S2（社区为 S4）、C→S3；每条都有 `topic_scope` 与 `language`。GitHub Releases 用 `adapter_type: rss` 走 `releases.atom`（没有独立的 github 适配器，写 `adapter_type: github` 会被判 `unsupported_source`）；`identity_verified` 只对核验过的来源为真，本机够不到的一律为 false 并保持关闭。默认启用一手 RSS（官方实验室 + 可靠媒体）以及 DeepSeek 官方文档 sitemap（`deepseek_official`，S1）。DeepSeek 没有公开 RSS，采集其官方 `api-docs.deepseek.com/sitemap.xml` 里的 `/news/news*` 静态页，不是二手聚合。`ithome` / `hn_frontpage` 带 `content_filter: "ai"`：标题必须是 AI 主题，早报、开售/优惠价、耳机手机汽车等零售稿即使正文里出现 “AI” 也会丢掉。生成文章前会读原文、查库内相关旧闻并做一次公开网页检索，把前因脉络写给没追过这件事的普通人（手动选材的单条 / 多条融合路径仍如此；从 Topic Dossier 生成时不再二次检索，只消费 Dossier 已有证据）。`aihot_aggregate` 保留但关闭。S4 讨论源（HN、可选 X 账号）可以直接写成观察帖；讨论量过阈值后该条升温为 S3 关注级，仍不是官方证实。X 抓取对齐 AIHOT 的方法：官方用户时间线、排除回复、丢掉纯转发、只收推文附图（`pbs.twimg.com/media`），不爬 X 网页、不把头像当配图。Bearer 只留进程内存；示例表登记了实验室官方号和观察号，默认关闭，填令牌后再启用。S4 讨论号可不做身份核验，S1/S2 仍要 `identity_verified=true`。成稿配图会丢掉头像、页眉图标和过小的方图。公众号没有公开 RSS，本仓库不抓。
 - `.env.example`：部署时可能使用的本地路径和规则变量。当前 CLI 以命令行参数为准，不自动读取 `.env`。
 - `config/hotspot.example.json`：热点规则输入示例。
 - `config/facts.example.json`：结构化事实清单示例。

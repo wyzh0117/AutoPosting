@@ -1,4 +1,6 @@
+import json
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -6,6 +8,7 @@ from pathlib import Path
 from autoposting.decision import DecisionService
 from autoposting.decision.adapters.jev import JevAdapter
 from autoposting.db import Database
+from autoposting.llm import LLMService
 from autoposting.models import FeedItem, Source
 from autoposting.radar import build_radar, cluster_candidates, engagement_by_platform
 from autoposting.workbench import HotspotService
@@ -159,6 +162,49 @@ class RadarTests(unittest.TestCase):
             decision["final_score"],
         )
         self.assertEqual(decision["final_score"], events[0]["priority_score"])
+
+    def test_run_shaped_llm_service_ranks_radar_without_network(self):
+        """The production shape: LLMService injected as the Jev provider via its `.run` seam."""
+
+        def payload_for(prompt):
+            score = 100 if "Developers" in prompt else 0
+            return {
+                "schema_version": "jev-assessment-v1",
+                "score": score,
+                "confidence": 0.95,
+                "decision": "include",
+                "reasons": ["run seam ranking"],
+            }
+
+        def command_runner(argv):
+            return types.SimpleNamespace(stdout=json.dumps(payload_for(argv[2])), stderr="", returncode=0)
+
+        candidates = [
+            candidate(
+                "objective-high",
+                "OpenAI announces global security model release",
+                [source("openai", "https://openai.com/security", "canonical", tier="S1")],
+                NOW,
+            ),
+            candidate(
+                "semantic-high",
+                "Developers discuss a new tool",
+                [source("media", "https://media.example/tool", "supporting", tier="S3")],
+                NOW,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "radar-provider.db")
+            database.initialize()
+            adapter = JevAdapter(LLMService(database, runner=command_runner))
+            self.assertTrue(adapter.configured)
+            events = build_radar(candidates, now=NOW, decision_service=DecisionService(adapter))
+
+        self.assertEqual("Developers discuss a new tool", events[0]["title"])
+        decision = events[0]["decision"]
+        self.assertEqual("ok", decision["status"])
+        self.assertFalse(decision["degraded"])
 
     def test_jev_failure_keeps_objective_ranking_and_emits_degraded_diagnostic(self):
         def broken_jev(_payload):

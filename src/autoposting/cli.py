@@ -258,6 +258,10 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
         return {"ok": True, "database": str(database.path), "sources_registered": len(sources)}
 
     if args.command == "collect":
+        # A plain collect does not build the hotspot window, so it creates no
+        # clusters and leaves ``clusters_created_or_updated`` at 0.  Only the
+        # web collect path (HotspotService.collect) counts clusters; 0 here is
+        # the truthful value, not a missing write.
         result = collect_sources(
             _database(args.db),
             load_sources(args.sources),

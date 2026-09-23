@@ -18,17 +18,29 @@ _PATH_RE = re.compile(r"(?<![A-Za-z0-9])(?:/(?:Users|private|tmp|var|home)/|[A-Z
 _SQL_RE = re.compile(r"(?is)\b(?:select|insert|update|delete|alter|create|drop|pragma)\b.*")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _KNOWN_CAUSES = {
+    "auth_failed",
     "bad_json",
+    "blocked_http",
+    "connection_reset",
+    "dns_failure",
     "forbidden",
     "http_error",
+    "invalid_content",
     "invalid_json",
     "invalid_response",
+    "low_confidence",
+    "not_configured",
     "not_found",
+    "provider_error",
     "rate_limited",
+    "reader_internal_error",
     "server_error",
     "timeout",
-    "unreachable",
+    "tls_failure",
+    "too_large",
     "unknown_error",
+    "unreachable",
+    "unsupported_content",
 }
 
 

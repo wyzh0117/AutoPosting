@@ -55,6 +55,8 @@ class Source:
     content_filter: str = ""
     source_type: str = ""
     adapter_type: str = ""
+    topic_scope: str = ""
+    language: str = ""
 
     def __post_init__(self) -> None:
         source_type, adapter_type = canonical_source_types(
@@ -66,6 +68,11 @@ class Source:
             object.__setattr__(self, "type", adapter_type)
         object.__setattr__(self, "source_type", source_type)
         object.__setattr__(self, "adapter_type", adapter_type)
+        # Registry scope/language are advisory metadata, but both columns are
+        # NOT NULL: normalise here so a None or padded value cannot reject an
+        # otherwise valid source at write time.
+        object.__setattr__(self, "topic_scope", str(self.topic_scope or "").strip().lower())
+        object.__setattr__(self, "language", str(self.language or "").strip().lower())
 
 
 @dataclass(frozen=True)

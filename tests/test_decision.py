@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 import unittest
 
 from autoposting.decision.adapters.jev import JevAdapter
@@ -127,6 +128,20 @@ class PlannerTests(unittest.TestCase):
         detail = str(context.exception.diagnostic["detail"])
         self.assertNotIn("planner-secret", detail)
         self.assertNotIn("https://example.invalid/x", detail)
+
+    def test_configured_tracks_the_provider_seam_not_provider_presence(self) -> None:
+        class RunProvider:
+            def run(self, prompt: str) -> object:
+                return _planner_payload()
+
+        class EndpointOnlyProvider:
+            """Looks configured in Settings but exposes no provider interface."""
+
+            settings = types.SimpleNamespace(base_url="https://example.invalid/v1")
+
+        self.assertTrue(LLMPlanner(RunProvider()).configured)
+        self.assertFalse(LLMPlanner(EndpointOnlyProvider()).configured)
+        self.assertFalse(LLMPlanner().configured)
 
     def test_fallback_plan_is_explicit_and_deterministic(self) -> None:
         result = build_fallback_plan("浏览器 截图", source_event_ids=("e1",))

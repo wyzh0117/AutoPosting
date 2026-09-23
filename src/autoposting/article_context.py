@@ -156,6 +156,13 @@ def _evidence_row(item: object, *, index: int) -> dict[str, object]:
         "relation": relation[:80],
         "reader_status": reader_status[:80],
         "reader_quality": quality,
+        # A degraded read stays visible: the writer must be able to tell a
+        # complete read from one that fell back to snippet or feed content.
+        "degraded": bool(data.get("degraded", False)),
+        "cause_code": str(data.get("cause_code") or "").strip()[:120],
+        "fallback_source": str(data.get("fallback_source") or "").strip()[:120],
+        "read_method": str(data.get("read_method") or "").strip()[:80],
+        "failure_reason": str(data.get("failure_reason") or "").strip()[:200],
         "decision": _evidence_decision(data),
         "content": content[:MAX_TEXT_CHARS],
     }
@@ -217,7 +224,13 @@ def _source_refs_from_topics(topics: list[dict[str, object]]) -> list[dict[str, 
 def _evidence_block(index: int, row: Mapping[str, object]) -> str:
     """Render one evidence entry as prompt material the writer can quote."""
     lines = [f"[{index}] {row.get('title') or row.get('url')}"]
-    lines.append(f"来源：{row.get('source')} · 关系：{row.get('relation')} · 阅读状态：{row.get('reader_status')}")
+    status_line = f"来源：{row.get('source')} · 关系：{row.get('relation')} · 阅读状态：{row.get('reader_status')}"
+    if row.get("degraded"):
+        marks = [str(row.get("cause_code") or row.get("failure_reason") or "unknown_error")]
+        if row.get("fallback_source"):
+            marks.append(f"来源：{row.get('fallback_source')}")
+        status_line += f"（降级：{' / '.join(marks)}）"
+    lines.append(status_line)
     if row.get("decision"):
         lines.append(f"判断：{row.get('decision')}")
     lines.append(f"链接：{row.get('url')}")
@@ -423,6 +436,11 @@ def build_dossier_context(
                 "relation",
                 "reader_status",
                 "reader_quality",
+                "failure_reason",
+                "degraded",
+                "cause_code",
+                "fallback_source",
+                "read_method",
                 "decision",
             )
         }

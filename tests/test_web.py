@@ -455,7 +455,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("3.2.1", payload["version"])
+        self.assertEqual("3.2.2", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -2314,7 +2314,12 @@ class IndexPageContractTests(unittest.TestCase):
         # leaving it hidden in the DOM.
         self.assertNotIn('legacy-lane-tabs', html)
         self.assertIn('id="source-health-wrap"', html)
-        self.assertIn('#source-health-wrap{display:none !important;}', html)
+        # 3.2.2: the strip is a visible disclosure on the news page instead of a
+        # hidden legacy hook, so it must not be force-hidden anywhere, and the
+        # token layer must style it as a real control.
+        self.assertNotIn("source-health-wrap{display:none", html)
+        self.assertIn("source-health-toggle", html)
+        self.assertIn("#source-health-toggle[aria-expanded=\"true\"]", html)
         self.assertIn('id="source-registry-list"', html)
         self.assertIn('id="collection-run-sources"', html)
         self.assertIn('id="resource-results"', html)
@@ -2340,7 +2345,6 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('/api/sources/fetch-interval', html)
         self.assertIn('/api/collection-runs?limit=20', html)
         self.assertIn('/api/research', html)
-        self.assertIn('/api/research/" + encodeURIComponent', html)
         # The editorial/community filter is the `scope` contract now, and the
         # retired `lane` name appears nowhere in the client.
         self.assertIn('state.newsScope', html)
@@ -2348,6 +2352,20 @@ class IndexPageContractTests(unittest.TestCase):
         client = html.split("<script>", 1)[1]
         for retired in ("state.lane", "setLane(", "laneStatus", "data-lane", "body.lane-", "lane !== "):
             self.assertNotIn(retired, client)
+        # 3.2.2 removed the definition-only JS functions; no consumer ever
+        # called them, so their names must not survive in the client.
+        for dead in (
+            "loadResearchDossier",
+            "endpointLabel",
+            "renderSettingsModels",
+            "stepImagePicker",
+            "stepGithubGallery",
+            "stepSkillsGallery",
+            "drawGithubCover",
+            "drawGithubPoster",
+            "github-canvas",
+        ):
+            self.assertNotIn(dead, client)
         for legacy_route in ('/api/status', '/api/hotspots?hours=', '/api/collect'):
             self.assertIn(legacy_route, html)
 
@@ -2510,7 +2528,10 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="github-fetch-btn"', html)
         self.assertIn("榜单模型", html)
         self.assertIn("用于榜单", html)
-        self.assertIn("本周爆火ai工具", html)
+        # The cover title now lives only in the render plan (image_gen.py),
+        # asserted by test_web.py:206 and test_visual.py:794; the retired
+        # canvas-draw path that hard-coded it in the client was removed in 3.2.2.
+        self.assertNotIn("本周爆火ai工具", html)
         self.assertIn("本周值得关注的github ai项目前10", html)
         self.assertIn("exportGithubImages", html)
         self.assertIn("github-gallery", html)
@@ -2594,7 +2615,7 @@ class IndexPageContractTests(unittest.TestCase):
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("3.2.1", html)
+        self.assertIn("3.2.2", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2943,7 +2964,7 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("--t-mid:", html)
         self.assertIn("animation:rise var(--t-mid) var(--ease)", html)
         self.assertIn('class="brand-kicker"', html)
-        self.assertIn("本地工作台", html)
+        self.assertIn("AI 信息生产工作台", html)
         picker = html[html.index("#image-picker{") : html.index("#image-picker[hidden]")]
         self.assertIn("overflow:hidden", picker)
         scroller = html[html.index("#image-picker-list{") : html.index(".image-carousel-nav{")]
@@ -3121,7 +3142,10 @@ class IndexPageContractTests(unittest.TestCase):
         header = html[html.index("<header>") : html.index("</header>")]
         self.assertRegex(
             header,
-            r'id="config-btn">设置</button>\s*<button type="button" id="favorites-btn">收藏</button>',
+            r'<div class="header-actions">\s*'
+            r'<button type="button" id="favorites-btn" aria-expanded="false" '
+            r'aria-controls="favorites-drawer">收藏</button>\s*'
+            r'<button type="button" id="config-btn">设置</button>',
         )
         self.assertIn('id="favorites-drawer"', html)
         self.assertIn("is-picked", html)
@@ -3144,11 +3168,11 @@ class IndexPageContractTests(unittest.TestCase):
         picked_start = html.index(".fav-item.is-picked, .hotspot-item.is-picked{")
         picked = html[picked_start : html.index("}", picked_start) + 1]
         self.assertIn("box-shadow:inset", picked)
-        self.assertIn("rgba(196, 164, 106", picked)
+        self.assertIn("rgba(207, 169, 107", picked)
         before_block = html[selected_before : html.index("}", selected_before) + 1]
         self.assertIn("width:3px", before_block)
         self.assertNotIn("accent-glow", selected)
-        self.assertNotIn("rgba(196, 164, 106", selected)
+        self.assertNotIn("rgba(207, 169, 107", selected)
         self.assertNotIn("box-shadow:inset", selected)
         self.assertNotIn("linear-gradient", selected)
 

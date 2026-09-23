@@ -1,14 +1,99 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from autoposting.content import Draft
 from autoposting.decision.contracts import PlannerResult, ResearchIntent, SearchPlan
 from autoposting.db import Database
-from autoposting.models import Source
+from autoposting.models import FeedItem, Source
 from autoposting.resource_discovery import ResourceCandidate, ResourceSet, ResourceStatus
+from autoposting.workbench import HotspotService
+
+
+V4_SOURCES_SCHEMA = """
+CREATE TABLE sources (
+    source_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('rss', 'web', 'x', 'sitemap', 'reddit', 'html', 'github', 'api', 'account')),
+    url_or_handle TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('S1', 'S2', 'S3', 'S4')),
+    topics_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    fetch_interval_minutes INTEGER NOT NULL CHECK (fetch_interval_minutes > 0),
+    source_type TEXT NOT NULL DEFAULT 'other' CHECK (source_type IN ('official', 'media', 'community', 'developer', 'research', 'repository', 'other')),
+    adapter_type TEXT NOT NULL DEFAULT 'rss' CHECK (adapter_type IN ('rss', 'sitemap', 'html', 'reddit', 'github', 'api', 'account', 'x')),
+    identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0, 1)),
+    content_filter TEXT NOT NULL DEFAULT '' CHECK (content_filter IN ('', 'ai')),
+    last_fetched_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+V5_REGISTRY_COLUMNS = {"topic_scope", "language", "last_success_at", "consecutive_failures"}
+
+
+def _registry_columns(db: Database) -> set[str]:
+    with db.connect() as connection:
+        return {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sources)").fetchall()
+        }
+
+
+def _legacy_v4_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(V4_SOURCES_SCHEMA)
+        connection.execute(
+            "INSERT INTO sources (source_id, name, type, url_or_handle, tier, topics_json, "
+            "enabled, fetch_interval_minutes, source_type, adapter_type, identity_verified, "
+            "content_filter, last_fetched_at, last_error, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-v4",
+                "Legacy V4",
+                "rss",
+                "https://example.test/legacy.xml",
+                "S2",
+                '["models"]',
+                1,
+                30,
+                "official",
+                "rss",
+                1,
+                "ai",
+                "2026-09-19T00:00:00+00:00",
+                None,
+                "2026-09-01T00:00:00+00:00",
+                "2026-09-19T00:00:00+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+
+def _rfc822(minutes_ago: int) -> str:
+    moment = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return moment.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def _rss_feed(entries: list[tuple[str, str, str, int]]) -> bytes:
+    items = "".join(
+        f"<item><guid>{guid}</guid><title>{title}</title><link>{url}</link>"
+        f"<description>{title} summary</description>"
+        f"<pubDate>{_rfc822(minutes_ago)}</pubDate></item>"
+        for guid, title, url, minutes_ago in entries
+    )
+    return (
+        "<rss version='2.0'><channel><title>Fixture</title>" + items + "</channel></rss>"
+    ).encode("utf-8")
+
+
+EMPTY_RSS_FEED = _rss_feed([])
 
 
 class HotspotFavoriteTests(unittest.TestCase):
@@ -247,7 +332,7 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
 
     def test_user_version_migration_is_idempotent_and_sanitizes_legacy_error(self) -> None:
         with self.db.connect() as connection:
-            self.assertEqual(4, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
             connection.execute(
                 "INSERT INTO sources (source_id, name, type, url_or_handle, tier, topics_json, "
                 "enabled, fetch_interval_minutes, created_at, updated_at, last_error) "
@@ -380,6 +465,75 @@ class JsonEnvelopeAndMigrationTests(unittest.TestCase):
             self.assertEqual(0, connection.execute("PRAGMA user_version").fetchone()[0])
 
 
+class SourceRegistryMigrationV5Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_v4_database_upgrades_to_v5_and_keeps_legacy_rows(self) -> None:
+        path = Path(self.temp_dir.name) / "legacy-v4.db"
+        _legacy_v4_database(path)
+        self.assertFalse(V5_REGISTRY_COLUMNS & _registry_columns(Database(path)))
+
+        upgraded = Database(path)
+        upgraded.initialize()
+
+        self.assertTrue(V5_REGISTRY_COLUMNS <= _registry_columns(upgraded))
+        with upgraded.connect() as connection:
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
+
+        row = upgraded.get_source("legacy-v4")
+        self.assertEqual("Legacy V4", row["name"])
+        self.assertEqual("https://example.test/legacy.xml", row["url_or_handle"])
+        self.assertEqual("S2", row["tier"])
+        self.assertEqual(1, row["enabled"])
+        self.assertEqual(30, row["fetch_interval_minutes"])
+        self.assertEqual("official", row["source_type"])
+        self.assertEqual("rss", row["adapter_type"])
+        self.assertEqual(1, row["identity_verified"])
+        self.assertEqual("ai", row["content_filter"])
+        self.assertEqual("2026-09-19T00:00:00+00:00", row["last_fetched_at"])
+        self.assertIsNone(row["last_error"])
+        # Documented defaults: scope/language are empty and the previous success
+        # time stays unknown rather than being fabricated from an error-free row.
+        self.assertEqual("", row["topic_scope"])
+        self.assertEqual("", row["language"])
+        self.assertIsNone(row["last_success_at"])
+        self.assertEqual(0, row["consecutive_failures"])
+
+        upgraded.initialize()
+        with upgraded.connect() as connection:
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
+        self.assertEqual(row, upgraded.get_source("legacy-v4"))
+
+        fresh = Database(Path(self.temp_dir.name) / "fresh-v5.db")
+        fresh.initialize()
+        self.assertTrue(V5_REGISTRY_COLUMNS <= _registry_columns(fresh))
+        with fresh.connect() as connection:
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def test_failed_v5_migration_rolls_back_columns_and_version(self) -> None:
+        path = Path(self.temp_dir.name) / "rollback-v4.db"
+        _legacy_v4_database(path)
+        failing = Database(path)
+
+        with patch.object(failing, "_migrate_v5", side_effect=RuntimeError("v5 boom")):
+            with self.assertRaisesRegex(RuntimeError, "v5 boom"):
+                failing.initialize()
+
+        self.assertFalse(V5_REGISTRY_COLUMNS & _registry_columns(failing))
+        with failing.connect() as connection:
+            self.assertEqual(4, connection.execute("PRAGMA user_version").fetchone()[0])
+            row = connection.execute(
+                "SELECT name, url_or_handle, enabled FROM sources WHERE source_id = 'legacy-v4'"
+            ).fetchone()
+        self.assertEqual("Legacy V4", row["name"])
+        self.assertEqual("https://example.test/legacy.xml", row["url_or_handle"])
+        self.assertEqual(1, row["enabled"])
+
+
 class ResourceSetPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -456,7 +610,7 @@ class ResourceSetPersistenceTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT * FROM resource_sets WHERE set_id = 'set-1'"
             ).fetchone()
-            self.assertEqual(4, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
             envelope = json.loads(row["resource_set_json"])
             self.assertEqual("resource-set-envelope-v1", envelope["schema_version"])
             self.assertIn("candidates", envelope["data"])
@@ -495,6 +649,14 @@ class ResourceSetPersistenceTests(unittest.TestCase):
             self.db.get_resource_set("set-1")
         with self.assertRaisesRegex(ValueError, "resource_set_unknown_schema_version"):
             self.db.list_resource_sets()
+
+    def test_resource_set_storage_never_registers_subscription_sources(self) -> None:
+        """Evidence storage keeps its own tables; only upsert_source writes sources."""
+        self.db.save_resource_set(self._resource_set())
+        with self.db.connect() as connection:
+            self.assertEqual(
+                0, connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+            )
 
 
 class DraftListingTests(unittest.TestCase):
@@ -615,3 +777,337 @@ class CollectionRunTests(unittest.TestCase):
             "FAILED", restored["source_attempts"][0]["status"]
         )
         self.assertEqual([run_id], [row["run_id"] for row in reopened.list_collection_runs()])
+
+
+class SourceRegistryRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp_dir.name) / "autoposting.db")
+        self.db.initialize()
+        self.db.upsert_source(
+            Source(
+                "runtime",
+                "Runtime",
+                "rss",
+                "https://example.test/feed.xml",
+                "S2",
+                ("models",),
+                True,
+                15,
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _health(self) -> dict[str, str]:
+        return {str(row["source_id"]): str(row["health"]) for row in self.db.list_sources()}
+
+    def test_record_fetch_result_tracks_last_success_and_failure_streak(self) -> None:
+        self.db.record_fetch_result("runtime")
+        first = self.db.get_source("runtime")
+        self.assertTrue(first["last_success_at"])
+        self.assertIsNone(first["last_error"])
+        self.assertEqual(0, first["consecutive_failures"])
+        success_at = str(first["last_success_at"])
+
+        diagnostic = {
+            "code": "source_fetch_failed",
+            "cause_code": "unreachable",
+            "source": "runtime",
+            "stage": "collect",
+            "detail": "feed outage",
+        }
+        self.db.record_fetch_result("runtime", diagnostic)
+        failed = self.db.get_source("runtime")
+        # The previous success time is history: a failure must not erase it.
+        self.assertEqual(success_at, failed["last_success_at"])
+        self.assertEqual(1, failed["consecutive_failures"])
+        self.assertTrue(
+            str(failed["last_error"]).startswith(
+                "code=source_fetch_failed;cause_code=unreachable;source=runtime;stage=collect;"
+            )
+        )
+
+        self.db.record_fetch_result("runtime", diagnostic)
+        self.assertEqual(2, self.db.get_source("runtime")["consecutive_failures"])
+
+        self.db.record_fetch_result("runtime")
+        recovered = self.db.get_source("runtime")
+        self.assertIsNone(recovered["last_error"])
+        self.assertEqual(0, recovered["consecutive_failures"])
+        self.assertGreaterEqual(str(recovered["last_success_at"]), success_at)
+
+    def test_list_sources_health_is_derived_from_stored_evidence(self) -> None:
+        for source_id in ("never", "broken", "off"):
+            self.db.upsert_source(
+                Source(
+                    source_id,
+                    source_id.title(),
+                    "rss",
+                    f"https://example.test/{source_id}.xml",
+                    "S2",
+                    ("models",),
+                    True,
+                    15,
+                )
+            )
+        self.db.set_source_enabled("off", False)
+        self.db.record_fetch_result("runtime")
+        self.db.record_fetch_result(
+            "broken",
+            {"code": "source_fetch_failed", "cause_code": "unreachable", "detail": "outage"},
+        )
+
+        self.assertEqual(
+            {"runtime": "ok", "never": "never", "broken": "error", "off": "disabled"},
+            self._health(),
+        )
+
+        # A 15m source whose last attempt is older than 30m reads as stale.
+        stale_at = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE sources SET last_fetched_at = ? WHERE source_id = 'runtime'",
+                (stale_at,),
+            )
+        self.assertEqual("stale", self._health()["runtime"])
+
+        broken = next(row for row in self.db.list_sources() if row["source_id"] == "broken")
+        for key in ("topic_scope", "language", "last_success_at", "consecutive_failures"):
+            self.assertIn(key, broken)
+        self.assertEqual(1, broken["consecutive_failures"])
+        self.assertIsNone(broken["last_success_at"])
+
+    def test_list_sources_health_agrees_with_the_web_registry_decorator(self) -> None:
+        from autoposting import web
+
+        decorator = getattr(web, "_runtime_source_health", None)
+        if decorator is None:  # pragma: no cover - registry UI moved off this helper
+            self.skipTest("web source-registry decorator is gone")
+        self.db.record_fetch_result("runtime")
+        self.db.upsert_source(
+            Source(
+                "never",
+                "Never",
+                "rss",
+                "https://example.test/never.xml",
+                "S2",
+                ("models",),
+                True,
+                15,
+            )
+        )
+        for row in self.db.list_sources():
+            self.assertEqual(
+                str(row["health"]),
+                str(decorator(dict(row))["status"]),
+                str(row["source_id"]),
+            )
+
+
+class ItemUrlLookupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp_dir.name) / "autoposting.db")
+        self.db.initialize()
+        self.source = Source(
+            "lab_blog",
+            "AI Lab",
+            "rss",
+            "https://lab.example/feed.xml",
+            "S1",
+            ("models",),
+            True,
+            15,
+        )
+        self.db.upsert_source(self.source)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_get_item_by_url_reads_known_url_and_never_raises_on_miss(self) -> None:
+        inserted = self.db.insert_item(
+            self.source,
+            FeedItem(
+                external_id="entry-1",
+                canonical_url="https://lab.example/news/alpha",
+                title="Alpha",
+                content_text="Alpha body",
+                published_at=None,
+                raw_data={},
+            ),
+        )
+        self.assertTrue(inserted)
+
+        row = self.db.get_item_by_url("https://lab.example/news/alpha")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertTrue(str(row["item_id"]))
+        self.assertEqual("Alpha", row["title"])
+        self.assertEqual("Alpha body", row["content_text"])
+        self.assertEqual("https://lab.example/news/alpha", row["canonical_url"])
+
+        self.assertIsNone(self.db.get_item_by_url("https://lab.example/news/missing"))
+        self.assertIsNone(self.db.get_item_by_url(""))
+        self.assertIsNone(self.db.get_item_by_url("   "))
+
+
+class CollectionRunClusterCounterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "autoposting.db"
+        self.db = Database(self.path)
+        self.db.initialize()
+        for source_id in ("official", "second"):
+            self.db.upsert_source(
+                Source(
+                    source_id,
+                    source_id.title(),
+                    "rss",
+                    f"https://example.test/{source_id}.xml",
+                    "S1",
+                    ("models",),
+                    True,
+                    15,
+                )
+            )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_all_acceptance_counters_expose_post_collection_clusters(self) -> None:
+        run_id = self.db.start_collection_run(
+            ("official", "second"), started_at="2026-09-22T08:00:00+00:00"
+        )
+        self.db.record_collection_source_attempt(
+            run_id, "official", "SUCCESS", items_fetched=5, items_inserted=4, items_after_dedupe=4
+        )
+        self.db.record_collection_source_attempt(
+            run_id,
+            "second",
+            "FAILED",
+            items_fetched=2,
+            items_inserted=0,
+            items_after_dedupe=0,
+            diagnostic={
+                "code": "source_fetch_failed",
+                "cause_code": "unreachable",
+                "source": "second",
+                "stage": "collect",
+                "detail": "feed outage",
+            },
+        )
+        self.db.finish_collection_run(run_id, finished_at="2026-09-22T08:00:05+00:00")
+        # finish_collection_run still defaults to 0: the real count only exists
+        # after the window is clustered.
+        self.assertEqual(0, self.db.get_collection_run(run_id)["clusters_created_or_updated"])
+
+        self.db.set_collection_run_clusters(run_id, 3)
+        run = self.db.get_collection_run(run_id)
+        self.assertEqual(["official", "second"], sorted(run["requested_sources"]))
+        self.assertEqual(["official", "second"], sorted(run["attempted_sources"]))
+        self.assertEqual(["official"], list(run["successful_sources"]))
+        self.assertEqual(["second"], list(run["failed_sources"]))
+        self.assertEqual(7, run["items_fetched"])
+        self.assertEqual(4, run["items_inserted"])
+        self.assertEqual(4, run["items_after_dedupe"])
+        self.assertEqual(3, run["clusters_created_or_updated"])
+
+        self.db.set_collection_run_clusters(run_id, 3)
+        self.assertEqual(3, self.db.get_collection_run(run_id)["clusters_created_or_updated"])
+        for invalid in (-1, True):
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                self.db.set_collection_run_clusters(run_id, invalid)
+        with self.assertRaisesRegex(ValueError, "run_id required"):
+            self.db.set_collection_run_clusters("   ", 1)
+        # An unknown run is a no-op rather than a KeyError.
+        self.db.set_collection_run_clusters("run-missing", 2)
+
+        reopened = Database(self.path)
+        reopened.initialize()
+        self.assertEqual(
+            3, reopened.get_collection_run(run_id)["clusters_created_or_updated"]
+        )
+
+
+class WorkbenchClusterCounterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp_dir.name) / "autoposting.db")
+        self.db.initialize()
+        self.sources = (
+            Source("lab_blog", "AI Lab", "rss", "https://lab.example/feed.xml", "S1", ("models",), True, 15),
+            Source("media_feed", "AI Media", "rss", "https://media.example/feed.xml", "S3", ("models",), True, 15),
+        )
+        for source in self.sources:
+            self.db.upsert_source(source)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_collect_persists_the_real_cluster_count_on_the_run(self) -> None:
+        fetcher = {
+            "https://lab.example/feed.xml": _rss_feed(
+                [("a1", "Model One ships", "https://lab.example/a1", 10)]
+            ),
+            "https://media.example/feed.xml": _rss_feed(
+                [
+                    ("b1", "Chip prices rise", "https://media.example/b1", 20),
+                    ("b2", "Datacenter buildout expands", "https://media.example/b2", 40),
+                ]
+            ),
+        }
+        payload = HotspotService(self.db, self.sources, fetcher=fetcher.get).collect(24)
+
+        events = payload["radar"]["events"]
+        self.assertTrue(events)
+        clusters = len(events)
+        self.assertEqual(clusters, payload["collection"]["clusters_created_or_updated"])
+        self.assertEqual(clusters, payload["collection_run"]["clusters_created_or_updated"])
+        run = self.db.get_collection_run(str(payload["collection"]["run_id"]))
+        self.assertGreater(run["clusters_created_or_updated"], 0)
+        self.assertEqual(clusters, run["clusters_created_or_updated"])
+        self.assertEqual("DONE", run["status"])
+        self.assertTrue(run["finished_at"])
+
+    def test_source_health_exposes_last_success_and_failure_streak(self) -> None:
+        broken = Source(
+            "broken", "Broken", "rss", "https://broken.example/feed.xml", "S3", ("models",), True, 15
+        )
+        self.db.upsert_source(broken)
+
+        def fetcher(url: str) -> bytes:
+            if "lab.example" in url:
+                return _rss_feed([("a1", "Model One ships", "https://lab.example/a1", 10)])
+            if "media.example" in url:
+                return EMPTY_RSS_FEED
+            raise OSError("simulated feed outage")
+
+        payload = HotspotService(self.db, (*self.sources, broken), fetcher=fetcher).collect(24)
+        health = {str(row["source_id"]): row for row in payload["sources"]}
+
+        self.assertEqual("ok", health["lab_blog"]["status"])
+        self.assertTrue(health["lab_blog"]["last_success_at"])
+        self.assertEqual(0, health["lab_blog"]["consecutive_failures"])
+        self.assertEqual("error", health["broken"]["status"])
+        self.assertTrue(health["broken"]["last_fetched_at"])
+        self.assertEqual("", health["broken"]["last_success_at"])
+        # One failed attempt is recorded exactly once (the pipeline is the sole
+        # recorder; the collector only raises).  Asserting equality, not ">= 1",
+        # is what makes a double-count regression fail here.
+        self.assertEqual(1, health["broken"]["consecutive_failures"])
+
+    def test_collect_without_clusters_still_finishes_the_run(self) -> None:
+        fetcher = {
+            "https://lab.example/feed.xml": EMPTY_RSS_FEED,
+            "https://media.example/feed.xml": EMPTY_RSS_FEED,
+        }
+        payload = HotspotService(self.db, self.sources, fetcher=fetcher.get).collect(24)
+
+        self.assertEqual([], payload["radar"]["events"])
+        self.assertEqual(0, payload["collection"]["clusters_created_or_updated"])
+        run = self.db.get_collection_run(str(payload["collection"]["run_id"]))
+        self.assertEqual(0, run["clusters_created_or_updated"])
+        self.assertEqual("DONE", run["status"])
+        self.assertTrue(run["finished_at"])

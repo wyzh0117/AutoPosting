@@ -38,7 +38,7 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/3.2.1"
+HTTP_USER_AGENT = "AutoPosting/3.2.2"
 LLM_TIMEOUT_SECONDS = 90
 LEADERBOARD_ENRICH_SECONDS = 180
 
@@ -120,10 +120,19 @@ def validate_llm_settings(
 class LLMError(Exception):
     """Stable machine-readable error code; never embeds prompt/stdout/stderr."""
 
-    def __init__(self, code: str, reason: str | None = None, *, cause_code: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        reason: str | None = None,
+        *,
+        cause_code: str | None = None,
+        detail: str | None = None,
+    ) -> None:
         self.code = code
         self.reason = reason or code
         self.cause_code = cause_code
+        # Optional machine token a caller may surface without the human reason.
+        self.detail = detail
         super().__init__(code)
 
 
@@ -341,7 +350,7 @@ def parse_model_json(output: str) -> object:
             found = obj
     if found is not None:
         return found
-    raise LLMError("llm_invalid_output", "模型输出不是有效 JSON")
+    raise LLMError("llm_invalid_output", "模型输出不是有效 JSON", cause_code="invalid_response")
 
 
 _TITLE_KEYS = ("title", "标题", "headline", "题目")
@@ -463,19 +472,32 @@ class HermesRunner:
         except (subprocess.TimeoutExpired, TimeoutError) as exc:
             raise LLMError("llm_timeout", f"模型调用超过 {self.timeout} 秒未返回") from exc
         except OSError as exc:
-            raise LLMError("llm_command_failed", "无法启动 hermes 模型进程") from exc
+            raise LLMError(
+                "llm_command_failed",
+                "无法启动 hermes 模型进程",
+                cause_code="provider_error",
+                detail="process_spawn_failed",
+            ) from exc
         returncode = getattr(completed, "returncode", None)
         if returncode != 0:
             raise LLMError(
                 "llm_command_failed",
                 f"模型进程退出，退出码 {returncode}",
-                cause_code=f"process_exit_{returncode}",
+                cause_code="provider_error",
+                detail=f"process_exit_{returncode}",
             )
         output = completed.stdout or ""
         if not isinstance(output, str):
-            raise LLMError("llm_invalid_output", "模型进程没有返回文本")
+            raise LLMError(
+                "llm_invalid_output", "模型进程没有返回文本", cause_code="invalid_response"
+            )
         if len(output) > MAX_OUTPUT_CHARS:
-            raise LLMError("llm_output_too_large", f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符")
+            raise LLMError(
+                "llm_output_too_large",
+                f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符",
+                cause_code="invalid_response",
+                detail="output_too_large",
+            )
         return output
 
     def chat(self, messages: list[dict[str, str]], settings: LLMSettings) -> str:
@@ -577,20 +599,41 @@ class HermesRunner:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 parsed = json.loads(response.read().decode("utf-8"))
         except TimeoutError as exc:
-            raise LLMError("llm_timeout", f"模型调用超过 {self.timeout} 秒未返回") from exc
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            raise LLMError("llm_api_failed", "模型 API 请求失败") from exc
+            raise LLMError(
+                "llm_timeout",
+                f"模型调用超过 {self.timeout} 秒未返回",
+                cause_code="timeout",
+            ) from exc
+        except urllib.error.HTTPError as exc:
+            # HTTPError subclasses URLError/OSError, so it must be classified first.
+            status = exc.code if isinstance(exc.code, int) else 0
+            if status in {401, 403}:
+                raise LLMError("llm_api_failed", "模型 API 鉴权失败", cause_code="auth_failed") from exc
+            if status == 429:
+                raise LLMError("llm_api_failed", "模型 API 触发限流", cause_code="rate_limited") from exc
+            raise LLMError("llm_api_failed", "模型 API 请求失败", cause_code="provider_error") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise LLMError("llm_api_failed", "模型 API 请求失败", cause_code="unreachable") from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise LLMError("llm_invalid_output", "模型 API 返回了无效 JSON") from exc
+            raise LLMError("llm_invalid_output", "模型 API 返回了无效 JSON", cause_code="invalid_response") from exc
         try:
             message = parsed["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError("llm_invalid_output", "模型 API 响应缺少消息内容") from exc
+            raise LLMError(
+                "llm_invalid_output", "模型 API 响应缺少消息内容", cause_code="invalid_response"
+            ) from exc
         output = _message_text(message)
         if not isinstance(output, str):
-            raise LLMError("llm_invalid_output", "模型 API 没有返回文本")
+            raise LLMError(
+                "llm_invalid_output", "模型 API 没有返回文本", cause_code="invalid_response"
+            )
         if len(output) > MAX_OUTPUT_CHARS:
-            raise LLMError("llm_output_too_large", f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符")
+            raise LLMError(
+                "llm_output_too_large",
+                f"模型输出超过 {MAX_OUTPUT_CHARS} 个字符",
+                cause_code="invalid_response",
+                detail="output_too_large",
+            )
         return output
 
 
@@ -701,6 +744,10 @@ class LLMService:
         if not settings.base_url:
             raise LLMError("chat_not_configured", "对话模型未配置")
         return self.runner.chat(messages, settings)
+
+    def run(self, prompt: str) -> str:
+        """Provider seam for Planner/Jev: call this service with its own restored settings."""
+        return self._run(prompt, self._settings)
 
     def _run(self, prompt: str, settings: LLMSettings) -> str:
         return self.runner.run(

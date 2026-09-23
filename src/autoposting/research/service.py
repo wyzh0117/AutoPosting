@@ -21,7 +21,7 @@ from ..decision.planner import LLMPlanner, PlannerError, build_fallback_plan
 from ..decision.rubrics import RESEARCH_RUBRIC_ID
 from ..decision.service import DecisionService
 from ..diagnostics import make_diagnostic, normalize_diagnostic
-from ..reader import ArticleDocument
+from ..reader import ArticleDocument, classify_fetch_error
 from .adapters import EvidenceReader, RelatedNewsSearchAdapter, SearchAdapter
 from .contracts import (
     DossierRepository,
@@ -126,20 +126,29 @@ def _reader_result(value: object, candidate: EvidenceCandidate) -> tuple[Evidenc
         content = _candidate_text(value.text)
         title = _candidate_text(value.title, candidate.title)
         failure = _candidate_text(value.failure_reason or "") or None
+        cause = _candidate_text(value.cause_code or "") or failure
+        # A read is degraded when the document says a legal fallback replaced
+        # the page, or when it produced nothing usable at all.
+        degraded = bool(value.degraded) or not (status in {"full", "partial"} and bool(content))
         updated = candidate.with_document(
             content=content,
             reader_status=status,
             reader_quality=float(value.quality_score),
             failure_reason=failure,
             title=title,
+            read_method=str(value.fetch_method or "none"),
+            degraded=degraded,
+            cause_code=cause,
+            fallback_source=value.fallback_source,
+            blocked_kind=value.blocked_kind,
         )
-        if status in {"full", "partial"} and content:
+        if status in {"full", "partial"} and content and not degraded:
             return updated, None
         return updated, make_diagnostic(
             "reader",
             "evidence_read",
             code="evidence_read_degraded",
-            cause_code=failure or "no_content",
+            cause_code=cause or "no_content",
             detail=failure or "reader returned no usable content",
         )
     if isinstance(value, Mapping):
@@ -147,22 +156,31 @@ def _reader_result(value: object, candidate: EvidenceCandidate) -> tuple[Evidenc
         content = _candidate_text(value.get("text") or value.get("content"))
         title = _candidate_text(value.get("title"), candidate.title)
         reason = _candidate_text(value.get("failure_reason") or value.get("error")) or None
+        cause = _candidate_text(value.get("cause_code") or "") or reason
         quality = value.get("quality_score")
         numeric_quality = float(quality) if isinstance(quality, (int, float)) and not isinstance(quality, bool) else None
+        degraded = bool(value.get("degraded", False)) or not (
+            status in {"full", "partial"} and bool(content)
+        )
         updated = candidate.with_document(
             content=content,
             reader_status=status,
             reader_quality=numeric_quality,
             failure_reason=reason,
             title=title,
+            read_method=_candidate_text(value.get("read_method") or value.get("fetch_method")) or "none",
+            degraded=degraded,
+            cause_code=cause,
+            fallback_source=_candidate_text(value.get("fallback_source")) or None,
+            blocked_kind=_candidate_text(value.get("blocked_kind")) or None,
         )
-        if status in {"full", "partial"} and content:
+        if status in {"full", "partial"} and content and not degraded:
             return updated, None
         return updated, make_diagnostic(
             "reader",
             "evidence_read",
             code="evidence_read_degraded",
-            cause_code=reason or "no_content",
+            cause_code=cause or "no_content",
             detail=reason or "reader returned no usable content",
         )
     if isinstance(value, str) and value.strip():
@@ -479,16 +497,24 @@ class ResearchService:
                 if diagnostic is not None:
                     diagnostics.append(diagnostic)
             except Exception as exc:
+                cause_code = classify_fetch_error(exc)
                 diagnostics.append(
                     make_diagnostic(
                         "reader",
                         "evidence_read",
                         code="evidence_read_failed",
-                        cause_code="unknown_error",
+                        cause_code=cause_code,
                         detail=exc,
                     )
                 )
-                result.append(candidate.with_document(reader_status="failed", failure_reason="reader_failed"))
+                result.append(
+                    candidate.with_document(
+                        reader_status="failed",
+                        failure_reason="reader_failed",
+                        degraded=True,
+                        cause_code=cause_code,
+                    )
+                )
         return result
 
     @staticmethod
@@ -568,6 +594,11 @@ class ResearchService:
                         reader_status=str(item.get("reader_status") or "unread"),
                         reader_quality=item.get("reader_quality"),
                         failure_reason=item.get("failure_reason"),
+                        read_method=str(item.get("read_method") or "none"),
+                        degraded=bool(item.get("degraded", False)),
+                        cause_code=item.get("cause_code"),
+                        fallback_source=item.get("fallback_source"),
+                        blocked_kind=item.get("blocked_kind"),
                     )
                 )
             groups = tuple(

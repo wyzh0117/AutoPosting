@@ -22,6 +22,14 @@ REQUIRED_SOURCE_FIELDS = {
     "fetch_interval",
 }
 
+# ``topic_scope`` and ``language`` are required registry attributes for new
+# long-term Subscription Sources, but they are intentionally NOT in
+# REQUIRED_SOURCE_FIELDS: registries written before schema v5 must keep
+# loading (absent -> ""), while the shipped example file carries both on every
+# entry and a test pins that.
+_TOPIC_SCOPE_RE = re.compile(r"[a-z][a-z0-9_]*")
+_LANGUAGE_TAG_RE = re.compile(r"[a-z]{2,8}(?:-[a-z0-9]{1,8})*")
+
 
 def _fetch_interval_minutes(value: object) -> int:
     if isinstance(value, bool):
@@ -76,6 +84,8 @@ def _source_from_mapping(data: object, index: int) -> Source:
     enabled = data["enabled"]
     identity_verified = data.get("identity_verified", False)
     content_filter = data.get("content_filter") or ""
+    topic_scope = data.get("topic_scope") or ""
+    language = data.get("language") or ""
 
     if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", source_id):
         raise ConfigError(f"sources[{index}].source_id is invalid")
@@ -123,6 +133,20 @@ def _source_from_mapping(data: object, index: int) -> Source:
         )
     if not isinstance(content_filter, str) or content_filter not in {"", "ai"}:
         raise ConfigError(f"sources[{index}].content_filter must be empty or 'ai'")
+    if not isinstance(topic_scope, str):
+        raise ConfigError(f"sources[{index}].topic_scope must be a string")
+    topic_scope = topic_scope.strip().lower()
+    if topic_scope and not _TOPIC_SCOPE_RE.fullmatch(topic_scope):
+        raise ConfigError(
+            f"sources[{index}].topic_scope must be a lowercase token like 'models'"
+        )
+    if not isinstance(language, str):
+        raise ConfigError(f"sources[{index}].language must be a string")
+    language = language.strip().lower()
+    if language and not _LANGUAGE_TAG_RE.fullmatch(language):
+        raise ConfigError(
+            f"sources[{index}].language must be a language tag like 'en' or 'zh-cn'"
+        )
 
     return Source(
         source_id=source_id,
@@ -137,6 +161,8 @@ def _source_from_mapping(data: object, index: int) -> Source:
         content_filter=content_filter,
         source_type=canonical_kind,
         adapter_type=canonical_adapter,
+        topic_scope=topic_scope,
+        language=language,
     )
 
 

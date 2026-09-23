@@ -124,7 +124,10 @@ class HermesRunnerTests(unittest.TestCase):
         with self.assertRaises(LLMError) as raised:
             runner.run("p")
         self.assertEqual("llm_command_failed", str(raised.exception))
-        self.assertEqual("process_exit_2", raised.exception.cause_code)
+        # 3.2.2: a non-zero CLI exit is a provider failure, not a cause of its
+        # own; the exit token is preserved on .detail for support.
+        self.assertEqual("provider_error", raised.exception.cause_code)
+        self.assertEqual("process_exit_2", raised.exception.detail)
         self.assertIn("退出码 2", raised.exception.reason)
 
     def test_runner_accepts_per_call_model_provider_and_effort(self) -> None:
@@ -144,6 +147,18 @@ class HermesRunnerTests(unittest.TestCase):
         with self.assertRaises(LLMError) as raised:
             runner.run("p")
         self.assertEqual("llm_output_too_large", str(raised.exception))
+        self.assertEqual("invalid_response", raised.exception.cause_code)
+        self.assertEqual("output_too_large", raised.exception.detail)
+
+    def test_runner_launch_failure_is_a_provider_error(self) -> None:
+        # The process never started, so this is the same class of problem as a
+        # non-zero exit and must not be left without a cause_code.
+        runner = HermesRunner(command_runner=FakeRunner(error=OSError("no such binary")))
+        with self.assertRaises(LLMError) as raised:
+            runner.run("p")
+        self.assertEqual("llm_command_failed", str(raised.exception))
+        self.assertEqual("provider_error", raised.exception.cause_code)
+        self.assertEqual("process_spawn_failed", raised.exception.detail)
 
     def test_keychain_store_keeps_secret_out_of_process_arguments(self) -> None:
         runner = FakeSecurityRunner()
@@ -225,7 +240,7 @@ class OpenAICompatibleRunnerTests(unittest.TestCase):
 
         self.assertEqual("/v1/chat/completions", requests[0][0])
         self.assertEqual("Bearer test-api-key", requests[0][1])
-        self.assertEqual("AutoPosting/3.2.1", requests[0][2])
+        self.assertEqual("AutoPosting/3.2.2", requests[0][2])
         self.assertEqual("remote-model", requests[0][3]["model"])
         self.assertEqual("REAL PROMPT", requests[0][3]["messages"][0]["content"])
 

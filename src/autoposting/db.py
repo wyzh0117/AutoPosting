@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -26,7 +26,7 @@ from .legacy_compat import SCOPE_ALL, SCOPE_COMMUNITY, SCOPE_ERROR, SCOPE_OFFICI
 from .normalize import content_hash
 
 
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 _JSON_VERSIONS = {
     "github_weekly_repos": "github-weekly-repos-v1",
     "github_weekly_images": "github-weekly-images-v1",
@@ -123,6 +123,47 @@ def _legacy_source_error(value: object) -> str:
     return f"legacy_source_error:{sanitize_detail(value)}"
 
 
+def _parse_registry_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def derive_source_health(row: Mapping[str, object], now: datetime | None = None) -> str:
+    """Derive one registry health status from the stored fetch evidence.
+
+    ``health`` is intentionally not a stored column: the raw evidence is
+    ``last_fetched_at`` / ``last_error`` / ``fetch_interval_minutes``, and this
+    function mirrors the threshold logic the web source registry applied at
+    request time (disabled / error / never / stale / ok) so the DB read surface
+    and the UI cannot disagree.
+    """
+    if not bool(row.get("enabled")):
+        return "disabled"
+    if row.get("last_error"):
+        return "error"
+    fetched_at = _parse_registry_timestamp(row.get("last_fetched_at"))
+    if fetched_at is None:
+        return "never"
+    try:
+        interval = int(row.get("fetch_interval_minutes") or 15)
+    except (TypeError, ValueError):
+        interval = 15
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    if moment.astimezone(timezone.utc) >= fetched_at + timedelta(minutes=max(interval, 1) * 2):
+        return "stale"
+    return "ok"
+
+
 def _schema_statements(script: str) -> Iterable[str]:
     """Yield complete schema statements without executescript's implicit COMMIT."""
     statement = ""
@@ -154,8 +195,12 @@ CREATE TABLE IF NOT EXISTS sources (
     adapter_type TEXT NOT NULL DEFAULT 'rss' CHECK (adapter_type IN ('rss', 'sitemap', 'html', 'reddit', 'github', 'api', 'account', 'x')),
     identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0, 1)),
     content_filter TEXT NOT NULL DEFAULT '' CHECK (content_filter IN ('', 'ai')),
+    topic_scope TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
     last_fetched_at TEXT,
     last_error TEXT,
+    last_success_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -473,6 +518,8 @@ class Database:
                         self._migrate_v3(connection)
                     elif next_version == 4:
                         self._migrate_v4(connection)
+                    elif next_version == 5:
+                        self._migrate_v5(connection)
                     else:  # pragma: no cover - guarded by DB_SCHEMA_VERSION
                         raise RuntimeError(f"missing_database_migration:{next_version}")
                     connection.execute(f"PRAGMA user_version = {next_version}")
@@ -487,6 +534,7 @@ class Database:
                     self._migrate_v2(connection)
                     self._migrate_v3(connection)
                     self._migrate_v4(connection)
+                    self._migrate_v5(connection)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -607,6 +655,35 @@ class Database:
             ON resource_sets (created_at DESC, set_id DESC)
             """
         )
+
+    @staticmethod
+    def _migrate_v5(connection: sqlite3.Connection) -> None:
+        """Add Subscription Source scope/language and durable fetch health fields.
+
+        ``health`` itself stays derived (see ``derive_source_health``) so the
+        registry cannot drift between two stored truths; what is stored here is
+        the raw evidence it needs: the last success time and the current failure
+        streak.  Purely additive: legacy rows keep ``last_success_at`` NULL
+        until their next successful fetch.
+        """
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sources)").fetchall()
+        }
+        if "topic_scope" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN topic_scope TEXT NOT NULL DEFAULT ''"
+            )
+        if "language" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN language TEXT NOT NULL DEFAULT ''"
+            )
+        if "last_success_at" not in columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN last_success_at TEXT")
+        if "consecutive_failures" not in columns:
+            connection.execute(
+                "ALTER TABLE sources ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _migrate_legacy_source_errors(connection: sqlite3.Connection) -> None:
@@ -1136,8 +1213,9 @@ class Database:
                 INSERT INTO sources (
                     source_id, name, type, url_or_handle, tier, topics_json,
                     enabled, fetch_interval_minutes, source_type, adapter_type,
-                    identity_verified, content_filter, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    identity_verified, content_filter, topic_scope, language,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     name = excluded.name,
                     type = excluded.type,
@@ -1148,6 +1226,8 @@ class Database:
                     adapter_type = excluded.adapter_type,
                     identity_verified = excluded.identity_verified,
                     content_filter = excluded.content_filter,
+                    topic_scope = excluded.topic_scope,
+                    language = excluded.language,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1163,6 +1243,8 @@ class Database:
                     adapter_type,
                     int(source.identity_verified),
                     source.content_filter,
+                    source.topic_scope,
+                    source.language,
                     now,
                     now,
                 ),
@@ -1556,6 +1638,24 @@ class Database:
             )
         return self.get_collection_run(run_id)
 
+    def set_collection_run_clusters(self, run_id: str, count: int) -> None:
+        """Persist the post-collection cluster count on an existing run.
+
+        Clustering happens after collection (the radar clusters the window's
+        items), so the run is finished before the real count exists.  One
+        idempotent UPDATE; an unknown run is a no-op rather than an error.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("clusters must be a non-negative integer")
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id required")
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE collection_runs SET clusters_created_or_updated = ? WHERE run_id = ?",
+                (count, run_id),
+            )
+
     def get_source(self, source_id: str) -> dict[str, object]:
         with self.connect() as connection:
             row = connection.execute(
@@ -1620,16 +1720,39 @@ class Database:
             return inserted
 
     def record_fetch_result(self, source_id: str, error: object | None = None) -> None:
+        """Record one fetch attempt's outcome on the source registry row.
+
+        Success clears the diagnostic and records ``last_success_at``; failure
+        keeps the previous success time (it is history, not state) and extends
+        the failure streak.  ``last_fetched_at`` is the attempt time in both
+        cases, which is what the derived health thresholds read.
+
+        ``consecutive_failures`` counts failed attempts exactly once per
+        attempt: the collection pipeline is the single recorder of a failed
+        attempt (the collectors only raise), so ``N`` means ``N`` attempts.  A
+        success resets it to 0 and stamps ``last_success_at``.
+        """
         stored_error = None
         if error is not None:
             stored_error = serialize_diagnostic(
                 normalize_diagnostic(error, source_id, "collect")
             )
+        now = _utc_now()
         with self.connect() as connection:
-            connection.execute(
-                "UPDATE sources SET last_fetched_at = ?, last_error = ?, updated_at = ? WHERE source_id = ?",
-                (_utc_now(), stored_error, _utc_now(), source_id),
-            )
+            if stored_error is None:
+                connection.execute(
+                    "UPDATE sources SET last_fetched_at = ?, last_error = NULL, "
+                    "last_success_at = ?, consecutive_failures = 0, updated_at = ? "
+                    "WHERE source_id = ?",
+                    (now, now, now, source_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE sources SET last_fetched_at = ?, last_error = ?, "
+                    "consecutive_failures = consecutive_failures + 1, updated_at = ? "
+                    "WHERE source_id = ?",
+                    (now, stored_error, now, source_id),
+                )
 
     def count_items(self) -> int:
         with self.connect() as connection:
@@ -2426,6 +2549,27 @@ class Database:
             ).fetchone()
         return str(row["item_id"]) if row is not None else ""
 
+    def get_item_by_url(self, url: str) -> dict[str, object] | None:
+        """Look up one stored item by its exact canonical URL.
+
+        The UNIQUE index on ``items.canonical_url`` makes this an index seek.
+        A miss (unknown or empty URL) returns ``None`` and never raises: callers
+        use it as a reader fallback when a live fetch is blocked.
+        """
+        canonical = str(url or "").strip()
+        if not canonical:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT item_id, title, content_text, canonical_url FROM items
+                WHERE canonical_url = ?
+                LIMIT 1
+                """,
+                (canonical,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def get_item(self, item_id: str) -> dict[str, object]:
         with self.connect() as connection:
             row = connection.execute(
@@ -2462,18 +2606,25 @@ class Database:
         return urls
 
     def list_sources(self) -> list[dict[str, object]]:
+        """Read the authoritative registry, including one derived health status."""
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT source_id, name, type, source_type, adapter_type, tier,
                        identity_verified, content_filter, enabled,
                        fetch_interval_minutes, last_fetched_at, last_error,
+                       topic_scope, language, last_success_at, consecutive_failures,
                        created_at, updated_at
                 FROM sources
                 ORDER BY name, source_id
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        sources: list[dict[str, object]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["health"] = derive_source_health(payload)
+            sources.append(payload)
+        return sources
 
     def list_hotspot_candidates(
         self,
