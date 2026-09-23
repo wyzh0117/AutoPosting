@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from pathlib import Path
 
 from autoposting.article_context import build_dossier_context
@@ -173,6 +174,41 @@ class DossierArticleTests(unittest.TestCase):
         # The retired chains must not reappear inside the prompt.
         self.assertNotIn("chosen_hooks", prompt)
         self.assertNotIn("related_news", prompt)
+
+    def test_generation_never_touches_the_retired_search_chain(self) -> None:
+        # Generation must consume the dossier only. The retired engine is still
+        # importable (research uses it), so prove it stays untouched by making
+        # every entry point explode: a single call fails this test loudly.
+        import autoposting.background as background
+        import autoposting.research.adapters as adapters
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("the retired search chain must not run during generation")
+
+        dossier = self._dossier()
+        calls = 0
+
+        def counting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return forbidden(*args, **kwargs)
+
+        with (
+            patch.object(background, "search_related_news", side_effect=counting),
+            patch.object(background, "_search_related_news_impl", side_effect=counting),
+            patch.object(background, "_search_related_news_bounded", side_effect=counting),
+            patch.object(adapters.RelatedNewsSearchAdapter, "search", side_effect=counting),
+        ):
+            status, article = self._request(
+                "POST", "/api/articles", {"dossier_id": dossier["dossier_id"], "platform": "wechat"}
+            )
+
+        self.assertEqual(200, status)
+        self.assertTrue(article["ok"])
+        self.assertEqual(0, calls)
+        draft = self.db.get_draft(article["draft_id"])
+        self.assertIn("AIGC", draft["body"])
+        self.assertIn("https://lab.example/w1", draft["body"])
 
     def test_dossier_article_records_the_topic_dossier_event(self) -> None:
         dossier = self._dossier()

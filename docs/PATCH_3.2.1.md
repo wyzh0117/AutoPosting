@@ -56,12 +56,13 @@
 - `docs/WEB_FUNCTIONAL_TEST.md`：按新 IA 重写验收步骤，含 `scope` / `dossier_id` 的真实 curl 示例、点击驱动的 B2 步骤、`/api/hooks/find` 负向检查与 `dossier_not_found` 400 校验。
 - `docs/ARTICLE_BASE_PROMPT.md` 升到 `article-v13`；`docs/article_styles/AI专家.md` 的 `background.chosen_hooks` 段落改为 `### 开头切口`。
 - 新增测试模块：`tests/test_article_context.py`、`tests/test_legacy_compat.py`、`tests/test_research_search.py`、`tests/test_research_to_article.py`；`test_article_sources.py` 增加句首引用、参考行（含标签行与诱饵图片 URL）与标记清理用例；`test_workbench.py` 增加雷达候选来源配对用例；`test_web.py` 增加资源网页检索走同一适配器与降级直通用例；`tests/test_hooks.py` 随实现删除。
+- 生成期禁止旧链路的显式断言：`test_generation_never_touches_the_retired_search_chain` 在生成文章时把 `background.search_related_news`、`_search_related_news_impl`、`_search_related_news_bounded`、`RelatedNewsSearchAdapter.search` 全部替换为抛异常，要求文章仍然生成成功且四者调用次数为 0（把任意一次调用注入生成路径，该测试即失败——已实测）。
 
 ## 验证
 
 - 独立验收：由未参与实现的 subagent 逐条复核本文件的事实性声明，并自行复跑测试 / 自检 / 静态扫描 / 归档校验；它额外用「把 `search_related_news`、`_search_related_news_impl`、`_search_related_news_bounded`、`RelatedNewsSearchAdapter.search` 全部替换为抛异常」的方式证明了生成期 0 次检索，并对真实 25 份草稿逐一验证可编辑。其提出的 5 项差异已在本轮修复：资源网页检索改走同一适配器（D1）、`body.lane-` 静态命中归零（D2）、`radar._build_event` 与 `_radar_event_candidate` 的来源配对逐位对齐并补强测试（D3/D5）、标签行引用不再导致草稿永久不可编辑（D4）。修复后复跑全量测试与真实链路均通过。
-- 全量测试：`PYTHONPATH=src:tests python3 -m unittest discover -s tests` — `Ran 816 tests`，`OK (skipped=1)`。
-- 定向测试：`test_web.py` 141 项、`test_workbench.py` 44 项、`test_article_sources.py` 22 项、`test_research_to_article.py` 20 项、`test_research_search.py` 20 项、`test_article_context.py` 14 项、`test_legacy_compat.py` 12 项，均全绿。其中 `test_the_radar_event_publishes_an_aligned_url_list` 已确认能捕获修复前的错位配对（回退实现即失败）。
+- 全量测试：`PYTHONPATH=src:tests python3 -m unittest discover -s tests` — `Ran 823 tests`，`OK (skipped=1)`。
+- 定向测试：`test_web.py` 141 项、`test_workbench.py` 46 项、`test_article_sources.py` 22 项、`test_research_to_article.py` 21 项、`test_research_search.py` 20 项、`test_article_context.py` 14 项、`test_legacy_compat.py` 12 项，均全绿。其中 `test_the_radar_event_publishes_an_aligned_url_list` 已确认能捕获修复前的错位配对（回退实现即失败）。
 - 离线自检：`PYTHONPATH=src python3 -m autoposting.cli self-check --workspace data/self-check` → `ok: true`，10 项检查全 `true`。
 - 静态清场（`src/` 全量检索）：`hooks/find`、`find_hooks`、`热点候选`、`观点候选`、`Skill查找器`、`legacy-lane-tabs`、`legacy-ui-contract`、`body.lane-`、`skill-search-row`、`skill-source-bar`、`skill-degraded-note`、`skill-list` 命中数为 0（`GitHub 周榜` 仅作为 preset / 工作室名称存在）。
 - 真实服务（`127.0.0.1:8080`，`GET /api/status` → `version: 3.2.1`）与真实浏览器（ego-browser）逐项验证：
