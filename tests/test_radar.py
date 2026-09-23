@@ -434,7 +434,7 @@ class RadarCollectionIntegrationTests(unittest.TestCase):
         self.assertTrue(snapshots)
         self.assertEqual("engagement", snapshots[0]["metric"])
 
-    def test_viewpoints_lane_still_uses_radar_without_mixing_hotspots(self):
+    def test_community_scope_still_uses_radar_without_mixing_editorial_items(self):
         reddit = Source(
             "reddit_ai", "Reddit", "reddit", "r/LocalLLaMA", "S4", ("models",), True, 15
         )
@@ -452,7 +452,7 @@ class RadarCollectionIntegrationTests(unittest.TestCase):
         )
         service = HotspotService(self.db, (*self.sources, reddit), fetcher=lambda _: b"<rss><channel/></rss>")
 
-        payload = service.list_window(24, translate=False, lane="viewpoints")
+        payload = service.list_window(24, translate=False, scope="community")
 
         self.assertEqual(1, len(payload["candidates"]))
         self.assertEqual(1, len(payload["radar"]["events"]))

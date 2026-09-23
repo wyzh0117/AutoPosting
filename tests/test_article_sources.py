@@ -122,8 +122,12 @@ class ArticleSourceLinkTests(unittest.TestCase):
         )
 
         self.assertIn("[第一篇事实](https://lab.example/one)", framed)
-        self.assertIn("lab_blog", framed)
         self.assertNotIn("https://lab.example/two", framed)
+        # The repeat still must not be guessed at ... but a bare machine id is
+        # not prose either: it is dropped, and the source panel carries the
+        # second source record.  What matters is that the text stays readable.
+        self.assertNotIn("lab_blog", framed)
+        self.assertNotIn("，。", framed)
 
     def test_duplicate_source_id_uses_unique_citation_markers_when_present(self) -> None:
         framed = frame_article_body(
@@ -220,5 +224,174 @@ class ArticleSourceLinkTests(unittest.TestCase):
             self.assertIn('"citation_id": "media_feed"', model.calls[0][2])
 
 
+class LeftoverSourceMarkerTests(unittest.TestCase):
+    """A source id is a machine token; it must never reach the reader as prose."""
+
+    RECORDS = [
+        {"source_id": "openai_news", "source_url": "https://openai.com/index/x", "name": "OpenAI"},
+        {"source_id": "reddit_openai", "source_url": "https://www.reddit.com/r/OpenAI/comments/1/", "name": "r/OpenAI"},
+    ]
+
+    def test_second_mention_is_dropped_but_the_link_survives(self) -> None:
+        framed = frame_article_body(
+            "此前定位最低的 Terra 型号不再提供 reddit_openai。\n"
+            "社区在讨论 Luna reddit_openai 的性价比。",
+            self.RECORDS,
+            inline_sources=True,
+        )
+        self.assertNotIn("reddit_openai", framed)
+        self.assertEqual(1, framed.count("](https://www.reddit.com/r/OpenAI/comments/1/)"))
+        # The cut must not leave a hole or a double space behind.
+        self.assertNotIn("提供 。", framed)
+        self.assertNotIn("  ", framed)
+
+    def test_a_clause_that_cannot_be_linked_still_loses_its_token(self) -> None:
+        framed = frame_article_body(
+            "开头 openai_news 就提到它。", self.RECORDS, inline_sources=True
+        )
+        self.assertNotIn("openai_news", framed)
+        self.assertIn("](https://openai.com/index/x)", framed)
+
+    def test_occurrence_suffixed_ids_are_dropped_too(self) -> None:
+        framed = frame_article_body(
+            "社区在讨论 Luna reddit_openai 的性价比，也有人对比 reddit_openai#2 的旧帖。",
+            self.RECORDS,
+            inline_sources=True,
+        )
+        self.assertNotIn("reddit_openai", framed)
+        self.assertEqual(1, framed.count("]("))
+
+    def test_a_link_is_never_stripped(self) -> None:
+        framed = frame_article_body(
+            "官方发布了 openai_news 的新模型。", self.RECORDS, inline_sources=True
+        )
+        self.assertIn("[官方发布了](https://openai.com/index/x) 的新模型。", framed)
+
+    def test_without_inline_sources_the_ids_are_left_alone(self) -> None:
+        # The manual/discussion paths write a source tail instead of inline
+        # links, so the token stays part of that tail.
+        framed = frame_article_body(
+            "正文提到 openai_news 一次。", self.RECORDS
+        )
+        self.assertIn("openai_news", framed)
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SentenceInitialCitationTests(unittest.TestCase):
+    """A citation at the start of a sentence still becomes a link."""
+
+    def test_a_sentence_initial_token_links_the_clause_after_it(self) -> None:
+        body = "hn_frontpage 页面显示，新模型把输入价格降到每百万 token 2 美元。"
+        framed = frame_article_body(
+            body,
+            [{"source_id": "hn_frontpage", "name": "Hacker News", "source_url": "https://hn.example/1"}],
+            inline_sources=True,
+        )
+        self.assertNotIn("hn_frontpage", framed)
+        self.assertIn("[页面显示，新模型把输入价格降到每百万 token 2 美元](https://hn.example/1)", framed)
+
+    def test_a_label_word_still_links_the_clause_after_it(self) -> None:
+        body = "来源：openai_news 官方说明把价格下调了 50%。"
+        framed = frame_article_body(
+            body,
+            [{"source_id": "openai_news", "name": "OpenAI News", "source_url": "https://openai.example/1"}],
+            inline_sources=True,
+        )
+        self.assertNotIn("openai_news", framed)
+        self.assertIn("(https://openai.example/1)", framed)
+
+    def test_a_link_label_never_swallows_another_source_token(self) -> None:
+        # Both ids share one url, so only the first gets a link record; the other
+        # must leave the prose instead of being printed inside the label.
+        body = "两个新模型 openai_news：Sol 和 Luna hn_frontpage。"
+        framed = frame_article_body(
+            body,
+            [
+                {"source_id": "hn_frontpage", "name": "Hacker News", "source_url": "https://openai.example/1"},
+                {"source_id": "openai_news", "name": "OpenAI News", "source_url": "https://openai.example/1"},
+            ],
+            inline_sources=True,
+        )
+        for source_id in ("hn_frontpage", "openai_news"):
+            self.assertNotIn(source_id, framed)
+        self.assertNotIn(" ：", framed)
+        self.assertIn("](https://openai.example/1)", framed)
+
+    def test_an_unknown_source_id_still_leaves_the_prose(self) -> None:
+        # The model occasionally cites a source that is not in this article's
+        # records; the caller passes the environment's ids so it is cleaned too.
+        body = "社区讨论热烈 reddit_openai，但这次发布是官方口径 openai_news。"
+        framed = frame_article_body(
+            body,
+            [{"source_id": "openai_news", "name": "OpenAI News", "source_url": "https://openai.example/1"}],
+            inline_sources=True,
+            extra_source_ids=("reddit_openai",),
+        )
+        self.assertNotIn("reddit_openai", framed)
+        self.assertNotIn("openai_news", framed)
+        self.assertIn("](https://openai.example/1)", framed)
+
+    def test_a_source_line_that_cannot_be_inlined_becomes_a_reference_list(self) -> None:
+        # The model sometimes lists its sources on one line instead of naming
+        # them in the prose.  That line is dropped, so the sources must still be
+        # reachable — and the draft must still carry a url an edit can validate.
+        body = "hn_frontpage openai_news\n\n文章正文讨论了价格下调与后续影响。"
+        framed = frame_article_body(
+            body,
+            [
+                {"source_id": "hn_frontpage", "name": "Hacker News", "source_url": "https://hn.example/1"},
+                {"source_id": "openai_news", "name": "OpenAI News", "source_url": "https://openai.example/1"},
+            ],
+            inline_sources=True,
+        )
+        self.assertNotIn("hn_frontpage ", framed.split("原文链接")[0])
+        self.assertIn("原文链接", framed)
+        self.assertIn("- Hacker News（hn_frontpage）：https://hn.example/1", framed)
+        self.assertIn("- OpenAI News（openai_news）：https://openai.example/1", framed)
+
+    def test_an_inlined_source_does_not_add_a_reference_list(self) -> None:
+        body = "社区讨论很热烈 reddit_openai，官方随后更新了价格页。"
+        framed = frame_article_body(
+            body,
+            [
+                {"source_id": "reddit_openai", "name": "Reddit r/OpenAI", "source_url": "https://reddit.example/1"},
+            ],
+            inline_sources=True,
+        )
+        self.assertNotIn("原文链接", framed)
+        self.assertIn("](https://reddit.example/1)", framed)
+        self.assertNotIn("reddit_openai", framed)
+
+    def test_a_source_without_a_url_adds_nothing_to_the_reference_list(self) -> None:
+        body = "正文只提到了一次 lab_blog。"
+        framed = frame_article_body(
+            body,
+            [{"source_id": "lab_blog", "name": "Lab Blog", "source_url": ""}],
+            inline_sources=True,
+        )
+        self.assertNotIn("原文链接", framed)
+        self.assertNotIn("lab_blog", framed)
+
+    def test_a_label_line_citation_still_keeps_the_source_reachable(self) -> None:
+        # A model may cite its source on its own label line instead of in prose.
+        # That line is unreadable and is removed, but the article must not lose
+        # its attribution — otherwise the draft can never be saved again.
+        framed = frame_article_body(
+            "实验室发布了模型一。\n来源：openai_news\nAIGC 声明：本文由 AI 辅助生成。",
+            [{"source_id": "openai_news", "name": "OpenAI News", "source_url": "https://openai.example/1"}],
+            inline_sources=True,
+        )
+        self.assertNotIn("来源：openai_news", framed)
+        self.assertIn("原文链接", framed)
+        self.assertIn("https://openai.example/1", framed)
+
+    def test_a_label_line_removes_a_decoy_url_but_keeps_the_source_url(self) -> None:
+        framed = frame_article_body(
+            "正文事实。\n图片来源：lab_blog · https://lab.example/image.jpg\n来源：lab_blog\nAIGC",
+            [{"source_id": "lab_blog", "name": "Lab Blog", "source_url": "https://lab.example/article"}],
+            inline_sources=True,
+        )
+        self.assertNotIn("https://lab.example/image.jpg", framed)
+        self.assertIn("https://lab.example/article", framed)

@@ -67,7 +67,37 @@ def _plain_text_spans(text: str) -> list[tuple[int, int]]:
     return sorted(spans)
 
 
-def _replace_first_source_id(text: str, source_id: str, url: str) -> str:
+def _following_clause(
+    text: str,
+    start: int,
+    end: int,
+    sentence_end: int,
+    markers: tuple[str, ...] = (),
+) -> tuple[int, int]:
+    """Byte range of the clause after a citation token, without its separators.
+
+    The clause stops at the next citation token: a link label must never swallow
+    a *different* source's machine id, which would print it to the reader.
+    """
+    follow_start = end
+    while follow_start < sentence_end and text[follow_start] in "，,：:、;； \t":
+        follow_start += 1
+    follow_end = sentence_end
+    for marker in markers:
+        if not marker:
+            continue
+        found = text.find(marker, follow_start, follow_end)
+        while found >= 0:
+            follow_end = min(follow_end, found)
+            found = text.find(marker, found + 1, follow_end + len(marker))
+    while follow_end > follow_start and text[follow_end - 1] in "，,：:、;； \t":
+        follow_end -= 1
+    return follow_start, follow_end
+
+
+def _replace_first_source_id(
+    text: str, source_id: str, url: str, markers: tuple[str, ...] = ()
+) -> str:
     if not source_id or not url:
         return text
     protected = _plain_text_spans(text)
@@ -92,9 +122,37 @@ def _replace_first_source_id(text: str, source_id: str, url: str) -> str:
         while anchor_start < start and text[anchor_start].isspace():
             anchor_start += 1
         anchor_end = start
+        # A label must never swallow another source's token: cut the anchor after
+        # the last marker inside it, or fall through to the following clause.
+        for marker in markers:
+            if not marker:
+                continue
+            position = text.rfind(marker, anchor_start, anchor_end)
+            if position >= 0:
+                anchor_start = position + len(marker)
+        while anchor_start < anchor_end and text[anchor_start] in "，,：:、;； \t":
+            anchor_start += 1
         while anchor_end > anchor_start and text[anchor_end - 1] in "，,：:、;； \t":
             anchor_end -= 1
         if anchor_end <= anchor_start:
+            # A sentence-initial token has no clause to wrap in front of it, so
+            # link the clause that follows instead.  Dropping the token would
+            # leave the article with no attribution for that source and the
+            # draft with nothing to validate an edit against.
+            sentence_end = len(text)
+            for boundary in "。！？；\n":
+                position = text.find(boundary, end)
+                if position >= 0:
+                    sentence_end = min(sentence_end, position)
+            follow_start, follow_end = _following_clause(
+                text, start, end, sentence_end, markers
+            )
+            if follow_end > follow_start:
+                return (
+                    text[:start]
+                    + f"[{text[follow_start:follow_end]}]({url})"
+                    + text[follow_end:]
+                )
             continue
         anchor = text[anchor_start:anchor_end]
         if anchor in {
@@ -106,12 +164,9 @@ def _replace_first_source_id(text: str, source_id: str, url: str) -> str:
                 position = text.find(boundary, end)
                 if position >= 0:
                     sentence_end = min(sentence_end, position)
-            follow_start = end
-            while follow_start < sentence_end and text[follow_start] in "，,：:、;； \t":
-                follow_start += 1
-            follow_end = sentence_end
-            while follow_end > follow_start and text[follow_end - 1] in "，,：:、;； \t":
-                follow_end -= 1
+            follow_start, follow_end = _following_clause(
+                text, start, end, sentence_end, markers
+            )
             if follow_end <= follow_start:
                 continue
             return (
@@ -128,8 +183,68 @@ def _replace_first_source_id(text: str, source_id: str, url: str) -> str:
 
 
 def _inline_source_links(text: str, records: list[tuple[str, str]]) -> str:
+    markers = tuple(
+        sorted({source_id for source_id, _url in records if source_id}, key=len, reverse=True)
+    )
     for source_id, url in sorted(records, key=lambda item: len(item[0]), reverse=True):
-        text = _replace_first_source_id(text, source_id, url)
+        text = _replace_first_source_id(text, source_id, url, markers)
+    return _strip_leftover_source_markers(text, records)
+
+
+def _strip_leftover_source_markers(
+    text: str, records: list[tuple[str, str]]
+) -> str:
+    """Remove source ids that survived inlining.
+
+    A source id is a machine token (``openai_news``), never prose: the model is
+    told to reference each source, and :func:`_replace_first_source_id` turns the
+    first reference into a link.  A second mention — or one whose clause cannot
+    be linked — would otherwise be printed verbatim to the reader, reading as a
+    non-sequitur inside a sentence.  Drop the token; keep every link already made.
+    """
+    markers = sorted(
+        {
+            marker
+            for source_id, _url in records
+            if source_id
+            for marker in (source_id, f"{source_id}#")
+        },
+        key=len,
+        reverse=True,
+    )
+    if not markers:
+        return text
+    protected = _plain_text_spans(text)
+    pattern = re.compile(
+        r"(?<![\w.-])(?:"
+        + "|".join(re.escape(marker) for marker in markers)
+        + r")\d*(?![\w.-])"
+    )
+    spans = [
+        (start, end)
+        for start, end in (match.span() for match in pattern.finditer(text))
+        if not any(left <= start < right for left, right in protected)
+    ]
+    terminal = "。；！？,.;!?)）"
+    leading = "，,、；;：:"
+    for start, end in reversed(spans):
+        # The token sits inside a sentence, so a bare cut leaves a hole
+        # ("不再提供 。").  Take the leading separator with it.
+        if start > 0 and text[start - 1] == " ":
+            if (
+                end >= len(text)
+                or text[end] in terminal
+                or text[end] == " "
+                or text[end] in leading
+            ):
+                # Also avoids a double space ("Luna  的") and a stranded
+                # "两个新模型 ：" once the token between them is gone.
+                start -= 1
+        elif start > 0 and text[start - 1] in "，,、；;：:":
+            if end >= len(text) or text[end] in terminal:
+                # "第二篇事实，lab_blog。" must not become "第二篇事实，。".
+                start -= 1
+        text = text[:start] + text[end:]
     return text
 
 
@@ -279,6 +394,62 @@ def extract_hn_id(*values: object) -> str:
     return ""
 
 
+def _has_prose(text: str) -> bool:
+    """True when the framed body still reads as an article.
+
+    A body that is nothing but the AIGC disclosure (its source labels having been
+    removed) is not worth a reference section.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "AIGC" in stripped and len(stripped) <= 40:
+            continue
+        return True
+    return False
+
+
+def _append_unlinked_sources(
+    text: str, links: list[tuple[str, str, str, str]], candidates: str
+) -> str:
+    """Keep every source reachable when its citation never became a link.
+
+    A model sometimes lists its sources on one line ("hn_frontpage openai_news")
+    instead of naming them in the prose.  That line is not readable, so it is
+    dropped — but dropping it must not leave the article with no attribution at
+    all (and the draft with no source an edit could be validated against).  Those
+    sources get a reference list, the same shape the non-inline frame uses.
+
+    Only a source that really was cited this way is listed: a source whose label
+    block was removed is gone by design, and a second url for an already-linked
+    source is not an attribution the article ever made.
+    """
+    if not _has_prose(text):
+        return text
+    missing: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for name, source_id, url, _citation_id in links:
+        if not url or source_id in seen:
+            continue
+        if url in text:
+            # Already attributed in the prose; a second url for the same source
+            # is not a citation the article ever made.
+            seen.add(source_id)
+            continue
+        if not re.search(rf"(?<![\w.-]){re.escape(source_id)}(?![\w.-])", candidates):
+            continue
+        seen.add(source_id)
+        missing.append((name, source_id, url))
+    if not missing:
+        return text
+    lines = [text.rstrip(), "", "原文链接"]
+    for name, source_id, url in missing:
+        label = f"{name}（{source_id}）" if source_id else name
+        lines.append(f"- {label}：{url}")
+    return "\n".join(lines).strip()
+
+
 def frame_article_body(
     body: str,
     records: list[dict[str, str]],
@@ -286,6 +457,7 @@ def frame_article_body(
     discussion: bool = False,
     promoted: bool = False,
     inline_sources: bool = False,
+    extra_source_ids: tuple[str, ...] = (),
 ) -> str:
     seen_sources: list[str] = []
     links: list[tuple[str, str, str, str]] = []
@@ -312,17 +484,36 @@ def frame_article_body(
             if citation_id and citation_id not in seen_link_source_ids:
                 seen_link_source_ids.add(citation_id)
                 source_links.append((citation_id, url))
+        # Every source that will be reported keeps its machine id out of the
+        # prose, including one with no url to link: the id is not a word.
+        covered = {link_id.split("#", 1)[0] for link_id, _url in source_links}
+        source_links.extend(
+            (source_id, "") for source_id in seen_sources if source_id not in covered
+        )
+        # A model can cite a source that is not part of this article's records.
+        # The caller knows the environment's source ids, so they still leave the
+        # prose instead of being printed as a machine token.
+        source_links.extend(
+            (str(source_id).strip(), "")
+            for source_id in extra_source_ids
+            if str(source_id).strip() and str(source_id).strip() not in covered
+        )
         source_markers = tuple(
             marker
             for _name, source_id, _url, citation_id in links
             for marker in (source_id, citation_id)
             if marker
         )
+        # A source cited on its own label line ("来源：openai_news") is removed as
+        # unreadable, exactly like a bare id line; it must still become
+        # reachable, so the citation check runs before the tail removal.
+        cited_candidates = text
         text = _remove_source_tail(text, source_markers)
         text = _inline_source_links(
             text,
             source_links,
         )
+        text = _append_unlinked_sources(text, links, cited_candidates)
         if discussion:
             text = "\n".join(
                 [text, "", PROMOTED_NOTE if promoted else DISCUSSION_NOTE]

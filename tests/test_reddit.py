@@ -202,14 +202,14 @@ class RedditCollectorTests(unittest.TestCase):
             self.assertEqual(1, result.inserted)
             self.assertEqual(0, result.failed)
             rows = database.list_hotspot_candidates(
-                "2020-01-01T00:00:00+00:00", limit=10, sort="heat", lane="viewpoints"
+                "2020-01-01T00:00:00+00:00", limit=10, sort="heat", scope="community"
             )
             self.assertEqual(1, len(rows))
             self.assertEqual("I replaced my morning email with a Claude project", rows[0]["title"])
             self.assertEqual(420, rows[0]["engagement"]["score"])
             self.assertEqual(88, rows[0]["engagement"]["comments"])
             news = database.list_hotspot_candidates(
-                "2020-01-01T00:00:00+00:00", limit=10, sort="heat", lane="hotspots"
+                "2020-01-01T00:00:00+00:00", limit=10, sort="heat", scope="official"
             )
             self.assertEqual([], news)
             self.assertTrue(any("/hot.json" in url for url in calls))
@@ -238,7 +238,7 @@ class RedditCollectorTests(unittest.TestCase):
             result = RedditCollector(database, fetcher=fetcher).collect(source)
             self.assertEqual(1, result.inserted)
             item = database.list_hotspot_candidates(
-                "2020-01-01T00:00:00+00:00", limit=10, lane="viewpoints"
+                "2020-01-01T00:00:00+00:00", limit=10, scope="community"
             )[0]
             self.assertIn("dump the inbox", str(item["content_text"]))
             self.assertNotIn("热评：", str(item["content_text"]))
@@ -285,7 +285,7 @@ class RedditCollectorTests(unittest.TestCase):
             result = RedditCollector(database, fetcher=fetcher).collect(source)
             self.assertEqual(1, result.inserted)
             row = database.list_hotspot_candidates(
-                "2020-01-01T00:00:00+00:00", limit=10, lane="viewpoints"
+                "2020-01-01T00:00:00+00:00", limit=10, scope="community"
             )[0]
             self.assertEqual("RSS fallback post", row["title"])
             self.assertIn("project folder", str(row["content_text"]))

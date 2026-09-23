@@ -146,6 +146,61 @@ def _skill_md(name: str, stage: str) -> str:
     return f"# {name}\n\n解决播客流程里的{stage}。\n"
 
 
+class StudioStatusRoutingTests(unittest.TestCase):
+    """A creation-page studio must report on the creation page.
+
+    Both poster studios live in `#page-creation`, so a message written to the
+    news-only `#hotspot-status` line is invisible exactly when the user needs it
+    (it renders on another page).  Every studio-side message goes to the shared
+    `#studio-status` live region instead.
+    """
+
+    STUDIO_FUNCTIONS = (
+        "loadGithubWeekly",
+        "renderGithubWeeklyImages",
+        "copyGithubXhs",
+        "exportGithubImages",
+        "saveSkillTitle",
+        "loadSkills",
+        "searchSkills",
+        "renderSkillCoverOnly",
+        "renderSkillImages",
+        "exportSkillImages",
+    )
+    NEWS_FUNCTIONS = (
+        "runResearch",
+        "applyHotspots",
+        "translateTitles",
+        "collect",
+        "setNewsScope",
+    )
+    NEWS_LINE = 'status("hotspot-status"'
+    STUDIO_LINE = 'status("studio-status"'
+
+    def _function_body(self, name: str) -> str:
+        marker = "function " + name + "("
+        self.assertIn(marker, INDEX_HTML, name + " is missing")
+        return INDEX_HTML.split(marker, 1)[1].split("\nfunction ", 1)[0]
+
+    def test_every_studio_function_reports_on_the_studio_line(self) -> None:
+        for name in self.STUDIO_FUNCTIONS:
+            body = self._function_body(name)
+            self.assertNotIn(self.NEWS_LINE, body, name + " writes the news status line")
+            self.assertIn(self.STUDIO_LINE, body, name + " never reports to the user")
+
+    def test_news_functions_keep_the_news_line(self) -> None:
+        for name in self.NEWS_FUNCTIONS:
+            self.assertIn(self.NEWS_LINE, self._function_body(name), name)
+
+    def test_the_two_status_lines_are_on_different_pages(self) -> None:
+        news = INDEX_HTML[INDEX_HTML.index('id="page-news"') : INDEX_HTML.index('id="page-creation"')]
+        creation = INDEX_HTML[INDEX_HTML.index('id="page-creation"') : INDEX_HTML.index('id="page-publishing"')]
+        self.assertIn('id="hotspot-status"', news)
+        self.assertNotIn('id="hotspot-status"', creation)
+        self.assertIn('id="studio-status"', creation)
+        self.assertNotIn('id="studio-status"', news)
+
+
 class SkillFinderTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_skill_finder_state()
@@ -2610,96 +2665,136 @@ class SkillFinderApiTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
-    def test_skills_lane_has_paste_box_and_github_token_box(self) -> None:
-        """Pasted links and the optional token live in the skills lane only."""
+    def test_paste_box_and_github_token_box_have_new_owners(self) -> None:
+        """Pasted links are read on 资源探索; the token card lives in 设置."""
         html = INDEX_HTML
-        self.assertIn('id="skill-links"', html)
-        self.assertIn('id="skill-paste-btn"', html)
-        self.assertIn('id="skill-paste-hint"', html)
-        self.assertIn("/api/skills/paste", html)
-        self.assertIn('id="skill-token-box"', html)
-        self.assertIn('id="skill-github-token"', html)
-        self.assertIn("/api/skills/github-token", html)
-        # 1.4.0 的粘贴框是多行 textarea，会跟着内容长高；旧的单行 input 已经没了。
-        self.assertIn('<textarea id="skill-links" rows="3"', html)
-        self.assertNotIn('<input id="skill-links"', html)
-        self.assertIn("function growSkillLinks()", html)
-        # 高度跟着内容长，最多到窗口的 40%。
-        self.assertIn("Math.round(window.innerHeight * 0.4)", html)
-        self.assertIn("Math.min(Math.max(box.scrollHeight, 76), ceiling)", html)
-        self.assertIn("function resetSkillLinks()", html)
-        # 回车换行，Ctrl/Cmd+Enter 才触发粘贴。
-        self.assertIn('$("skill-links").addEventListener("input", growSkillLinks)', html)
-        self.assertIn('event.key === "Enter" && (event.metaKey || event.ctrlKey)', html)
-        # Same lane scoping as the search row: hidden by default, shown only in 技能栏.
-        self.assertRegex(
+        # 资源探索 owns the inputs the studio used to read from itself.
+        self.assertIn('id="resource-query"', html)
+        self.assertIn('<textarea id="resource-pasted-text" rows="2" maxlength="20000"', html)
+        self.assertIn('id="resource-studio-btn"', html)
+        self.assertIn("function sendResourcesToStudio()", html)
+        # Both entry points take their input as an argument — no DOM read inside.
+        self.assertIn("function searchSkills(query)", html)
+        self.assertIn("function pasteSkills(links)", html)
+        self.assertIn(
+            '$("resource-studio-btn").addEventListener("click", function () { sendResourcesToStudio(); });',
             html,
-            r"#skill-search-row,[^{]*#skill-paste-row[^{]*"
-            r"#skill-paste-hint[^{]*#skill-token-box[^{]*\{[^}]*display:none",
         )
-        self.assertIn("body.lane-skills #skill-paste-row{display:flex", html)
-        self.assertIn("body.lane-skills #skill-token-box{display:block", html)
+        # The GitHub Token card exists only in 设置, and never echoes the token.
+        self.assertIn('id="settings-github-token"', html)
+        self.assertIn('id="settings-save-github-token"', html)
+        self.assertIn('id="settings-clear-github-token"', html)
+        self.assertIn('id="settings-github-status"', html)
+        self.assertIn('$("settings-save-github-token").addEventListener("click"', html)
+        self.assertIn('$("settings-clear-github-token").addEventListener("click"', html)
+        self.assertIn("function renderGithubTokenState(", html)
+        self.assertIn("/api/skills/github-token", html)
+        self.assertIn("/api/skills/paste", html)
+        # The studio is handed the resource-page values; it never reads a hidden field.
+        handoff = html[
+            html.index("function sendResourcesToStudio()") : html.index("function openWeeklyStudio()")
+        ]
+        self.assertIn('$("resource-query")', handoff)
+        self.assertIn('$("resource-pasted-text")', handoff)
+        self.assertIn("searchSkills(query)", handoff)
+        self.assertIn("pasteSkills(links)", handoff)
+        self.assertIn('status("studio-status"', handoff)
         # Pasting runs the same two steps a search does: package first, then posters.
-        paste = html[html.index("function pasteSkills()") : html.index("function openSkillsLightbox(")]
+        paste = html[html.index("function pasteSkills(") : html.index("function openSkillsLightbox(")]
         self.assertIn("renderSkillPackage(data)", paste)
         self.assertIn("renderSkillImages()", paste)
-        self.assertIn("resetSkillLinks()", paste)
         self.assertIn("data.unverified", paste)
         self.assertIn("没读到 SKILL.md", paste)
         # 上限从 4000 提到 20000（MAX_PASTE_CHARS），客户端文案也要跟着说 20000。
-        self.assertIn('links.length > 20000', paste)
+        self.assertIn("links.length > 20000", paste)
+        self.assertIn("粘贴内容过长", paste)
         self.assertIn("上限 20000", paste)
-        self.assertIn('$("skill-paste-btn").addEventListener("click", pasteSkills)', html)
-        self.assertIn('$("skill-token-save").addEventListener("click", saveGithubToken)', html)
-        self.assertIn('$("skill-token-clear").addEventListener("click", clearGithubToken)', html)
-        # 1.4.0 删掉了 #skill-stage-chips / #skill-gap-note。1.4.3 把 skill 列表
-        # 加回来，用来勾选出图对象；来源 chip 仍回答「这些 skill 从哪来」。
-        for gone in ('id="skill-stage-chips"', 'id="skill-gap-note"', "gapReason("):
+        # The retired lane DOM: every one of these ids is gone from the page.
+        for gone in (
+            'id="skill-paste-row"',
+            'id="skill-links"',
+            'id="skill-paste-btn"',
+            'id="skill-paste-hint"',
+            'id="skill-paste-status"',
+            'id="skill-token-box"',
+            'id="skill-token-save"',
+            'id="skill-token-clear"',
+            'id="skill-github-token"',
+            'id="skill-search-row"',
+            'id="skill-query"',
+            'id="skill-search-btn"',
+            'id="skill-clear-btn"',
+            '$("skill-links")',
+            '$("skill-query")',
+            'id="skill-stage-chips"',
+            'id="skill-gap-note"',
+            "gapReason(",
+            "function growSkillLinks()",
+            "function resetSkillLinks()",
+            "function setPasteStatus(",
+        ):
             self.assertNotIn(gone, html, msg=f"{gone} 已从技能栏移除")
-        self.assertIn('id="skill-list"', html)
-        self.assertIn('id="skill-source-bar"', html)
-        self.assertIn('<ul id="skill-source-chips"', html)
+        # The merged source block: one chip per source, inside the visible studio.
+        self.assertIn('<ul id="skills-source-chips"', html)
         self.assertIn("function renderSkillSourceChips(", html)
         source_fn = html[
-            html.index("var SKILL_SOURCE_LABELS = {") : html.index("function renderCrawlSources(")
+            html.index("var SKILL_SOURCE_LABELS = {") : html.index("function skillIdentity(")
         ]
         self.assertIn("手动粘贴", source_fn)
         self.assertIn('"is-manual"', source_fn)
         self.assertIn('label + " " + counts[label]', source_fn)
         for label in ("GitHub", "skills.sh", "网页检索"):
             self.assertIn(label, source_fn)
-        self.assertIn('id="skill-degraded-note"', html)
-        # 当前自动抓取源的展开列表。
-        self.assertIn('id="skill-source-toggle"', html)
-        self.assertIn('id="skill-crawl-sources"', html)
-        self.assertIn("当前自动抓取 skill 的源：", html)
+        self.assertIn('id="skills-degraded-note"', html)
         # 标题框：既上封面海报也做介绍文标题。
         self.assertIn('id="skill-title"', html)
         self.assertIn("/api/skills/title", html)
         self.assertIn('$("skills-title").textContent = userTitle || articleTitle', html)
-        # 清空按钮紧跟在查找按钮后面。
-        self.assertIn('id="skill-clear-btn"', html)
-        self.assertLess(
-            html.index('id="skill-search-btn"'), html.index('id="skill-clear-btn"')
-        )
-        self.assertLess(
-            html.index('id="skill-clear-btn"'), html.index('id="skills-studio"')
-        )
+        # 清空收录 lives in the studio, next to 读取上次收录.
+        self.assertIn('id="skills-clear-btn"', html)
+        self.assertIn('$("skills-clear-btn").addEventListener("click", clearSkills);', html)
+        self.assertIn('status("studio-status", "已清空收录的 skill（标题保留）"', html)
         self.assertIn("/api/skills/clear", html)
 
     def test_degraded_note_speaks_chinese_not_reason_tokens(self) -> None:
-        """`github:rate_limited` must not reach the page as a raw token."""
+        """`github:rate_limited` must not reach the page as a raw token.
+
+        The note is the visible #skills-degraded-note, next to the source chips.
+        """
+        import re
+
         html = INDEX_HTML
+        self.assertIn('<p id="skills-degraded-note" role="status" hidden>', html)
         self.assertIn("function degradeLabel(", html)
         self.assertIn("function degradedSummary(", html)
         self.assertIn('"github:rate_limited"', html)
         self.assertIn("GitHub 接口限流", html)
-        self.assertIn("配置 GitHub Token", html)
-        note_fn = html[html.index("function degradedSummary(") : html.index("function renderSkillPackage(")]
+        note_fn = html[
+            html.index("function degradedSummary(") : html.index("var SKILL_SOURCE_LABELS = {")
+        ]
         self.assertIn("githubTokenConfigured", note_fn)
+        # Rate limiting points at the GitHub Token, and only when none is configured.
+        self.assertIn(
+            'reasons.indexOf("github:rate_limited") >= 0 && !state.githubTokenConfigured', note_fn
+        )
+        self.assertIn("GitHub Token", note_fn)
         render = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
         self.assertIn("degradedSummary(reasons)", render)
         self.assertIn("degradedNote.title = reasons.join", render)
+        # Visibility is driven, not decorative: the note is unhidden exactly when a
+        # source degraded, and it is the Chinese summary that goes into it.
+        self.assertIn("degradedNote.hidden = !degraded;", render)
+        self.assertIn('degradedNote.textContent = degraded ? degradedSummary(reasons) : "";', render)
+        # Every mapped reason renders Chinese; the raw `source:kind` token stays in title.
+        labels_at = html.index("var DEGRADE_LABELS = {")
+        labels = html[labels_at : html.index("};", labels_at)]
+        values = re.findall(r':\s*"([^"]*)"', labels)
+        self.assertTrue(values, msg="DEGRADE_LABELS 没有解析出任何映射")
+        for value in values:
+            self.assertNotIn(":", value, msg=f"原始降级记号漏进了用户可见文案：{value}")
+            self.assertTrue(
+                any(ord(char) > 127 for char in value), msg=f"降级文案不是中文：{value}"
+            )
 
     def test_search_rejects_empty_query(self) -> None:
         status, payload = self._request("POST", "/api/skills/search", {"query": ""})
@@ -2750,35 +2845,47 @@ class SkillFinderApiTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertIn("20000", str(payload["error"]))
 
-    def test_paste_result_has_its_own_visible_line(self) -> None:
-        """The render overwrites the shared status line, so the paste result needs its own."""
-        html = INDEX_HTML
-        self.assertIn('id="skill-paste-status"', html)
-        self.assertRegex(
-            html,
-            r"#skill-paste-hint[^{]*#skill-paste-status[^{]*#skill-token-box[^{]*\{[^}]*display:none",
-        )
-        self.assertIn("body.lane-skills #skill-paste-status:not([hidden]){display:block;}", html)
-        self.assertIn('$("skill-paste-status")', html)
-        self.assertIn("node.hidden = !text;", html)
-        paste = html[html.index("function setPasteStatus(") : html.index("function renderGithubTokenState(")]
-        self.assertIn("setPasteStatus", paste)
-        self.assertIn('setPasteStatus(summary', paste)
-        self.assertIn("替换 ", paste)
-        # The input is not truncated by the browser any more: the client checks the
-        # length itself so a cut-off tail cannot become a phantom repo.
-        links_input = html[html.index('id="skill-links"') : html.index('id="skill-paste-btn"')]
-        self.assertNotIn("maxlength", links_input)
-        self.assertIn("链接太长", paste)
+    def test_paste_result_is_visible_on_the_studio_status_line(self) -> None:
+        """The paste result reports into the shared #studio-status line.
 
-    def test_render_status_updates_are_lane_scoped(self) -> None:
-        """A render that finishes after a lane switch must not talk in another lane."""
+        1.5.0 deletes the paste-only #skill-paste-status line: search, paste and
+        render all report into the one status line the studio owns.
+        """
         html = INDEX_HTML
+        self.assertIn(
+            '<p id="studio-status" class="page-description" role="status" aria-live="polite">', html
+        )
+        paste = html[html.index("function pasteSkills(") : html.index("function renderGithubTokenState(")]
+        self.assertIn('status("studio-status"', paste)
+        # The result names what happened and the package size it leaves behind.
+        self.assertIn('parts.push("新增 " + added + " 个")', paste)
+        self.assertIn('parts.push("替换 " + replaced + " 个")', paste)
+        self.assertIn('"；当前共 " + count + " 个 skill"', paste)
+        self.assertIn("没读到 SKILL.md", paste)
+        # The length guard lives in the client because MAX_PASTE_CHARS is 20000.
+        self.assertIn("links.length > 20000", paste)
+        self.assertIn("粘贴内容过长", paste)
+        # The dedicated line is retired: nothing may render into it.
+        for gone in ('id="skill-paste-status"', "function setPasteStatus("):
+            self.assertNotIn(gone, html, msg=f"{gone} 已删除，粘贴结果统一走 #studio-status")
+
+    def test_render_status_updates_use_the_studio_status_line(self) -> None:
+        """A render reports into #studio-status, the line the studio owns.
+
+        Lanes are retired (no body.lane-* any more): the studio lives on the
+        creation page and every render update goes to the one visible status line.
+        """
+        html = INDEX_HTML
+        self.assertNotIn("body.lane-", html)
         render_fn = html[html.index("function renderSkillImages()") : html.index("function exportSkillImages()")]
-        self.assertIn("laneStatus", render_fn)
-        self.assertIn('state.lane === "skills"', render_fn)
+        self.assertIn("var studioStatus = function", render_fn)
+        self.assertIn('status("studio-status", text, kind);', render_fn)
+        self.assertIn("studioStatus(", render_fn)
         self.assertIn("skill_package_changed", render_fn)
         self.assertIn("重新点「生成图片」", render_fn)
+        # A failed render must also be visible on the tiles, not only on the line.
+        self.assertIn("image.error = reason;", render_fn)
+        self.assertIn("renderSkillsGallery();", render_fn)
 
     def test_paste_reports_links_without_a_readable_skill_file(self) -> None:
         """A pasted link whose SKILL.md cannot be read still enters, but is flagged."""
@@ -2930,16 +3037,17 @@ class SkillFinderApiTests(unittest.TestCase):
         self.assertIn("video-edit", body, msg="没有模型也要有机械介绍文")
         self.assertIn("AIGC", body)
 
-    def test_skills_lane_shows_studio_gallery_without_autorender(self) -> None:
+    def test_studio_gallery_shows_without_autorender(self) -> None:
         """B3/D4: 查找 and 出图 are two separately controlled stages."""
         html = INDEX_HTML
         self.assertIn('id="skills-studio"', html)
         self.assertIn('id="skills-gallery"', html)
-        self.assertIn("body.lane-skills #skills-studio", html)
-        self.assertIn("body.lane-skills #skills-gallery", html)
+        # The studio is a laid-out block on the creation page, not a hidden lane.
+        self.assertIn("#github-studio,#skills-studio{display:flex", html)
+        self.assertIn('$("skills-gallery")', html)
         self.assertIn("skills_ready", html)
         self.assertIn("function renderSkillImages()", html)
-        search_fn = html[html.index("function searchSkills()") : html.index("function renderSkillImages()")]
+        search_fn = html[html.index("function searchSkills(") : html.index("function renderSkillImages(")]
         # A finished search lays out placeholder tiles and stops there.
         self.assertNotIn("renderSkillImages()", search_fn)
         self.assertIn("queueSkillImagesForRender()", search_fn)
@@ -3002,7 +3110,7 @@ class SkillFinderApiTests(unittest.TestCase):
         self.assertIn("max-height", article_css)
         self.assertIn("overflow-y:auto", article_css)
         self.assertIn("查找完成后会生成介绍文", html)
-        poll_fn = html[html.index("function skillArticleReady(") : html.index("function searchSkills()")]
+        poll_fn = html[html.index("function skillArticleReady(") : html.index("function searchSkills(")]
         compact = poll_fn.replace(" ", "").replace("\n", "")
         self.assertIn("article.body", compact)
         self.assertIn("skillArticleReady", poll_fn)
@@ -3066,33 +3174,6 @@ class SkillFinderApiTests(unittest.TestCase):
         self.assertEqual(article["body"], (saved.get("article") or {}).get("body"))
         self.assertEqual("done", payload.get("phase"))
 
-    def test_skill_search_btn_css_keeps_lookup_on_one_line(self) -> None:
-        html = INDEX_HTML
-        self.assertIn('id="skill-search-btn"', html)
-        self.assertIn(">查找</button>", html)
-        # 旧的收尾标记 #skill-stage-chips 已经不存在；粘贴行是同一段技能栏 CSS 里
-        # 稳定的下一个规则。
-        css = html[
-            html.index("body.lane-skills #skill-search-row") : html.index(
-                "body.lane-skills #skill-paste-row"
-            )
-        ]
-        self.assertIn("#skill-search-btn", css)
-        # 查找按钮和新的清空按钮共用一条规则：都不换行、都不被压缩。
-        self.assertIn("body.lane-skills #skill-search-btn,\nbody.lane-skills #skill-clear-btn{", css)
-        for button in ("#skill-search-btn", "#skill-clear-btn"):
-            self.assertIn(button, css)
-        self.assertIn("white-space:nowrap", css)
-        self.assertIn("flex:0 0 auto", css)
-        self.assertIn("min-width", css)
-        self.assertIn("height:40px", css)
-        self.assertIn("width:auto", css)
-        self.assertIn("min-width:0", css)
-        self.assertIn("flex:1", css)
-        self.assertIn("display:inline-flex", css)
-        self.assertIn("align-items:center", css)
-        self.assertIn("justify-content:center", css)
-
     def test_paint_wait_drops_sliding_meter_keeps_abort(self) -> None:
         html = INDEX_HTML
         paint = html[html.index("function paintWait()") : html.index("function formatTime(")]
@@ -3106,9 +3187,9 @@ class SkillFinderApiTests(unittest.TestCase):
         wait_stop = html[html.index("function waitStop(") : html.index("function scheduleWaitHide(")]
         self.assertIn(".abort.abort()", wait_stop)
         self.assertIn('waitFail("已停止"', wait_stop)
-        search = html[html.index("function searchSkills()") : html.index("function renderSkillImages()")]
+        search = html[html.index("function searchSkills(") : html.index("function renderSkillImages()")]
         self.assertIn("abortSkillSearch", search)
-        poll = html[html.index("function pollSkillSnapshot()") : html.index("function searchSkills()")]
+        poll = html[html.index("function pollSkillSnapshot(") : html.index("function searchSkills(")]
         self.assertIn("abortSkillSearch", poll)
         banner_css = html[html.index("#wait-banner{") : html.index("#wait-jobs{") + 160]
         self.assertIn("pointer-events:none", banner_css)
@@ -3147,20 +3228,22 @@ class SkillFinderApiTests(unittest.TestCase):
         )
         self.assertNotIn("skills_ready", phases)
         self.assertNotIn("done", phases)
-        poll = html[html.index("function pollSkillSnapshot()") : html.index("function searchSkills()")]
+        poll = html[html.index("function pollSkillSnapshot(") : html.index("function searchSkills(")]
         terminal = poll.index('if (phase === "skills_ready" || phase === "done") { return data; }')
         # 终态在「等介绍文」之前就直接返回，不再递归。
         self.assertLess(terminal, poll.index("if (skillArticleReady(data))"))
         self.assertIn("if (!phase || SKILL_POLL_PHASES[phase]) {", poll)
         self.assertLess(terminal, poll.index("if (!phase || SKILL_POLL_PHASES[phase]) {"))
         self.assertIn(
-            "setTimeout(function () { pollSkillSnapshot().then(resolve, reject); }, 350);", poll
+            "setTimeout(function () { pollSkillSnapshot(query).then(resolve, reject); }, 350);", poll
         )
         self.assertIn("skillArticleReady", poll)
         # B3: polling a finished search must not kick off image generation.
         self.assertNotIn("renderSkillImages()", poll)
         self.assertIn('phase === "error"', poll)
-        self.assertIn("pollSkillSnapshot()", poll)
+        # The query is carried through the recursion, not read from a hidden field.
+        self.assertIn("pollSkillSnapshot(query)", poll)
+        self.assertIn("function pollSkillSnapshot(query)", poll)
         self.assertIn("setTimeout", poll)
 
     def test_skill_search_wait_detail_uses_progress_step_index(self) -> None:

@@ -22,6 +22,7 @@ from .diagnostics import (
     serialize_diagnostic,
 )
 from .models import FeedItem, Source, canonical_source_types
+from .legacy_compat import SCOPE_ALL, SCOPE_COMMUNITY, SCOPE_ERROR, SCOPE_OFFICIAL, VALID_SCOPES
 from .normalize import content_hash
 
 
@@ -2480,12 +2481,12 @@ class Database:
         limit: int = 10,
         sort: str = "time",
         pool: int = 40,
-        lane: str = "hotspots",
+        scope: str = SCOPE_ALL,
     ) -> list[dict[str, object]]:
         if sort not in {"time", "heat"}:
             raise ValueError("sort must be time or heat")
-        if lane not in {"hotspots", "viewpoints"}:
-            raise ValueError("lane must be hotspots or viewpoints")
+        if scope not in VALID_SCOPES:
+            raise ValueError(SCOPE_ERROR)
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -2534,9 +2535,9 @@ class Database:
                 source_meta.get(source_id, ("S4", "rss"))[1] == "reddit"
                 for source_id in source_ids
             )
-            if lane == "viewpoints" and not has_reddit:
+            if scope == SCOPE_COMMUNITY and not has_reddit:
                 continue
-            if lane == "hotspots" and has_reddit:
+            if scope == SCOPE_OFFICIAL and has_reddit:
                 continue
             if should_hide_candidate(str(row["title"]), source_ids):
                 continue

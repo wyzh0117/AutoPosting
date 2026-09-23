@@ -1,16 +1,13 @@
 import json
 import tempfile
 import threading
-import time
 import types
 import unittest
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
 
-from autoposting.background import derive_related_query
 from autoposting.content import FactValidationError
 from autoposting.decision import DecisionService
 from autoposting.decision.adapters import JevAdapter
@@ -50,12 +47,6 @@ class FakeModel:
                     },
                     ensure_ascii=False,
                 ),
-                stderr="",
-                returncode=0,
-            )
-        if "候选切口JSON" in prompt:
-            return types.SimpleNamespace(
-                stdout='{"candidates":[{"phrase":"协和医学院4+4试点班","kind":"program"}]}',
                 stderr="",
                 returncode=0,
             )
@@ -175,7 +166,7 @@ class WorkbenchTests(unittest.TestCase):
             self.assertTrue(candidate["summary"])
         self.assertEqual(2, self.db.count_items())
 
-    def test_mixed_lane_collects_both_source_families_and_embeds_collection_run(self) -> None:
+    def test_all_scope_collects_both_source_families_and_embeds_collection_run(self) -> None:
         reddit = Source(
             "reddit_ai",
             "Reddit AI",
@@ -210,7 +201,7 @@ class WorkbenchTests(unittest.TestCase):
             fetcher=fetcher.get,
         )
 
-        payload = service.collect(24, lane="mixed")
+        payload = service.collect(24, scope="all")
 
         self.assertIn("collection_run", payload)
         collection = payload["collection"]
@@ -225,11 +216,26 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual({"lab_blog", "reddit_ai"}, set(event["source_ids"]))
         self.assertEqual(2, event["independent_source_count"])
 
-    def test_mixed_lane_rejects_unknown_lane_before_database_query(self) -> None:
+    def test_unknown_scope_is_rejected_before_any_database_query(self) -> None:
         service = HotspotService(self.db, self.sources, fetcher=lambda _: EMPTY_FEED)
 
-        with self.assertRaisesRegex(ValueError, "lane must be hotspots, viewpoints, or mixed"):
-            service.list_window(24, translate=False, lane="unknown")
+        with self.assertRaisesRegex(ValueError, "scope must be official, community, or all"):
+            service.list_window(24, translate=False, scope="unknown")
+
+    def test_scope_splits_editorial_from_community_sources(self) -> None:
+        reddit = Source(
+            "reddit_ai", "Reddit AI", "reddit", "r/LocalLLaMA", "S4", ("models",), True, 15
+        )
+        self.db.upsert_source(reddit)
+        service = HotspotService(self.db, (*self.sources[:1], reddit), fetcher=lambda _: EMPTY_FEED)
+
+        editorial = {source.source_id for source in service._sources_for_scope("official")}
+        community = {source.source_id for source in service._sources_for_scope("community")}
+        everything = {source.source_id for source in service._sources_for_scope("all")}
+
+        self.assertEqual({"lab_blog"}, editorial)
+        self.assertEqual({"reddit_ai"}, community)
+        self.assertEqual({"lab_blog", "reddit_ai"}, everything)
 
     def test_hotspot_production_path_passes_decision_service_to_radar(self) -> None:
         service = HotspotService(
@@ -378,8 +384,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("media_feed", event["fact_list_json"])
         draft = self.db.get_draft(first["draft_id"])
         self.assertEqual({"lab_blog", "media_feed"}, set(json.loads(draft["source_ids_json"])))
-        self.assertEqual("openai-compatible/unconfigured:none:article-v12", draft["generator"])
-        self.assertEqual("article-v12", draft["processing_version"])
+        self.assertEqual("openai-compatible/unconfigured:none:article-v13", draft["generator"])
+        self.assertEqual("article-v13", draft["processing_version"])
         self.assertEqual("HOTSPOT_ITEM", event["trigger_type"])
         self.assertEqual(2, len(model.calls))
         self.assertEqual("AI专家", first["prompt_style"])
@@ -540,47 +546,17 @@ class WorkbenchTests(unittest.TestCase):
         )
         return str(self.db.connect().execute("SELECT item_id FROM items LIMIT 1").fetchone()["item_id"])
 
-    def test_find_hooks_uses_injected_searcher(self) -> None:
-        item_id = self._one_item("中国医生用 GPT-5.6 破解数学题", self.HOOK_BODY)
-
-        def searcher(query: str) -> list[dict[str, str]]:
-            if "试点班" in query or "4+4" in query:
-                return [
-                    {
-                        "title": "协和4+4试点班争议",
-                        "url": "https://news.example/4plus4",
-                        "snippet": "舆论质疑。",
-                    }
-                ]
-            return []
-
-        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=FakeModel()))
-        payload = workbench.find_hooks(item_id, searcher=searcher)
-        self.assertTrue(payload["ok"])
-        self.assertTrue(any("4+4" in card["phrase"] for card in payload["hooks"]))
-
-    def test_generate_article_without_hooks_omits_chosen_hooks_payload(self) -> None:
+    def test_generate_article_without_research_carries_no_retired_payload(self) -> None:
         item_id = self._one_item("Model One news", "Model One news 内容")
         model = FakeModel()
         workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
         workbench.generate_article(item_id, "wechat")
-        self.assertNotIn('"chosen_hooks"', model.calls[0][2])
-
-    def test_generate_article_with_hooks_puts_them_in_prompt_order(self) -> None:
-        item_id = self._one_item("Model One news", "Model One news 内容")
-        model = FakeModel()
-        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
-        workbench.generate_article(
-            item_id,
-            "wechat",
-            chosen_hooks=[
-                {"phrase": "协和4+4试点班", "why": "公开检索出现争议"},
-                {"phrase": "第二切口"},
-            ],
-        )
-        prompt = model.calls[-1][2]
-        self.assertIn('"chosen_hooks"', prompt)
-        self.assertLess(prompt.index("协和4+4试点班"), prompt.index("第二切口"))
+        prompt = model.calls[0][2]
+        # The retired 找切口 / 相关检索 payloads must never reach the model again.
+        self.assertNotIn("chosen_hooks", prompt)
+        self.assertNotIn("related_news", prompt)
+        # The surviving contract is the ArticleGenerationContext.
+        self.assertIn("article_context", prompt)
 
     def _named_item(self, external_id: str, title: str, body: str) -> str:
         self.db.insert_item(
@@ -617,27 +593,6 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("这是用户从内容页粘贴进来的完整正文，必须进入生成提示。", prompt)
         self.assertIn("pasted_page", prompt)
 
-    def test_generate_article_includes_selected_related_news(self) -> None:
-        item_id = self._named_item("news-1", "Model One news", "Model One news 内容")
-        model = FakeModel()
-        workbench = Workbench(self.db, llm_service=LLMService(self.db, runner=model))
-        workbench.generate_article(
-            item_id,
-            "wechat",
-            related_items=[
-                {
-                    "title": "补充新闻标题",
-                    "url": "https://news.example/extra",
-                    "snippet": "这条相关新闻必须进入生成提示。",
-                }
-            ],
-        )
-        prompt = model.calls[-1][2]
-        self.assertIn("补充新闻标题", prompt)
-        self.assertIn("这条相关新闻必须进入生成提示。", prompt)
-        self.assertIn("https://news.example/extra", prompt)
-        self.assertIn("related_news", prompt)
-
     def test_generate_article_item_ids_fuses_two_items_into_one_prompt(self) -> None:
         first_id = self._named_item("fuse-a", "Alpha launch", "Alpha body from lab")
         second_id = self._named_item("fuse-b", "Beta debate", "Beta body from media")
@@ -658,236 +613,6 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(payload["title"])
         self.assertIn("lab_blog", result["source_ids"])
         self.assertEqual(1, len(model.calls))
-
-
-    def _related_draft(self, body: str, draft_id: str = "draft-related-search") -> str:
-        """Insert one event/draft pair directly; related search only needs the body."""
-        now = datetime.now(timezone.utc).isoformat()
-        event_id = f"event-{draft_id}"
-        with self.db.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO events (
-                    event_id, topic, name, trigger_type, window_start, triggered_at,
-                    current_count, independent_sources, baseline_mean, baseline_stddev,
-                    statistical_threshold, evidence_json, rule_version, fact_list_json,
-                    status, created_at
-                ) VALUES (?, 'related', 'related', 'HOTSPOT_ITEM', ?, ?, 1, 1, 0, 0, 0, '{}',
-                          'v1', '{}', 'DRAFTED', ?)
-                """,
-                (event_id, now, now, now),
-            )
-            connection.execute(
-                """
-                INSERT INTO drafts (
-                    draft_id, event_id, platform, title, body, tags_json, assets_json,
-                    source_ids_json, generator, processing_version, status, validation_json,
-                    content_hash, created_at, updated_at
-                ) VALUES (?, ?, 'wechat', ?, ?, '[]', '[]', '[]', 'test', 'draft-v1',
-                          'DRAFTED', '{}', 'hash', ?, ?)
-                """,
-                (draft_id, event_id, "相关检索草稿", body, now, now),
-            )
-        return draft_id
-
-    def test_related_search_returns_derived_query_and_items(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        html = (
-            '<a class="result__a" href="https://news.example/chip">英伟达 AI 芯片新进展</a>'
-            '<div class="result__snippet">英伟达新一代芯片报道</div>'
-        ).encode("utf-8")
-
-        def fetcher(url: str) -> bytes:
-            return html if "duckduckgo.com/html" in url else b""
-
-        result = Workbench(self.db, page_fetcher=fetcher).related_search(
-            draft_id, selection, 0, len(selection)
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual("ok", result["search_status"])
-        self.assertEqual(derive_related_query(selection).text, result["query"])
-        self.assertEqual("https://news.example/chip", result["items"][0]["url"])
-        self.assertEqual("", result["cause_code"])
-
-    def test_related_search_returns_more_than_one_google_hit(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        rss = (
-            "<rss><channel>"
-            "<item><title>英伟达芯片一</title><link>https://news.a.example/one</link><description>一</description></item>"
-            "<item><title>英伟达芯片二</title><link>https://news.b.example/two</link><description>二</description></item>"
-            "</channel></rss>"
-        ).encode("utf-8")
-
-        def fetcher(url: str) -> bytes:
-            return rss if "news.google.com/rss" in url else b""
-
-        result = Workbench(self.db, page_fetcher=fetcher).related_search(
-            draft_id, selection, 0, len(selection)
-        )
-        self.assertEqual(2, len(result["items"]))
-        self.assertEqual("https://news.a.example/one", result["items"][0]["url"])
-        self.assertEqual("https://news.b.example/two", result["items"][1]["url"])
-        self.assertFalse(result["query_degraded"])
-        self.assertEqual(len(selection), result["query_source_chars"])
-
-    def test_related_search_empty_result_is_success_not_failure(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        empty_feed = b"<rss><channel><title>no items</title></channel></rss>"
-
-        result = Workbench(self.db, page_fetcher=lambda _url: empty_feed).related_search(
-            draft_id, selection, 0, len(selection)
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual("empty", result["search_status"])
-        self.assertEqual("no_qualified_result", result["cause_code"])
-        self.assertEqual([], result["items"])
-
-    def test_related_search_maps_graded_failures_to_cause_codes(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-
-        def unreachable(_url: str) -> bytes:
-            raise OSError("dns lookup failed")
-
-        def unparsable(_url: str) -> bytes:
-            return b'{"error": "rate limited"}'
-
-        for cause, fetcher, expected_reason in (
-            ("transport_unavailable", unreachable, "网络不可达"),
-            ("parse_error", unparsable, "解析失败"),
-        ):
-            with self.subTest(cause):
-                workbench = Workbench(self.db, page_fetcher=fetcher)
-                with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
-                    with self.assertRaises(LLMError) as raised:
-                        workbench.related_search(draft_id, selection, 0, len(selection))
-                # The top-level API code must never change.
-                self.assertEqual("related_search_failed", str(raised.exception))
-                self.assertEqual(cause, raised.exception.cause_code)
-                self.assertIn(expected_reason, raised.exception.reason)
-                self.assertIn(cause, "\n".join(logs.output))
-
-    def test_related_search_timeout_is_graded_and_logged(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-
-        def slow(_url: str) -> bytes:
-            time.sleep(0.2)
-            return b"<rss><channel /></rss>"
-
-        workbench = Workbench(self.db, page_fetcher=slow)
-        with patch("autoposting.background._RELATED_SEARCH_BUDGET_SECONDS", 0.05):
-            with self.assertLogs("autoposting.workbench", level="WARNING"):
-                with self.assertRaises(LLMError) as raised:
-                    workbench.related_search(draft_id, selection, 0, len(selection))
-
-        self.assertEqual("related_search_failed", str(raised.exception))
-        self.assertEqual("timeout", raised.exception.cause_code)
-        self.assertIn("检索超时", raised.exception.reason)
-
-    def test_related_search_reason_does_not_leak_upstream_text(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        secret = "secret upstream failure"
-
-        def fetcher(_url: str) -> bytes:
-            raise RuntimeError(secret)
-
-        workbench = Workbench(self.db, page_fetcher=fetcher)
-        with self.assertLogs("autoposting.workbench", level="WARNING"):
-            with self.assertRaises(LLMError) as raised:
-                workbench.related_search(draft_id, selection, 0, len(selection))
-
-        self.assertNotIn(secret, raised.exception.reason)
-        self.assertIn("网络不可达", raised.exception.reason)
-
-    def test_related_search_failure_log_never_carries_credentials(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        secret = "SUPERSECRETVALUE"
-        # The verifier's reproduced upstream text, credential and all.
-        upstream = (
-            "ddg: ConnectionRefusedError: SECRET-UPSTREAM-BODY-"
-            f"http://internal.example/token={secret}"
-        )
-
-        def fetcher(_url: str) -> bytes:
-            raise ConnectionRefusedError(upstream)
-
-        workbench = Workbench(self.db, page_fetcher=fetcher)
-        with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
-            with self.assertRaises(LLMError) as raised:
-                workbench.related_search(draft_id, selection, 0, len(selection))
-
-        logged = "\n".join(logs.output)
-        self.assertIn("related search failed", logged)
-        self.assertNotIn(secret, logged)
-        self.assertNotIn("SECRET-UPSTREAM-BODY", logged)
-        self.assertIn("token=***", logged)
-        self.assertIn("internal.example", logged)
-        # The HTTP-facing error stays the graded Chinese reason.
-        self.assertEqual("related_search_failed", str(raised.exception))
-        self.assertEqual("transport_unavailable", raised.exception.cause_code)
-        self.assertNotIn(secret, raised.exception.reason)
-        self.assertNotIn("SECRET-UPSTREAM-BODY", raised.exception.reason)
-
-    def test_related_search_crash_log_never_carries_credentials(self) -> None:
-        selection = "英伟达发布新一代AI芯片"
-        draft_id = self._related_draft(f"{selection}，性能大幅提升。")
-        secret = "SUPERSECRETVALUE"
-
-        workbench = Workbench(self.db, page_fetcher=lambda _url: b"")
-        with patch(
-            "autoposting.workbench.search_related_news",
-            side_effect=RuntimeError(
-                f"upstream said https://api.example/v1?api_key={secret}"
-            ),
-        ):
-            with self.assertLogs("autoposting.workbench", level="WARNING") as logs:
-                with self.assertRaises(LLMError) as raised:
-                    workbench.related_search(draft_id, selection, 0, len(selection))
-
-        logged = "\n".join(logs.output)
-        self.assertIn("related search crashed", logged)
-        self.assertNotIn(secret, logged)
-        self.assertIn("api_key=***", logged)
-        self.assertEqual("related_search_failed", str(raised.exception))
-        self.assertNotIn(secret, raised.exception.reason)
-
-    def test_related_search_reports_degraded_long_selection_query(self) -> None:
-        paragraph = (
-            "英伟达在大会上发布了新一代AI芯片，这款芯片采用了全新的架构设计，"
-            "在推理性能上比上一代产品提升了两倍以上。分析师认为，随着数据中心对算力的需求持续增长，"
-            "这款芯片预计将推动公司下一季度的营收增长。与此同时，竞争对手也在加快自研芯片的节奏，"
-            "整个行业的竞争格局正在发生变化，供应链厂商同样受到关注。业内普遍预计，"
-            "未来几个季度相关产品的出货量还会继续攀升，下游客户也在调整采购计划，"
-            "多家机构上调了行业增速预期，但同时也提醒投资者关注供需波动带来的风险。"
-        )
-        draft_id = self._related_draft(paragraph)
-        rss = (
-            "<rss><channel><item>"
-            "<title>英伟达发布新一代AI芯片</title>"
-            "<link>https://news.example/ai-chip</link>"
-            "<description>英伟达 AI 芯片报道</description>"
-            "</item></channel></rss>"
-        ).encode("utf-8")
-
-        result = Workbench(self.db, page_fetcher=lambda _url: rss).related_search(
-            draft_id, paragraph, 0, len(paragraph)
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["query_degraded"])
-        self.assertEqual("degraded_leading_clause", result["query_strategy"])
-        self.assertEqual(len(paragraph), result["query_source_chars"])
-        self.assertLess(len(result["query"]), len(paragraph))
-        self.assertIn("英伟达", result["query"])
-        self.assertEqual("https://news.example/ai-chip", result["items"][0]["url"])
 
 
 class WorkbenchLlmTests(unittest.TestCase):
@@ -1495,3 +1220,58 @@ class WeChatPublisherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RadarEventCandidatePairTests(unittest.TestCase):
+    """The news-page candidate keeps ids and urls index-for-index aligned."""
+
+    def test_the_event_override_keeps_the_pair_aligned(self) -> None:
+        from autoposting.workbench import _radar_event_candidate
+
+        event = {
+            "representative_item_id": "item-1",
+            "source_ids": ["alpha_feed", "zeta_feed"],
+            "sources": [
+                {"source_id": "zeta_feed", "name": "Zeta", "url": "https://zeta.example/post"},
+                {"source_id": "alpha_feed", "name": "Alpha", "url": "https://alpha.example/post"},
+            ],
+        }
+        row = {
+            "item_id": "item-1",
+            "title": "Model One news",
+            "content_text": "Model One news 内容",
+            "observed_at": "2026-09-23T02:00:00+00:00",
+            "source_ids": ["alpha_feed"],
+            "source_urls": ["https://alpha.example/post"],
+            "engagement": {},
+        }
+        candidate = _radar_event_candidate(event, {"item-1": row}, {})
+        self.assertIsNotNone(candidate)
+        self.assertEqual(
+            len(candidate["source_ids"]), len(candidate["source_urls"])
+        )
+        self.assertEqual(
+            {
+                "zeta_feed": "https://zeta.example/post",
+                "alpha_feed": "https://alpha.example/post",
+            },
+            dict(zip(candidate["source_ids"], candidate["source_urls"])),
+        )
+        self.assertEqual(2, candidate["source_count"])
+
+    def test_a_row_without_event_sources_keeps_its_own_pair(self) -> None:
+        from autoposting.workbench import _radar_event_candidate
+
+        event = {"representative_item_id": "item-1", "source_ids": ["alpha_feed"], "sources": []}
+        row = {
+            "item_id": "item-1",
+            "title": "Model One news",
+            "content_text": "Model One news 内容",
+            "observed_at": "2026-09-23T02:00:00+00:00",
+            "source_ids": ["alpha_feed"],
+            "source_urls": ["https://alpha.example/post"],
+            "engagement": {},
+        }
+        candidate = _radar_event_candidate(event, {"item-1": row}, {})
+        self.assertEqual(["alpha_feed"], candidate["source_ids"])
+        self.assertEqual(["https://alpha.example/post"], candidate["source_urls"])

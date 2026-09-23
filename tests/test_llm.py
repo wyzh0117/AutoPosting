@@ -225,7 +225,7 @@ class OpenAICompatibleRunnerTests(unittest.TestCase):
 
         self.assertEqual("/v1/chat/completions", requests[0][0])
         self.assertEqual("Bearer test-api-key", requests[0][1])
-        self.assertEqual("AutoPosting/3.2.0", requests[0][2])
+        self.assertEqual("AutoPosting/3.2.1", requests[0][2])
         self.assertEqual("remote-model", requests[0][3]["model"])
         self.assertEqual("REAL PROMPT", requests[0][3]["messages"][0]["content"])
 
@@ -953,38 +953,6 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertEqual("article_generation_failed", str(raised.exception))
         self.assertEqual("llm_timeout", raised.exception.cause_code)
         self.assertIn("模型调用超过 90 秒", raised.exception.reason)
-
-    def test_extract_hook_candidates_parses_and_fails_fast(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        fake = FakeRunner(
-            stdout='{"candidates":[{"phrase":"协和医学院4+4试点班","kind":"program"}]}'
-        )
-        service = LLMService(
-            _db(tmp),
-            runner=fake,
-            model="m",
-            base_url="https://api.example/v1",
-            api_key="sk",
-        )
-        found = service.extract_hook_candidates("……协和医学院4+4试点班……")
-        self.assertEqual("program", found[0]["kind"])
-        self.assertIn("候选切口JSON", fake.calls[0][2])
-
-        broken = FakeRunner(stdout="not-json")
-        service = LLMService(
-            _db(tmp),
-            runner=broken,
-            model="m",
-            base_url="https://api.example/v1",
-            api_key="sk",
-        )
-        with self.assertRaises(LLMError) as raised:
-            service.extract_hook_candidates("正文")
-        self.assertIn("LLM_HOOK_FAILED", raised.exception.reason)
-        empty = LLMService(_db(tmp), runner=FakeRunner(stdout="{}"))
-        self.assertEqual([], empty.extract_hook_candidates("正文"))
-
 
 class CjkTests(unittest.TestCase):
     def test_has_cjk(self) -> None:

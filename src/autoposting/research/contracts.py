@@ -86,6 +86,60 @@ def _url(value: object, name: str = "url") -> str:
     return text
 
 
+def _source_urls(value: object, source_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep source urls positionally aligned with ``source_ids``.
+
+    An event must never hand over two independently ordered lists: ``source_ids``
+    is a sorted set in the radar payload while the urls follow source-record
+    order, so a blind zip attributes one source's url to another.  The lists are
+    therefore only used as a pairing when they have exactly one url per id;
+    otherwise the urls are dropped instead of shifted.  A blank entry means
+    "this source has no known url".
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("source_urls_must_be_string_list")
+    if len(value) > _MAX_LIST_ITEMS:
+        raise ValueError("source_urls_too_many")
+    urls = [
+        _url(item, "source_url") if isinstance(item, str) and item.strip() else ""
+        for item in value
+    ]
+    if len(urls) == len(source_ids):
+        return tuple(urls)
+    return tuple("" for _ in source_ids)
+
+
+def _paired_sources(data: Mapping[str, object]) -> tuple[list[object], list[object]]:
+    """Read the source ids and their own urls out of one event payload.
+
+    ``sources`` records carry ``source_id`` and ``url`` together, so they are the
+    only trustworthy pairing.  They are preferred whenever they name at least one
+    source; ids that only appear in ``source_ids`` keep their slot with a blank
+    url instead of borrowing a neighbour's.
+    """
+    records = data.get("sources")
+    ids: list[object] = []
+    urls: list[object] = []
+    if isinstance(records, (list, tuple)):
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            source_id = str(record.get("source_id") or record.get("id") or "").strip()
+            url = str(record.get("url") or record.get("source_url") or "").strip()
+            if not source_id or not url or source_id in ids:
+                continue
+            ids.append(source_id)
+            urls.append(url)
+    if not ids:
+        return list(data.get("source_ids", ())), list(data.get("source_urls", ()))
+    for source_id in data.get("source_ids", ()) if isinstance(data.get("source_ids"), (list, tuple)) else ():
+        cleaned = str(source_id).strip()
+        if cleaned and cleaned not in ids:
+            ids.append(cleaned)
+            urls.append("")
+    return ids, urls
+
+
 @dataclass(frozen=True)
 class ResearchTopic:
     """A selected Event Cluster reduced to the research boundary."""
@@ -101,8 +155,9 @@ class ResearchTopic:
         object.__setattr__(self, "event_id", _text(self.event_id, "event_id", limit=_MAX_ID_CHARS))
         object.__setattr__(self, "title", _text(self.title, "title", limit=_MAX_TITLE_CHARS))
         object.__setattr__(self, "topic", _text(self.topic, "topic", limit=200, required=False))
-        object.__setattr__(self, "source_ids", _strings(self.source_ids, "source_ids"))
-        object.__setattr__(self, "source_urls", tuple(_url(item, "source_url") for item in self.source_urls))
+        source_ids = _strings(self.source_ids, "source_ids")
+        object.__setattr__(self, "source_ids", source_ids)
+        object.__setattr__(self, "source_urls", _source_urls(self.source_urls, source_ids))
         object.__setattr__(self, "item_ids", _strings(self.item_ids, "item_ids"))
 
     @classmethod
@@ -110,14 +165,7 @@ class ResearchTopic:
         data = _object(value, "event")
         selected_id = event_id or data.get("event_id") or data.get("id")
         title = data.get("title") or data.get("name")
-        source_ids = data.get("source_ids", ())
-        source_urls = data.get("source_urls", ())
-        if not source_urls and isinstance(data.get("sources"), (list, tuple)):
-            urls: list[str] = []
-            for source in data["sources"]:
-                if isinstance(source, Mapping) and source.get("url"):
-                    urls.append(str(source["url"]))
-            source_urls = urls
+        source_ids, source_urls = _paired_sources(data)
         item_ids = data.get("item_ids", ())
         return cls(
             event_id=str(selected_id or ""),

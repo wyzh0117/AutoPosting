@@ -29,7 +29,6 @@ from .article_prompt import (
     build_article_prompt,
     load_article_style_prompt,
 )
-from .hooks import EXTRACT_CANDIDATES_PROMPT
 from .leaderboard_prompt import load_leaderboard_copy_prompt, load_skill_copy_prompt
 from .normalize import contains_source_id, content_hash
 from .xhs_cards import fill_xhs_caption
@@ -39,7 +38,7 @@ LLM_PROVIDER = "openai-compatible"
 LLM_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 LLM_EFFORT = "none"
 HERMES_BINARY = "hermes"
-HTTP_USER_AGENT = "AutoPosting/3.2.0"
+HTTP_USER_AGENT = "AutoPosting/3.2.1"
 LLM_TIMEOUT_SECONDS = 90
 LEADERBOARD_ENRICH_SECONDS = 180
 
@@ -745,44 +744,6 @@ class LLMService:
         finally:
             if previous_timeout is not None:
                 runner.timeout = previous_timeout
-
-    def extract_hook_candidates(self, excerpt: str) -> list[dict[str, str]]:
-        """Optional extra phrases from the article model.
-
-        Unconfigured models skip this step. A configured model that returns
-        unusable output raises instead of pretending there were no hooks.
-        """
-        settings = self.resolve_settings()
-        if settings.model == LLM_MODEL or not settings.base_url:
-            return []
-        prompt = EXTRACT_CANDIDATES_PROMPT.replace("{excerpt}", excerpt or "")
-        run_settings = settings
-        if self._injected_command_runner:
-            # Constructor base_url would send _run to HTTP; tests inject argv fakes.
-            run_settings = validate_llm_settings(
-                settings.model, settings.provider, settings.effort, "", ""
-            )
-        try:
-            parsed = parse_model_json(self._run(prompt, run_settings))
-        except LLMError as exc:
-            raise LLMError(
-                "llm_invalid_output",
-                f"LLM_HOOK_FAILED: {exc.reason}",
-                cause_code=exc.code,
-            ) from None
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("candidates"), list):
-            raise LLMError("llm_invalid_output", 'LLM_HOOK_FAILED: missing field "candidates"')
-        allowed = {"org", "program", "person", "other"}
-        found: list[dict[str, str]] = []
-        for item in parsed["candidates"]:
-            if not isinstance(item, dict):
-                continue
-            phrase = item.get("phrase")
-            if not isinstance(phrase, str) or not phrase.strip():
-                continue
-            kind = item.get("kind") if item.get("kind") in allowed else "other"
-            found.append({"phrase": phrase.strip(), "kind": kind})
-        return found
 
     @staticmethod
     def _cache_key(

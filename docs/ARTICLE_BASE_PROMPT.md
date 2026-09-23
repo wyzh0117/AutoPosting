@@ -2,7 +2,7 @@
 
 这是所有文章类型共用的基础提示词。类型规则决定写什么，平台规则只决定怎样呈现。
 
-version: article-v12
+version: article-v13
 
 ## 共用
 

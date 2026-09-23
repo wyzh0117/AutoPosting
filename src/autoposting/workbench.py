@@ -8,9 +8,16 @@ import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
 from urllib.parse import urlencode, urlsplit
 
 from .content import Claim, ContentWorkflow, Draft, FactList, FactValidationError
+from .article_context import (
+    ArticleContextError,
+    ArticleGenerationContext,
+    build_dossier_context,
+    build_manual_context,
+)
 from .article_fuse import fuse_hotspot_items
 from .article_prompt import DEFAULT_ARTICLE_PROMPT_STYLE, load_article_style_prompt
 from .decision.adapters.jev import JevAdapter
@@ -39,25 +46,14 @@ from .images import (
     _safe_external_url,
 )
 from .title_poster import render_title_poster
-from .background import (
-    RELATED_SEARCH_CAUSE_NO_RESULT,
-    RELATED_SEARCH_CAUSE_TRANSPORT,
-    RelatedSearchError,
-    derive_related_query,
-    gather_background,
-    redact_related_detail,
-    related_article_context,
-    related_search_reason,
-    search_related_news,
-    search_web,
-)
-from .hooks import EMPTY_HOOKS_MESSAGE, find_hooks as collect_hooks, sanitize_chosen_hooks
+from .background import gather_background
 from .ingestion import should_hide_candidate
+from .legacy_compat import SCOPE_ALL, SCOPE_COMMUNITY, SCOPE_ERROR, SCOPE_OFFICIAL, VALID_SCOPES
 from .llm import ARTICLE_PROMPT_VERSION, LLMError, LLMService
 from .pipeline import collect_sources
 from .publishing import PublicationError
 from .research.adapters import ReaderServiceEvidenceAdapter
-from .research.service import ResearchService
+from .research.service import ResearchError, ResearchService
 from .models import Source
 from .radar import rank_events
 
@@ -70,7 +66,6 @@ HOTSPOT_HOUR_MAX = 720
 HOTSPOT_LIMIT = 10
 HOTSPOT_POOL = 40
 PASTED_PAGE_LIMIT = 20000
-RELATED_SEARCH_ITEM_LIMIT = 8
 
 
 def _with_pasted_page(
@@ -84,37 +79,6 @@ def _with_pasted_page(
     updated["pasted_page"] = clipped
     prefix = f"{material}\n\n" if str(material or "").strip() else ""
     return f"{prefix}用户粘贴的原文页面：\n{clipped}", updated
-
-
-def _with_related_news(
-    material: str, background: dict[str, object], related_items: object
-) -> tuple[str, dict[str, object]]:
-    if not isinstance(related_items, list) or not related_items:
-        return material, background
-    rows: list[str] = []
-    for item in related_items:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or item.get("name") or "").strip()
-        url = str(item.get("url") or item.get("link") or item.get("source_url") or "").strip()
-        snippet = str(
-            item.get("snippet") or item.get("summary") or item.get("description") or ""
-        ).strip()
-        if not title and not snippet:
-            continue
-        block = title
-        if snippet:
-            block = f"{block}\n{snippet}" if block else snippet
-        if url:
-            block = f"{block}\n{url}"
-        rows.append(block)
-    if not rows:
-        return material, background
-    clipped = ("相关新闻补充：\n" + "\n\n".join(rows))[:PASTED_PAGE_LIMIT]
-    updated = dict(background)
-    updated["related_news"] = clipped
-    prefix = f"{material}\n\n" if str(material or "").strip() else ""
-    return f"{prefix}{clipped}", updated
 
 
 def _with_radar_evidence(
@@ -454,17 +418,21 @@ def _radar_event_candidate(
         return None
     candidate = _decorate_candidate(row, translated)
     source_ids = [str(value) for value in (event.get("source_ids") or ()) if str(value)]
-    source_urls = [
-        str(source.get("url") or "")
-        for source in (event.get("sources") or ())
-        if isinstance(source, dict) and str(source.get("url") or "")
+    event_sources = [
+        source for source in (event.get("sources") or ()) if isinstance(source, dict)
     ]
     candidate["item_id"] = representative_id
-    if source_ids:
+    if event_sources:
+        # `sources` is the pairing source of truth: keep ids and urls in its
+        # order and the same length, so a positional reader cannot mispair them.
+        candidate["source_ids"] = [str(source.get("source_id") or "") for source in event_sources]
+        candidate["source_urls"] = [str(source.get("url") or "") for source in event_sources]
+        candidate["source_count"] = len(
+            {value for value in candidate["source_ids"] if value}
+        )
+    elif source_ids:
         candidate["source_ids"] = source_ids
         candidate["source_count"] = len(source_ids)
-    if source_urls:
-        candidate["source_urls"] = source_urls
     return candidate
 
 
@@ -512,12 +480,13 @@ class HotspotService:
             health.append(_source_health_entry(source, row, moment))
         return health
 
-    def _sources_for_lane(self, lane: str) -> tuple[Source, ...]:
-        if lane not in {"hotspots", "viewpoints", "mixed"}:
-            raise ValueError("lane must be hotspots, viewpoints, or mixed")
-        if lane == "mixed":
+    def _sources_for_scope(self, scope: str) -> tuple[Source, ...]:
+        """Editorial vs community vs both, as one explicit contract."""
+        if scope not in VALID_SCOPES:
+            raise ValueError(SCOPE_ERROR)
+        if scope == SCOPE_ALL:
             return self.sources
-        if lane == "viewpoints":
+        if scope == SCOPE_COMMUNITY:
             return tuple(source for source in self.sources if source.type == "reddit")
         return tuple(source for source in self.sources if source.type != "reddit")
 
@@ -528,24 +497,24 @@ class HotspotService:
         limit: int,
         sort: str,
         pool: int,
-        lane: str,
+        scope: str,
     ) -> list[dict[str, object]]:
-        """Read one lane or merge the two legacy DB lanes for the unified view."""
-        if lane not in {"hotspots", "viewpoints", "mixed"}:
-            raise ValueError("lane must be hotspots, viewpoints, or mixed")
-        lanes = ("hotspots", "viewpoints") if lane == "mixed" else (lane,)
+        """Read one scope, merging the editorial and community reads for ``all``."""
+        if scope not in VALID_SCOPES:
+            raise ValueError(SCOPE_ERROR)
+        scopes = (SCOPE_OFFICIAL, SCOPE_COMMUNITY) if scope == SCOPE_ALL else (scope,)
         rows_by_id: dict[str, dict[str, object]] = {}
-        for source_lane in lanes:
+        for source_scope in scopes:
             for row in self.database.list_hotspot_candidates(
                 since,
                 limit=limit,
                 sort=sort,
                 pool=pool,
-                lane=source_lane,
+                scope=source_scope,
             ):
                 rows_by_id.setdefault(str(row.get("item_id") or ""), row)
         rows = [row for item_id, row in rows_by_id.items() if item_id]
-        if lane != "mixed":
+        if scope != SCOPE_ALL:
             return rows
         if sort == "heat":
             rows.sort(
@@ -573,7 +542,7 @@ class HotspotService:
         *,
         force: bool = True,
         source_id: str | None = None,
-        lane: str = "hotspots",
+        scope: str = SCOPE_ALL,
     ) -> dict[str, object]:
         if isinstance(hours, bool) or not isinstance(hours, int):
             raise ValueError("hours must be an integer")
@@ -584,13 +553,13 @@ class HotspotService:
         only = (source_id,) if source_id else None
         batch = collect_sources(
             self.database,
-            self._sources_for_lane(lane),
+            self._sources_for_scope(scope),
             fetcher=self.fetcher,
             force=force,
             only_source_ids=only,
             x_bearer_token=self.x_bearer_token,
         )
-        payload = self.list_window(hours, translate=False, lane=lane)
+        payload = self.list_window(hours, translate=False, scope=scope)
         self._persist_radar_snapshots(payload)
         payload["collection"] = {
             "run_id": batch.run_id,
@@ -655,7 +624,7 @@ class HotspotService:
             self.database.record_engagement_snapshots(rows)
 
     def list_window(
-        self, hours: int = 4, *, translate: bool = True, lane: str = "hotspots"
+        self, hours: int = 4, *, translate: bool = True, scope: str = SCOPE_ALL
     ) -> dict[str, object]:
         if isinstance(hours, bool) or not isinstance(hours, int):
             raise ValueError("hours must be an integer")
@@ -672,7 +641,7 @@ class HotspotService:
                 limit=HOTSPOT_LIMIT,
                 sort="time",
                 pool=HOTSPOT_POOL,
-                lane=lane,
+                scope=scope,
             )
             if not should_hide_candidate(str(row["title"]), row.get("source_ids") or ())
         ]
@@ -683,7 +652,7 @@ class HotspotService:
                 limit=HOTSPOT_LIMIT,
                 sort="heat",
                 pool=HOTSPOT_POOL,
-                lane=lane,
+                scope=scope,
             )
             if not should_hide_candidate(str(row["title"]), row.get("source_ids") or ())
         ]
@@ -848,108 +817,6 @@ class Workbench:
             raise ValueError("dossier_delete_not_supported")
         return bool(deleter(dossier_id))
 
-    def find_hooks(self, item_id: str, searcher=None) -> dict[str, object]:
-        item = self.database.get_item(item_id)
-        page_url = ""
-        for pair in self.database.get_item_sources(item_id):
-            if pair.get("source_url"):
-                page_url = str(pair["source_url"])
-                break
-        if not page_url:
-            page_url = str(item.get("canonical_url") or "")
-        notes = gather_background(
-            self.database,
-            str(item["title"]),
-            str(item["content_text"]),
-            item_id=item_id,
-            page_url=page_url,
-            fetcher=self.page_fetcher,
-            render_fetcher=self.render_fetcher,
-        )
-        excerpt = notes.source_excerpt or str(item["content_text"])
-        extra = (
-            self.llm_service.extract_hook_candidates(excerpt)
-            if self.llm_service is not None
-            else []
-        )
-        if searcher is None:
-            searcher = lambda query: search_web(query, fetcher=self.page_fetcher)
-        hooks = collect_hooks(str(item["title"]), excerpt, searcher, extra)
-        return {
-            "ok": True,
-            "hooks": hooks,
-            "message": EMPTY_HOOKS_MESSAGE if not hooks else "",
-        }
-
-    def related_search(
-        self, draft_id: str, selection: str, selection_start: int, selection_end: int
-    ) -> dict[str, object]:
-        draft = self.database.get_draft(draft_id)
-        related_article_context(str(draft["body"]), selection, selection_start, selection_end)
-        # The raw selection stays the source of truth for context; only the
-        # query handed to the search engines is derived and bounded.
-        derived = derive_related_query(selection)
-        try:
-            search_fetcher = None if self.page_fetcher is default_page_fetcher else self.page_fetcher
-            query, results = search_related_news(
-                selection, fetcher=search_fetcher, limit=RELATED_SEARCH_ITEM_LIMIT
-            )
-        except RelatedSearchError as exc:
-            # Full cause (including the upstream exception text) stays in the
-            # server log; the API only ever sees the graded Chinese reason.
-            # Every logged detail goes through _redact_related_detail(), the
-            # single boundary that keeps credentials out of the log.
-            LOGGER.warning(
-                "related search failed: cause=%s sources=%s detail=%s",
-                exc.cause_code,
-                ",".join(exc.sources) or "-",
-                redact_related_detail(exc.detail),
-            )
-            raise LLMError(
-                "related_search_failed",
-                exc.reason,
-                cause_code=exc.cause_code,
-            ) from None
-        except Exception as exc:
-            # Same boundary as above: the crash text is logged only redacted.
-            LOGGER.warning(
-                "related search crashed: %s: %s",
-                type(exc).__name__,
-                redact_related_detail(str(exc)),
-            )
-            raise LLMError(
-                "related_search_failed",
-                related_search_reason(RELATED_SEARCH_CAUSE_TRANSPORT),
-                cause_code=RELATED_SEARCH_CAUSE_TRANSPORT,
-            ) from None
-        items: list[dict[str, str]] = []
-        seen_urls: set[str] = set()
-        for result in results:
-            url = str(result.get("url") or "").strip()
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            items.append(
-                {
-                    "title": str(result.get("title") or "").strip(),
-                    "url": url,
-                    "snippet": str(result.get("snippet") or "").strip()[:280],
-                }
-            )
-        # A reachable search that qualified nothing is a success with an empty
-        # result set, not a failure: the caller keeps search_status="empty".
-        cause_code = "" if items else RELATED_SEARCH_CAUSE_NO_RESULT
-        return {
-            "ok": True,
-            "query": query,
-            "items": items[:RELATED_SEARCH_ITEM_LIMIT],
-            "search_status": "ok" if items else "empty",
-            "cause_code": cause_code,
-            "query_degraded": bool(derived.degraded),
-            "query_strategy": derived.strategy,
-            "query_source_chars": len(derived.selection or selection),
-        }
-
     def generate_article(
         self,
         item_id: str,
@@ -958,16 +825,34 @@ class Workbench:
         provider: str | None = None,
         effort: str | None = None,
         style: str = "",
-        chosen_hooks: object = None,
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         xhs_handle: str = "",
         item_ids: list[str] | None = None,
         pasted_text: str | None = None,
-        related_items: object = None,
         radar_event: object = None,
+        dossier_id: str | None = None,
     ) -> dict[str, object]:
+        """Generate one article from an explicit :class:`ArticleGenerationContext`.
+
+        ``dossier_id`` selects the official research path: the context is rebuilt
+        from the persisted Topic Dossier and nothing else is researched.  Without
+        it the retained manual path runs (one selected item, or a fused set).
+        Article Service never starts a second research run on its own.
+        """
         if platform not in {"wechat", "xiaohongshu"}:
             raise ValueError(f"unsupported platform: {platform}")
+        if dossier_id is not None and str(dossier_id).strip():
+            return self._generate_dossier_article(
+                str(dossier_id).strip(),
+                platform,
+                model=model,
+                provider=provider,
+                effort=effort,
+                style=style,
+                prompt_style=prompt_style,
+                xhs_handle=xhs_handle,
+                pasted_text=pasted_text,
+            )
         ids = _normalize_article_item_ids(item_id, item_ids)
         if len(ids) >= 2:
             return self._generate_fused_article(
@@ -977,11 +862,9 @@ class Workbench:
                 provider=provider,
                 effort=effort,
                 style=style,
-                chosen_hooks=chosen_hooks,
                 prompt_style=prompt_style,
                 xhs_handle=xhs_handle,
                 pasted_text=pasted_text,
-                related_items=related_items,
                 radar_event=radar_event,
             )
         if ids:
@@ -1049,24 +932,28 @@ class Workbench:
             render_fetcher=self.render_fetcher,
         )
         material = notes.source_excerpt or str(item["content_text"])
-        hooks = sanitize_chosen_hooks(chosen_hooks)
         background = notes.as_prompt()
         background["source_refs"] = source_refs
         background = _with_radar_evidence(background, radar_event)
-        if hooks:
-            background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)
-        material, background = _with_related_news(material, background, related_items)
+        context = build_manual_context(
+            primary_subject=str(item["title"]),
+            material=material,
+            research_summary=summary,
+            source_refs=source_refs,
+            background=background,
+            metadata={"item_id": item_id, "event_id": event_id},
+        )
         article = self.llm_service.generate_article(
             platform,
-            str(item["title"]),
-            material,
+            context.primary_subject,
+            context.material,
             source_ids,
             model=settings.model,
             provider=settings.provider,
             effort=settings.effort,
             style=style,
-            background=background,
+            background=context.prompt_background(),
             preset_style=preset_style,
         )
         records: list[dict[str, str]] = []
@@ -1105,7 +992,215 @@ class Workbench:
             probe_fetcher=self.image_fetcher,
         )
         assets = build_asset_bundle(images, item_id=item_id)
-        manuscript = article["body"]
+        return self._persist_article(
+            event_id=event_id,
+            platform=platform,
+            settings=settings,
+            article=article,
+            records=records,
+            source_ids=source_ids,
+            assets=assets,
+            discussion=discussion,
+            promoted=promoted,
+            prompt_style=prompt_style,
+            xhs_handle=xhs_handle,
+        )
+
+    def _generate_dossier_article(
+        self,
+        dossier_id: str,
+        platform: str,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        effort: str | None = None,
+        style: str = "",
+        prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
+        xhs_handle: str = "",
+        pasted_text: str | None = None,
+    ) -> dict[str, object]:
+        """Topic Dossier -> ArticleGenerationContext -> Article.
+
+        The dossier already carries the research result, so this path performs no
+        search at all: no hook hunt, no related search, no extra topic expansion.
+        """
+        preset_style = load_article_style_prompt(prompt_style)
+        if self.llm_service is None:
+            raise LLMError("article_generation_failed")
+        try:
+            dossier = self.get_research(dossier_id)
+        except (ResearchError, ValueError, KeyError) as exc:
+            # One error vocabulary at the article boundary: a missing dossier is
+            # an article-context failure, not a research-layer exception.
+            raise ArticleContextError("dossier_not_found") from exc
+        images = self._dossier_images(dossier)
+        context = build_dossier_context(dossier, selected_images=images)
+        source_ids = context.source_ids
+        settings = self.llm_service.resolve_settings(model, provider, effort)
+
+        summary = context.research_summary or context.primary_subject
+        facts = FactList(
+            event=context.primary_subject,
+            claims=(Claim(summary[:2_000], source_ids, "medium"),),
+            unknowns=(),
+            conflicts=(),
+        )
+        topics = context.metadata.get("topics") or ()
+        topic = str((topics[0] if topics else {}).get("topic") or "unclassified")
+        event_id = self.database.create_event(
+            context.primary_subject,
+            topic,
+            "TOPIC_DOSSIER",
+            f"topic-dossier:{dossier_id}:{platform}",
+        )
+        workflow = ContentWorkflow(self.database)
+        validation = workflow.save_fact_list(event_id, facts)
+        if not validation.valid:
+            raise FactValidationError(",".join(validation.errors))
+
+        background = dict(context.prompt_background())
+        material, background = _with_pasted_page(
+            context.material, background, pasted_text
+        )
+        article = self.llm_service.generate_article(
+            platform,
+            context.primary_subject,
+            material,
+            source_ids,
+            model=settings.model,
+            provider=settings.provider,
+            effort=settings.effort,
+            style=style,
+            background=background,
+            preset_style=preset_style,
+        )
+
+        records: list[dict[str, str]] = []
+        citation_occurrences: dict[str, int] = {}
+        best_base = "S4"
+        has_x = False
+        seen_refs: set[str] = set()
+        for ref in context.source_refs:
+            source_id = str(ref.get("source_id") or "")
+            if not source_id:
+                continue
+            try:
+                source = self.database.get_source(source_id)
+            except KeyError:
+                # Evidence URLs are never subscription sources; only real event
+                # sources become citation records, and a stale id is skipped
+                # rather than invented.
+                continue
+            source_url = str(ref.get("source_url") or "")
+            ref_key = f"{source_id}|{source_url}"
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
+            best_base = better_tier(best_base, str(source["tier"]))
+            if str(source["type"]) == "x":
+                has_x = True
+            citation_occurrences[source_id] = citation_occurrences.get(source_id, 0) + 1
+            records.append(
+                {
+                    "source_id": source_id,
+                    "citation_id": source_citation_id(
+                        source_id, citation_occurrences[source_id]
+                    ),
+                    "name": str(source["name"]),
+                    "source_url": source_url,
+                }
+            )
+        if not records:
+            raise ArticleContextError("dossier_sources_required")
+        discussion = best_base == "S4" or has_x
+        assets = build_asset_bundle(images, item_id=",".join(context.item_ids))
+        return self._persist_article(
+            event_id=event_id,
+            platform=platform,
+            settings=settings,
+            article=article,
+            records=records,
+            source_ids=source_ids,
+            assets=assets,
+            discussion=discussion,
+            promoted=False,
+            prompt_style=prompt_style,
+            xhs_handle=xhs_handle,
+        )
+
+    def _configured_source_ids(self) -> tuple[str, ...]:
+        """Every source id the environment knows, for prose cleanup only.
+
+        A model occasionally cites a source that is not part of this article's
+        records.  Those ids must still leave the prose — they are machine tokens,
+        not words — but they must never gain a link they have no url for.
+        """
+        try:
+            rows = self.database.list_sources()
+        except Exception:  # pragma: no cover - a broken config must not block an article
+            return ()
+        return tuple(
+            sorted(
+                {
+                    str(row["source_id"]).strip()
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("source_id") or "").strip()
+                }
+            )
+        )
+
+    def _dossier_images(self, dossier: Mapping[str, object]) -> list[dict[str, object]]:
+        """Collect already-selected images for the dossier's own event items.
+
+        This reads collected items; it does not fetch or search for anything new.
+        """
+        topics = dossier.get("topics")
+        if not isinstance(topics, (list, tuple)):
+            return []
+        images: list[dict[str, object]] = []
+        seen_items: set[str] = set()
+        for topic in topics:
+            if not isinstance(topic, Mapping):
+                continue
+            for raw_id in topic.get("item_ids") or ():
+                item_id = str(raw_id or "").strip()
+                if not item_id or item_id in seen_items:
+                    continue
+                seen_items.add(item_id)
+                try:
+                    item = self.database.get_item(item_id)
+                    pairs = self.database.get_item_sources(item_id)
+                except KeyError:
+                    continue
+                images.extend(
+                    collect_article_images(
+                        item,
+                        pairs,
+                        page_fetcher=self.page_fetcher,
+                        probe_fetcher=self.image_fetcher,
+                    )
+                )
+        return images
+
+    def _persist_article(
+        self,
+        *,
+        event_id: str,
+        platform: str,
+        settings,
+        article: Mapping[str, str],
+        records: list[dict[str, str]],
+        source_ids: tuple[str, ...],
+        assets: dict[str, object],
+        discussion: bool,
+        promoted: bool,
+        prompt_style: str,
+        xhs_handle: str,
+    ) -> dict[str, object]:
+        """Shared tail: frame the body, write the Draft, shape the API payload."""
+        if self.llm_service is None:
+            raise LLMError("article_generation_failed")
+        manuscript = str(article["body"])
         source_body = article.get("caption") if platform == "xiaohongshu" else manuscript
         framed = frame_article_body(
             str(source_body),
@@ -1113,6 +1208,7 @@ class Workbench:
             discussion=discussion,
             promoted=promoted,
             inline_sources=True,
+            extra_source_ids=self._configured_source_ids(),
         )
         body = strip_image_credits(framed)
         if platform == "xiaohongshu":
@@ -1123,7 +1219,7 @@ class Workbench:
             ).hexdigest()[:24],
             event_id=event_id,
             platform=platform,
-            title=article["title"],
+            title=str(article["title"]),
             body=body,
             tags=(),
             source_ids=source_ids,
@@ -1160,11 +1256,9 @@ class Workbench:
         provider: str | None = None,
         effort: str | None = None,
         style: str = "",
-        chosen_hooks: object = None,
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         xhs_handle: str = "",
         pasted_text: str | None = None,
-        related_items: object = None,
         radar_event: object = None,
     ) -> dict[str, object]:
         preset_style = load_article_style_prompt(prompt_style)
@@ -1234,24 +1328,28 @@ class Workbench:
             render_fetcher=self.render_fetcher,
         )
         material = fused_content or notes.source_excerpt
-        hooks = sanitize_chosen_hooks(chosen_hooks)
         background = notes.as_prompt()
         background["source_refs"] = source_refs
         background = _with_radar_evidence(background, radar_event)
-        if hooks:
-            background["chosen_hooks"] = hooks
         material, background = _with_pasted_page(material, background, pasted_text)
-        material, background = _with_related_news(material, background, related_items)
+        context = build_manual_context(
+            primary_subject=fused_title,
+            material=material,
+            research_summary=summary,
+            source_refs=source_refs,
+            background=background,
+            metadata={"item_ids": list(item_ids), "event_id": event_id},
+        )
         article = self.llm_service.generate_article(
             platform,
-            fused_title,
-            material,
+            context.primary_subject,
+            context.material,
             source_ids,
             model=settings.model,
             provider=settings.provider,
             effort=settings.effort,
             style=style,
-            background=background,
+            background=context.prompt_background(),
             preset_style=preset_style,
         )
         records: list[dict[str, str]] = []
@@ -1304,52 +1402,19 @@ class Workbench:
                 )
         discussion = best_base == "S4" or has_x
         assets = build_asset_bundle(images, item_id=",".join(sorted(item_ids)))
-        manuscript = article["body"]
-        source_body = article.get("caption") if platform == "xiaohongshu" else manuscript
-        framed = frame_article_body(
-            str(source_body),
-            records,
-            discussion=discussion,
-            promoted=promoted,
-            inline_sources=True,
-        )
-        body = strip_image_credits(framed)
-        if platform == "xiaohongshu":
-            assets["manuscript"] = manuscript
-        draft = Draft(
-            draft_id=hashlib.sha256(
-                f"{event_id}:{platform}:{ARTICLE_PROMPT_VERSION}".encode()
-            ).hexdigest()[:24],
+        return self._persist_article(
             event_id=event_id,
             platform=platform,
-            title=article["title"],
-            body=body,
-            tags=(),
+            settings=settings,
+            article=article,
+            records=records,
             source_ids=source_ids,
-            generator=(
-                f"{settings.provider}/{settings.model}:{settings.effort}:{ARTICLE_PROMPT_VERSION}"
-            ),
-            processing_version=ARTICLE_PROMPT_VERSION,
             assets=assets,
+            discussion=discussion,
+            promoted=promoted,
+            prompt_style=prompt_style,
+            xhs_handle=xhs_handle,
         )
-        outcome = self.database.upsert_draft(draft)
-        if outcome != "unchanged":
-            self.database.update_event_status(event_id, "DRAFTED")
-        payload: dict[str, object] = {
-            "event_id": event_id,
-            "draft_id": draft.draft_id,
-            "platform": platform,
-            "status": self.database.get_draft(draft.draft_id)["status"],
-            "title": draft.title,
-            "body": draft.body,
-            "source_ids": list(source_ids),
-            "assets": assets,
-            "prompt_style": prompt_style,
-            "llm": self.llm_service.settings_payload(settings),
-        }
-        if platform == "xiaohongshu":
-            payload.update(xhs_fields(draft.title, draft.body, assets, xhs_handle))
-        return payload
 
     def rescan_images(self, draft_id: str) -> dict[str, object]:
         draft = self.database.get_draft(draft_id)

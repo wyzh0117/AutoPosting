@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .background import RELATED_SELECTION_LIMIT
+from .article_context import ArticleContextError
+from .legacy_compat import SCOPE_ALL, resolve_scope
 from .config import load_sources
 from .content import ContentWorkflow
 from .decision.adapters.jev import JevAdapter
@@ -77,7 +79,7 @@ from .workbench import (
     xhs_fields,
 )
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_CHAT_JSON_BODY_BYTES = 4_194_304
@@ -289,34 +291,11 @@ header h1.logo{
 }
 #favorites-btn:hover:not(:disabled){background:var(--bg-input); border-color:var(--accent); box-shadow:none;}
 #favorites-btn[aria-expanded="true"]{border-color:var(--accent); color:var(--accent);}
-#news-supplement-btn{
-  border-radius:99px; padding:.5rem 1.2rem;
-  border:1px solid var(--border); background:var(--bg-card);
-  color:var(--text-main); font-weight:500;
-}
-#news-supplement-btn:hover:not(:disabled){background:var(--bg-input); border-color:var(--accent); box-shadow:none;}
-#news-supplement-btn[aria-expanded="true"]{border-color:var(--accent); color:var(--accent);}
-#favorites-drawer,#news-supplement-drawer{
-  display:none; position:fixed; top:0; right:0; bottom:0;
-  width:var(--favorites-drawer-w); z-index:40;
-  background:linear-gradient(180deg, rgba(36, 33, 26, 0.98), rgba(22, 20, 16, 0.98));
-  border-left:1px solid var(--border);
-  flex-direction:column; padding:1rem 1rem 1.2rem;
-  overflow:hidden;
-}
 body.favorites-open #favorites-drawer{display:flex;}
-body.news-supplement-open #news-supplement-drawer{display:flex;}
 body.favorites-open header,
 body.favorites-open #app-nav,
 body.favorites-open main,
 body.favorites-open #wait-banner{
-  margin-right:var(--favorites-drawer-w);
-  width:calc(100% - var(--favorites-drawer-w));
-}
-body.news-supplement-open header,
-body.news-supplement-open #app-nav,
-body.news-supplement-open main,
-body.news-supplement-open #wait-banner{
   margin-right:var(--favorites-drawer-w);
   width:calc(100% - var(--favorites-drawer-w));
 }
@@ -332,18 +311,6 @@ body.news-supplement-open #wait-banner{
   list-style:none; margin:0; padding:0; overflow-y:auto; min-height:0; flex:1;
   display:flex; flex-direction:column; gap:.75rem;
 }
-#news-supplement-list{
-  list-style:none; margin:0; padding:0; overflow-y:auto; min-height:0; flex:1;
-  display:flex; flex-direction:column; gap:.75rem;
-}
-.news-supplement-item{
-  position:relative; background:var(--bg-input); border:1px solid transparent;
-  border-radius:var(--radius-md); padding:.8rem 2.4rem .8rem .9rem;
-}
-.news-supplement-item.is-focus{border-color:var(--accent);}
-.news-supplement-item a{display:block; color:var(--accent); font-weight:600; line-height:1.4; word-break:break-word;}
-.news-supplement-item .news-summary{display:block; margin-top:.35rem; color:var(--text-muted); font-size:.78rem; line-height:1.45; word-break:break-word;}
-.news-supplement-item .news-meta{display:block; margin-top:.45rem; color:var(--text-muted); font-size:.7rem;}
 .fav-item{
   position:relative; background:var(--bg-input); border:1px solid transparent;
   border-radius:var(--radius-md); padding:.8rem 2.4rem 2.1rem .9rem;
@@ -527,8 +494,6 @@ button.seg.active{
 .platform-tabs[aria-label="候选栏"] button.seg{
   flex:1 1 0; font-size:.82rem; padding:.42rem .55rem; letter-spacing:0;
 }
-body.lane-github .panel-title{letter-spacing:0; font-weight:700;}
-body.lane-github .panel-header .row{width:100%;}
 .btn-magic{
   background:linear-gradient(135deg, var(--accent-gradient-2), var(--accent-gradient-1));
   color:#1a160f; border:1px solid var(--accent); font-weight:700;
@@ -629,8 +594,6 @@ body.lane-github .panel-header .row{width:100%;}
 #hotspot-list li:nth-child(4){animation-delay:160ms;}
 #hotspot-list li:nth-child(5){animation-delay:200ms;}
 #hotspot-list li:nth-child(n+6){animation-delay:240ms;}
-#hotspot-list::-webkit-scrollbar, .dialog-content::-webkit-scrollbar, .article-scroll::-webkit-scrollbar, #image-picker-list::-webkit-scrollbar, #hook-list::-webkit-scrollbar, #news-supplement-list::-webkit-scrollbar{width:4px;}
-#hotspot-list::-webkit-scrollbar-thumb, .dialog-content::-webkit-scrollbar-thumb, .article-scroll::-webkit-scrollbar-thumb, #image-picker-list::-webkit-scrollbar-thumb, #hook-list::-webkit-scrollbar-thumb, #news-supplement-list::-webkit-scrollbar-thumb{background:var(--accent-gradient-2); border-radius:4px;}
 .hotspot-item{
   display:block; width:100%; text-align:left;
   background:var(--bg-input); border:1px solid transparent;
@@ -661,32 +624,6 @@ body.lane-github .panel-header .row{width:100%;}
 .ht-zh-unavailable{display:block; color:var(--warn); margin:0 0 .4rem; font-size:.82rem;}
 .ht-meta{display:block; font-size:.72rem; color:var(--text-muted); border-top:1px solid rgba(243, 238, 228, 0.05); padding-top:.65rem;}
 .hotspot-empty{padding:.8rem .2rem; color:var(--text-muted);}
-#hook-list{
-  list-style:none; margin:0 0 .75rem; padding:0 .3rem 0 0;
-  display:flex; flex-direction:column; gap:.55rem;
-  max-height:18rem; overflow-y:auto; overscroll-behavior:contain;
-  scrollbar-width:thin; scrollbar-gutter:stable;
-}
-#hook-list[hidden]{display:none;}
-.hook-card{
-  background:var(--bg-input); border:1px solid var(--border);
-  border-radius:var(--radius-md); padding:.65rem .75rem;
-}
-.hook-row{display:flex; align-items:flex-start; gap:.55rem;}
-.hook-row input{margin:.28rem 0 0; flex:0 0 auto;}
-.hook-body{min-width:0; flex:1 1 auto;}
-.hook-title-row{display:flex; flex-wrap:wrap; align-items:baseline; gap:.35rem .5rem; margin-bottom:.25rem;}
-.hook-phrase{font-weight:600; color:var(--text-main);}
-.hook-kind{
-  font-size:.68rem; color:var(--accent); font-weight:600;
-  background:rgba(196, 164, 106, 0.08); border:1px solid rgba(196, 164, 106, 0.18);
-  padding:.1rem .4rem; border-radius:4px;
-}
-.hook-priority{font-size:.68rem; color:var(--accent); font-weight:600;}
-.hook-why{margin:0 0 .3rem; font-size:.78rem; color:var(--text-muted); line-height:1.4;}
-.hook-results{margin:.15rem 0 0; padding:0 0 0 1.05rem; display:flex; flex-direction:column; gap:.25rem;}
-.hook-results a{color:var(--accent); word-break:break-word;}
-.hook-snippet{display:block; font-size:.75rem; color:var(--text-muted); line-height:1.4;}
 
 #article-empty{color:var(--text-muted); font-size:.9rem; padding:.75rem 0; margin:0; text-align:center;}
 #article-panel{min-height:0; height:auto; overflow:visible;}
@@ -701,7 +638,6 @@ body.lane-github .panel-header .row{width:100%;}
 .article-field{display:flex; flex-direction:column; gap:.5rem; margin:0; font-size:.85rem; font-weight:600; color:var(--text-muted);}
 .article-field input,.article-field textarea{margin:0; font-weight:400;}
 .article-field-head{display:flex; align-items:center; justify-content:space-between; gap:.75rem;}
-#related-search-btn{height:32px; min-height:32px; padding:0 .75rem; font-size:.76rem; white-space:nowrap;}
 #article-body{
   flex:1 0 auto; min-height:260px; height:auto; overflow:hidden; resize:none;
   overflow-anchor:none; white-space:pre-wrap; word-break:break-word; line-height:1.8;
@@ -900,108 +836,35 @@ textarea[name=style]{resize:vertical; max-height:50vh;}
   .model-role-row,.model-role-row.simple{grid-template-columns:minmax(0, 1fr);}
   .model-role-row button{width:100%;}
 }
-body.lane-github .rank-toolbar,
-body.lane-github #source-health-wrap,
-body.lane-github label[for="hours-select"],
-body.lane-github #hours-select,
-body.lane-github #hours-custom,
-body.lane-github #translate-btn,
-body.lane-github #hotspot-list,
-body.lane-github #article-panel .panel-header .platform-tabs,
-body.lane-github #prompt-style-select,
-body.lane-github #find-hooks-btn,
-body.lane-github #generate-btn,
-body.lane-github #article-paste,
-body.lane-github #article-empty,
-body.lane-github #article-view,
-body.lane-github #hook-list,
-body.lane-skills .rank-toolbar,
-body.lane-skills #source-health-wrap,
-body.lane-skills label[for="hours-select"],
-body.lane-skills #hours-select,
-body.lane-skills #hours-custom,
-body.lane-skills #collect-btn,
-body.lane-skills #translate-btn,
-body.lane-skills #hotspot-list,
-body.lane-skills #github-list,
-body.lane-skills #prompt-style-select,
-body.lane-skills #find-hooks-btn,
-body.lane-skills #generate-btn,
-body.lane-skills #article-paste,
-body.lane-skills #article-empty,
-body.lane-skills #article-view,
-body.lane-skills #hook-list{display:none !important;}
-body.lane-github #picked-dock, body.lane-skills #picked-dock { display:none !important; }
-#github-list,#skill-search-row,#skill-source-bar,#skill-source-toggle,#skill-crawl-sources,
-#skill-degraded-note,#skill-paste-row,#skill-paste-hint,#skill-paste-status,#skill-token-box,#skill-list{display:none;}
 /* Iteration 2: the creation page owns the retained visual studios (weekly 3:4
    and skill posters), so they are no longer gated behind the retired lanes. */
 #github-studio,#skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
 .studio-heading{margin:0; font-size:1rem;}
-body.lane-github #github-list{display:flex; flex-direction:column; gap:.55rem; margin:0; padding:0; list-style:none;}
-body.lane-github #github-studio{display:flex; flex-direction:column; gap:1rem; min-height:0;}
-body.lane-skills #skill-search-row{display:flex; gap:.5rem; align-items:center; width:100%; margin:.35rem 0 .55rem;}
-body.lane-skills #skill-search-row input{
-  flex:1 1 auto; width:auto; min-width:0; height:40px;
+/* Skill package sources and degradation are part of the visible studio contract
+   now: they used to live in a hidden lane block, which made them unreadable. */
+#skills-sources{display:flex; flex-direction:column; gap:.45rem;}
+#skills-source-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0; padding:0; list-style:none;}
+#skills-source-chips li{display:inline-flex;}
+#skills-source-chips button{
+  font-size:.72rem; padding:.24rem .6rem; border-radius:999px;
+  border:1px solid var(--border); background:var(--bg-card); color:var(--text-muted); cursor:pointer;
 }
-body.lane-skills #skill-search-btn,
-body.lane-skills #skill-clear-btn{
-  flex:0 0 auto; min-width:4.75rem; height:40px; padding:0 1.15rem;
-  white-space:nowrap; line-height:1; display:inline-flex;
-  align-items:center; justify-content:center;
+#skills-source-chips button:hover{border-color:var(--accent); color:var(--text-main);}
+#skills-source-chips li.is-manual button{border-style:dashed;}
+#skills-degraded-note{
+  margin:0; padding:.45rem .6rem; font-size:.76rem; line-height:1.5;
+  border:1px solid rgba(196,122,106,.45); border-radius:var(--radius-sm);
+  background:rgba(196,122,106,.08); color:var(--err); word-break:break-word;
 }
-body.lane-skills #skill-clear-btn{min-width:3.6rem; padding:0 .85rem;}
-/* The paste box is a textarea on purpose: a real paste is multi-line, and the
-   box has to grow with it instead of scrolling one line at a time. */
-body.lane-skills #skill-paste-row{display:flex; gap:.5rem; align-items:flex-start; width:100%; margin:0 0 .35rem;}
-body.lane-skills #skill-paste-hint{display:block; margin:0 0 .55rem;}
-/* The paste result keeps its own line: the shared status line is overwritten by
-   the render that starts right after a paste, which hid skips and warnings. */
-#skill-paste-status{margin:0 0 .55rem; font-size:.78rem; line-height:1.5; word-break:break-word; color:var(--text-muted);}
-#skill-paste-status[hidden]{display:none;}
-body.lane-skills #skill-paste-status:not([hidden]){display:block;}
-body.lane-skills #skill-paste-status.status-ok{color:var(--ok);}
-body.lane-skills #skill-paste-status.status-error{color:var(--err);}
-body.lane-skills #skill-paste-row textarea{
-  flex:1 1 auto; width:auto; min-width:0; min-height:76px; max-height:40vh;
-  padding:.6rem .7rem; line-height:1.5; resize:vertical; overflow-y:auto;
-  font:inherit; font-size:.85rem;
-}
-body.lane-skills #skill-paste-btn{
-  flex:0 0 auto; min-width:4.75rem; height:40px; padding:0 1.15rem;
-  white-space:nowrap; line-height:1; display:inline-flex;
-  align-items:center; justify-content:center;
-}
-body.lane-skills #skill-token-box{display:block; margin:0 0 .6rem;}
-#skill-token-box summary{
-  cursor:pointer; font-size:.74rem; color:var(--text-muted); font-weight:600;
-}
-#skill-token-box .skill-token-row{display:flex; gap:.5rem; align-items:center; margin:.45rem 0 .35rem;}
-#skill-token-box .skill-token-row input{flex:1 1 auto; min-width:0; height:36px;}
-#skill-token-box .skill-token-row button{flex:0 0 auto; height:36px; min-height:36px; padding:0 .9rem;}
-#skill-token-status{margin:0; font-size:.72rem; line-height:1.45;}
-/* One merged block replaces the stage chips + gap note: it answers the only
-   question the user asks here — where did the collected skills come from. */
-#skill-source-bar{margin:.15rem 0 .55rem;}
-#skill-source-chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:0; padding:0; list-style:none;}
-#skill-source-chips li{margin:0; padding:0; list-style:none;}
-#skill-source-chips button{
-  padding:.2rem .65rem; border-radius:99px; border:1px solid var(--border);
-  font-size:.72rem; color:var(--text-muted); background:var(--bg-card); cursor:pointer;
-}
-#skill-source-chips button:hover{border-color:var(--accent); color:var(--text-main);}
-#skill-source-chips li.is-manual button{border-style:dashed; color:var(--text-main);}
-#skill-degraded-note{
-  margin:.35rem 0 0; font-size:.78rem; line-height:1.5;
-  color:var(--text-muted); word-break:break-word;
-}
-#skill-degraded-note[hidden]{display:none;}
-body.lane-skills #skill-source-bar:not([hidden]),
-body.lane-skills #skill-degraded-note:not([hidden]){display:block;}
-body.lane-skills #skill-source-bar{display:block;}
-#poster-template-dock{display:none; margin:0 0 .75rem;}
-body.lane-github #poster-template-dock,
-body.lane-skills #poster-template-dock{display:block;}
+#skills-degraded-note[hidden]{display:none;}
+#article-context{margin:0 0 .9rem;}
+#article-context[hidden]{display:none;}
+#article-context h3{margin:0 0 .3rem;}
+#article-context .page-description{margin:.2rem 0 .55rem;}
+/* Both poster studios live in the creation page now, so the template picker is
+   a normal visible control instead of a lane-gated one. */
+#poster-template-dock{margin:0 0 1rem; padding:.8rem .9rem; border:1px solid var(--border);
+  border-radius:var(--radius-md); background:var(--bg-card);}
 .poster-template-cards{display:flex; gap:.7rem;}
 .poster-template-card{
   flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:.4rem; align-items:center;
@@ -1024,51 +887,7 @@ body.lane-skills #poster-template-dock{display:block;}
     #ded3c0;
   box-shadow:inset 0 0 0 2px #b39163, inset 0 0 0 10px rgba(177,149,110,.28);
 }
-body.lane-skills #skill-list:not([hidden]){
-  display:flex; flex-direction:column; gap:.35rem;
-  margin:.15rem 0 .55rem; padding:0; list-style:none;
-  max-height:16rem; overflow-y:auto; overscroll-behavior:contain;
-}
-body.lane-skills #skill-list[hidden]{display:none;}
-#skill-list li{
-  display:flex; align-items:center; gap:.55rem;
-  padding:.4rem .65rem;
-  border:1px solid var(--border); border-radius:var(--radius-sm);
-  background:var(--bg-card);
-}
-#skill-list li.is-selected{border-color:rgba(196, 164, 106, 0.45);}
-#skill-list input[type=checkbox]{
-  margin:0; accent-color:var(--accent); width:1rem; height:1rem; flex:0 0 auto;
-}
-#skill-list a{color:var(--accent); font-weight:600; text-decoration:none; min-width:0; word-break:break-word;}
-#skill-list a:hover{text-decoration:underline;}
-#skill-list .skill-source{margin-left:auto; color:var(--text-muted); font-size:.72rem; white-space:nowrap;}
-/* Clicking the shared status line expands the list of configured crawlers. */
-body.lane-skills #skill-source-toggle{
-  display:block; width:100%; text-align:left; cursor:pointer;
-  margin:.15rem 0 0; padding:.3rem .55rem; border-radius:var(--radius-sm,6px);
-  border:1px dashed var(--border); background:transparent;
-  font-size:.76rem; color:var(--text-muted); font-weight:600;
-}
-body.lane-skills #skill-source-toggle:hover{color:var(--text-main); border-color:var(--accent);}
-#skill-source-toggle[hidden]{display:none !important;}
-body.lane-skills #skill-crawl-sources{
-  display:block; margin:.4rem 0 0; padding:.55rem .7rem; list-style:none;
-  border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-card);
-}
-#skill-crawl-sources[hidden]{display:none !important;}
-body.lane-skills #skill-crawl-sources li{
-  display:flex; flex-direction:column; gap:.15rem; padding:.4rem 0;
-  border-bottom:1px solid var(--border); font-size:.76rem; line-height:1.5;
-}
-body.lane-skills #skill-crawl-sources li:last-child{border-bottom:0;}
-body.lane-skills #skill-crawl-sources strong{font-size:.8rem; color:var(--text-main);}
-body.lane-skills #skill-crawl-sources a{color:var(--accent); word-break:break-all; font-size:.72rem;}
-body.lane-skills #skill-crawl-sources span{color:var(--text-muted);}
 #skill-title{font-size:.92rem;}
-body.lane-skills #skills-studio > .article-field{flex:0 0 auto;}
-body.lane-skills #skills-studio{display:flex; flex-direction:column; gap:1rem; min-height:0; flex:1 1 auto;}
-body.lane-skills #skills-gallery{display:flex; justify-content:center; min-height:12rem;}
 #skills-article{
   flex:0 0 auto; min-height:6rem; max-height:24rem; overflow-y:auto;
   padding:.85rem 1rem 1rem;
@@ -1079,19 +898,7 @@ body.lane-skills #skills-gallery{display:flex; justify-content:center; min-heigh
 #skills-article.is-empty #skills-body{color:var(--text-muted);}
 #skills-article h3{margin:0 0 .4rem; font-family:var(--display); font-size:1.35rem;}
 #skills-body{white-space:pre-wrap; line-height:1.7; color:var(--text-main);}
-.gh-row{
-  display:grid; grid-template-columns:2rem 2.4rem minmax(0,1fr) auto; gap:.7rem;
-  align-items:center; padding:.7rem .8rem; border:1px solid var(--border);
-  border-radius:var(--radius-md); background:var(--bg-card);
-}
-.gh-row img{width:2.4rem; height:2.4rem; border-radius:10px; object-fit:cover; background:#111;}
-.gh-row strong{display:block; color:var(--text-main); font-size:.92rem;}
-.gh-row .gh-kind{color:var(--text-muted); font-size:.75rem; white-space:nowrap;}
-.gh-stars{display:flex; flex-direction:column; align-items:flex-end; gap:.25rem; min-width:4.8rem;}
-.gh-bar{width:4.6rem; height:5px; border-radius:99px; background:#2c2923; overflow:hidden;}
-.gh-bar > span{display:block; height:100%; background:var(--accent); border-radius:99px;}
 #github-render-controls{display:flex; align-items:center; gap:.45rem; flex-wrap:wrap;}
-body.lane-skills #github-render-btn{display:none;}
 .gh-swatch{display:flex; align-items:center; gap:.28rem; font-size:.72rem; color:var(--text-muted);}
 .gh-swatch input[type=color]{
   width:1.85rem; height:1.85rem; padding:0; border:1px solid var(--border);
@@ -1178,9 +985,8 @@ body.lane-skills #github-render-btn{display:none;}
   *, *::before, *::after{animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important;}
 }
 
-/* Iteration 1 information architecture.  The older lane controls remain in
-   the DOM as a compatibility surface for the existing JavaScript, but they are
-   not part of the user-facing navigation. */
+/* Information architecture: the eight primary pages.  Iteration 2 removed the
+   older lane controls from the DOM entirely rather than hiding them. */
 .app-page{width:100%; max-width:1400px; min-width:0;}
 .app-page[hidden]{display:none !important;}
 #app-nav{align-items:stretch; gap:.75rem;}
@@ -1238,7 +1044,6 @@ body.lane-skills #github-render-btn{display:none;}
 #page-publishing .publishing-draft h3{margin:0 0 .3rem;}
 #source-health-wrap{display:none !important;}
 #source-health-toggle{display:none !important;}
-#skill-token-box{display:none !important;}
 @media (max-width: 900px){
   #page-home .home-hero{grid-template-columns:1fr;}
   .home-shortcuts,.ia-grid{grid-template-columns:1fr;}
@@ -1254,10 +1059,9 @@ body.lane-skills #github-render-btn{display:none;}
     <h1 class="logo">AutoPosting</h1>
     <p class="brand-kicker">本地工作台</p>
   </div>
-  <span id="service-status">v3.2.0 · 本地服务</span>
+  <span id="service-status">v3.2.1 · 本地服务</span>
   <button type="button" id="config-btn">设置</button>
   <button type="button" id="favorites-btn">收藏</button>
-  <button type="button" id="news-supplement-btn" aria-expanded="false">新闻补充</button>
 </header>
 <aside id="favorites-drawer" hidden>
   <div class="favorites-drawer-head">
@@ -1265,14 +1069,6 @@ body.lane-skills #github-render-btn{display:none;}
     <button type="button" id="favorites-close">关闭</button>
   </div>
   <ul id="favorites-list" aria-label="收藏列表"></ul>
-</aside>
-<aside id="news-supplement-drawer" hidden>
-  <div class="favorites-drawer-head">
-    <h2>新闻补充</h2>
-    <button type="button" id="news-supplement-close">关闭</button>
-  </div>
-  <p id="news-supplement-status" role="status" aria-live="polite"></p>
-  <ul id="news-supplement-list" aria-label="新闻补充列表"></ul>
 </aside>
 <nav id="app-nav" aria-label="主导航">
   <div id="primary-nav" role="tablist" aria-label="AutoPosting 主导航">
@@ -1326,6 +1122,12 @@ body.lane-skills #github-render-btn{display:none;}
         <p id="hotspot-sub" class="panel-sub">按综合分、时效与独立来源聚合资讯事件；选择一个或多个事件后可继续研究</p>
       </div>
       <div class="row">
+        <label for="news-scope-select">来源范围</label>
+        <select id="news-scope-select" aria-label="来源范围">
+          <option value="all" selected>全部来源</option>
+          <option value="official">仅订阅源</option>
+          <option value="community">仅社区来源</option>
+        </select>
         <label for="hours-select">时间范围</label>
         <select id="hours-select">
           <option value="4" selected>4 小时</option>
@@ -1350,49 +1152,8 @@ body.lane-skills #github-render-btn{display:none;}
       <button type="button" id="research-btn" class="primary" disabled>研究已选事件</button>
     </div>
     <div id="hotspot-pane">
-      <div id="poster-template-dock">
-        <p class="panel-sub">海报模版。切换只改背景和风格，文案模块不变。</p>
-        <div class="poster-template-cards" role="list">
-          <button type="button" class="poster-template-card active" data-template="1" aria-pressed="true">
-            <span class="poster-template-preview preview-geometric" aria-hidden="true"></span>
-            <span>模版一</span>
-          </button>
-          <button type="button" class="poster-template-card" data-template="2" aria-pressed="false">
-            <span class="poster-template-preview preview-toc" aria-hidden="true"></span>
-            <span>模版二</span>
-          </button>
-        </div>
-      </div>
-      <div id="skill-search-row">
-        <input id="skill-query" type="text" maxlength="200" aria-label="Skill 查找关键词" placeholder="关键词，空格分隔多个：视频 剪辑 字幕">
-        <button type="button" id="skill-search-btn">查找</button>
-        <button type="button" id="skill-clear-btn" title="清空已收录的 skill（标题保留）">清空</button>
-      </div>
-      <div id="skill-paste-row">
-        <textarea id="skill-links" rows="3" aria-label="粘贴 skill 链接" title="粘贴 skill 链接（可多行、可多个），加入后和检索到的一样出简介和海报" placeholder="每行一个 skill 链接，可以粘贴多条"></textarea>
-        <button type="button" id="skill-paste-btn">加入</button>
-      </div>
-      <p id="skill-paste-hint" class="muted">支持 GitHub / skills.sh 的 skill 链接；可多行、每行一条，加入后和检索到的一样出海报。</p>
-      <p id="skill-paste-status" role="status" aria-live="polite" hidden></p>
-      <details id="skill-token-box">
-        <summary>GitHub Token（可选）</summary>
-        <div class="skill-token-row">
-          <input id="skill-github-token" type="password" autocomplete="off" aria-label="GitHub Token" title="粘贴 GitHub Personal Access Token；只存本机钥匙串，不回显">
-          <button type="button" id="skill-token-save">保存</button>
-          <button type="button" id="skill-token-clear">清除</button>
-        </div>
-        <p id="skill-token-status" class="muted">未配置。不配也能用，但 GitHub 接口每小时只给 60 次，容易限流。</p>
-      </details>
-      <div id="skill-source-bar">
-        <ul id="skill-source-chips" aria-label="已收录 skill 的来源"></ul>
-        <p id="skill-degraded-note" role="status" hidden></p>
-      </div>
-      <ul id="skill-list" hidden aria-label="已收录的 skill"></ul>
       <ul id="hotspot-list"></ul>
-      <ul id="github-list"></ul>
       <p id="hotspot-status" role="status" aria-live="polite"></p>
-      <button type="button" id="skill-source-toggle" aria-expanded="false" aria-controls="skill-crawl-sources" hidden></button>
-      <ul id="skill-crawl-sources" hidden aria-label="已配置的自动抓取源"></ul>
     </div>
     <div id="source-health-wrap">
       <button type="button" id="source-health-toggle" aria-expanded="false" aria-controls="source-health">订阅源状态</button>
@@ -1409,6 +1170,7 @@ body.lane-skills #github-render-btn{display:none;}
       <div class="resource-toolbar">
         <input id="research-query" type="text" maxlength="200" placeholder="可选：限定研究问题" aria-label="研究问题">
         <button type="button" id="research-run-btn" class="primary" disabled>开始研究</button>
+        <button type="button" id="research-to-creation-btn" disabled>进入创作</button>
         <button type="button" id="research-back-news">返回资讯</button>
       </div>
       <p id="research-status" class="page-description" role="status" aria-live="polite">尚未提交研究。</p>
@@ -1453,6 +1215,12 @@ body.lane-skills #github-render-btn{display:none;}
   <section class="app-page" id="page-creation" data-app-page="creation" hidden>
   <section class="panel" id="article-panel" aria-labelledby="h-article">
     <h2 id="h-article" class="sr-only">文章</h2>
+    <article id="article-context" class="ia-card" hidden>
+      <p class="page-kicker">ArticleGenerationContext</p>
+      <h3 id="article-context-title"></h3>
+      <p id="article-context-meta" class="page-description"></p>
+      <button type="button" id="article-context-clear">清除研究上下文</button>
+    </article>
     <div class="panel-header">
       <div class="row">
       <select id="prompt-style-select" aria-label="生成风格" title="生成风格">
@@ -1460,15 +1228,26 @@ body.lane-skills #github-render-btn{display:none;}
         <option value="经验分享">经验分享</option>
         <option value="klinkenborg_style">klinkenborg_style</option>
       </select>
-      <button type="button" id="find-hooks-btn" disabled>找切口</button>
       <button type="button" id="generate-btn" class="btn-magic" disabled>生成文章</button>
       <textarea id="article-paste" rows="1" placeholder="可粘贴原文页面，点生成文章时一并送进模型"></textarea>
       </div>
     </div>
     <p id="article-status" role="status" aria-live="polite"></p>
     <p id="studio-status" class="page-description" role="status" aria-live="polite"></p>
-    <ul id="hook-list" hidden></ul>
     <p id="article-empty">尚未生成文章</p>
+    <div id="poster-template-dock">
+      <p class="panel-sub">海报模版。切换只改背景和风格，文案模块不变。</p>
+      <div class="poster-template-cards" role="list">
+        <button type="button" class="poster-template-card active" data-template="1" aria-pressed="true">
+          <span class="poster-template-preview preview-geometric" aria-hidden="true"></span>
+          <span>模版一</span>
+        </button>
+        <button type="button" class="poster-template-card" data-template="2" aria-pressed="false">
+          <span class="poster-template-preview preview-toc" aria-hidden="true"></span>
+          <span>模版二</span>
+        </button>
+      </div>
+    </div>
     <div id="github-studio">
       <h3 class="studio-heading">GitHub 周榜出图工作台</h3>
       <p class="page-description">周榜发现现在走资源探索的「GitHub Weekly Preset」；这里负责抓取本周 AI 项目、选主题配色并生成 3:4 图片。</p>
@@ -1502,7 +1281,12 @@ body.lane-skills #github-render-btn{display:none;}
       <p class="page-description">在资源探索里用自然语言找 Skill 或粘贴 Skill 链接，再送到这里生成封面与每个 skill 一张海报。</p>
       <div class="gh-toolbar">
         <button type="button" id="skills-fetch-btn">读取上次收录</button>
+        <button type="button" id="skills-clear-btn">清空收录</button>
         <button type="button" data-app-page-target="resources">去资源探索</button>
+      </div>
+      <div id="skills-sources">
+        <ul id="skills-source-chips" aria-label="已收录 skill 的来源"></ul>
+        <p id="skills-degraded-note" role="status" hidden></p>
       </div>
       <label class="article-field" for="skill-title">标题
         <input id="skill-title" type="text" maxlength="120" placeholder="封面海报标题；同时作为介绍文标题">
@@ -1546,7 +1330,6 @@ body.lane-skills #github-render-btn{display:none;}
         <div class="article-field">
           <div class="article-field-head">
             <span>正文</span>
-            <button type="button" id="related-search-btn" disabled>相关检索</button>
           </div>
           <textarea id="article-body" rows="14"></textarea>
         </div>
@@ -1790,7 +1573,7 @@ var state = {
   page: "home",
   hours: 4,
   rank: "heat",
-  lane: "hotspots",
+  newsScope: "all",
   newsStyle: "AI专家",
   rankings: {heat: [], time: []},
   radarEvents: {},
@@ -1818,16 +1601,11 @@ var state = {
   llm: {model: "", base_url: "", effort: "none", configured: false},
   translation: {model: "", base_url: "", configured: false, enabled: false},
   leaderboard: {model: "", base_url: "", configured: false, enabled: false},
-  newsSupplements: [],
-  pickedNewsKeys: {},
-  articleSessions: {},
-  articleLastKeys: {},
   articleRequestGen: 0,
-  relatedSearchGen: 0,
+  articleContext: null,
   githubWeekly: {repos: [], xhs_title: "本周值得关注的github ai项目前10", xhs_body: ""},
   githubTheme: "dark",
-  skillsPackage: {query: "", title: "", user_title: "", theme: "", stages: [], skills: [], article: {title: "", body: ""}, images: [], crawl_sources: []},
-  crawlSourcesOpen: false,
+  skillsPackage: {query: "", title: "", user_title: "", theme: "", stages: [], skills: [], article: {title: "", body: ""}, images: []},
   githubTokenConfigured: false,
   modelEndpoints: [],
   platforms: {wechat: {configured: false}, xiaohongshu: {account_configured: false}, x: {configured: false}},
@@ -1835,7 +1613,6 @@ var state = {
   originalGen: 0,
   originalItemId: "",
   originalTranslatable: false,
-  newsFocus: null,
   hotspotGen: 0,
   collectGen: 0,
   collectionRun: null,
@@ -1977,9 +1754,9 @@ function renderSourceRegistry(sources) {
     action.textContent = source.enabled ? "手动刷新" : "已停用";
     action.disabled = !source.enabled;
     action.addEventListener("click", function () {
-      var lane = source.type === "reddit" || source.adapter_type === "reddit" ? "viewpoints" : "hotspots";
+      var scope = source.type === "reddit" || source.adapter_type === "reddit" ? "community" : "official";
       setAppPage("news");
-      setLane(lane);
+      setNewsScope(scope);
       collect(source.source_id);
     });
     controls.appendChild(action);
@@ -2000,6 +1777,16 @@ function renderCollectionRun(payload) {
   var inserted = Number(run.items_inserted || run.inserted || 0);
   var deduped = Number(run.items_after_dedupe || run.deduped || 0);
   var clustered = Number(run.clusters_created_or_updated || run.clusters || 0);
+  var homeSummary = $("home-recent-summary");
+  if (homeSummary) {
+    // The home card reports the latest run even when it happened in an earlier
+    // session: a loading placeholder that never resolves is worse than a line.
+    homeSummary.textContent = run.run_id
+      ? ("最近一次采集：" + (failed ? ("有 " + failed + " 个源失败") : "全部成功")
+         + " · 新增 " + inserted + " 条" + (clustered ? (" · 聚类 " + clustered + " 个事件") : "")
+         + (run.started_at ? (" · " + formatTime(run.started_at)) : ""))
+      : "还没有采集运行记录，去「资讯探索」刷新一次来源。";
+  }
   renderSummaryStats($("run-summary"), [
     {label: "尝试源", value: requested || attempted},
     {label: "成功", value: successful},
@@ -2036,10 +1823,6 @@ function renderCollectionRun(payload) {
     row.appendChild(el("span", "meta", diagnostic || attempt.error || ""));
     list.appendChild(row);
   });
-  var summary = $("home-recent-summary");
-  if (summary && run.run_id) {
-    summary.textContent = "最近一次采集：" + (failed ? ("有 " + failed + " 个源失败") : "全部成功") + " · 新增 " + inserted + " 条" + (clustered ? " · 聚类 " + clustered + " 个事件" : "");
-  }
 }
 
 function renderCollectionRuns(payload) {
@@ -2052,6 +1835,15 @@ function renderCollectionRuns(payload) {
     return;
   }
   var latest = runs[0] || {};
+  var homeSummary = $("home-recent-summary");
+  if (homeSummary) {
+    // Loading the page must not leave the home card on its placeholder: the
+    // latest persisted run is the answer, whether or not it ran in this tab.
+    var failedCount = Array.isArray(latest.failed_sources) ? latest.failed_sources.length : 0;
+    homeSummary.textContent = "最近一次采集：" + (failedCount ? ("有 " + failedCount + " 个源失败") : "全部成功")
+      + " · 新增 " + Number(latest.items_inserted || 0) + " 条"
+      + (latest.started_at ? (" · " + formatTime(latest.started_at)) : "");
+  }
   renderSummaryStats($("run-summary"), [
     {label: "运行记录", value: runs.length},
     {label: "最近状态", value: latest.status || "—"},
@@ -2210,8 +2002,68 @@ function syncResearchControls() {
   var enabled = ids.length > 0 && !state.research.loading;
   var button = $("research-btn");
   var runButton = $("research-run-btn");
+  var toCreation = $("research-to-creation-btn");
   if (button) { button.disabled = !enabled; }
   if (runButton) { runButton.disabled = !enabled; }
+  // 只有拿到 dossier 才能进创作：这是「Topic Dossier → 文章」的唯一入口。
+  if (toCreation) { toCreation.disabled = !state.research.dossier; }
+}
+
+function articleContextFromDossier(dossier) {
+  if (!dossier || typeof dossier !== "object") { return null; }
+  var dossierId = String(dossier.dossier_id || "").trim();
+  if (!dossierId) { return null; }
+  var evidence = Array.isArray(dossier.evidence) ? dossier.evidence : [];
+  return {
+    source_type: "topic_dossier",
+    dossier_id: dossierId,
+    title: String(dossier.title || dossier.query || "未命名研究"),
+    event_count: Array.isArray(dossier.event_ids) ? dossier.event_ids.length : 0,
+    evidence_count: evidence.length,
+    status: String(dossier.status || ""),
+    degraded: !!dossier.degraded,
+  };
+}
+
+function renderArticleContext() {
+  var box = $("article-context");
+  if (!box) { return; }
+  var context = state.articleContext;
+  if (!context) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  $("article-context-title").textContent = context.title || "未命名研究";
+  var meta = [
+    context.source_type === "topic_dossier" ? "Topic Dossier" : "手动选材",
+    context.dossier_id || "",
+    context.event_count ? context.event_count + " 个事件" : "",
+    context.evidence_count ? context.evidence_count + " 条证据" : "",
+    context.status || "",
+    context.degraded ? "部分能力降级" : "",
+  ].filter(Boolean);
+  $("article-context-meta").textContent = meta.join(" · ");
+  syncGenerateEnabled();
+}
+
+function setArticleContextFromDossier(dossier) {
+  var context = articleContextFromDossier(dossier);
+  if (!context) {
+    status("research-status", "这份研究还没有 dossier_id，不能作为创作输入", "error");
+    return false;
+  }
+  state.articleContext = context;
+  renderArticleContext();
+  setAppPage("creation");
+  status("article-status", "已带入研究：" + context.title + "。直接点「生成文章」即可。", "ok");
+  return true;
+}
+
+function clearArticleContext() {
+  state.articleContext = null;
+  renderArticleContext();
+  status("article-status", "已清除研究上下文，回到手动选材。", "");
 }
 
 function diagnosticLabel(diagnostic) {
@@ -2232,6 +2084,7 @@ function renderResearchDossier(dossier) {
   evidenceList.textContent = "";
   if (!dossier || typeof dossier !== "object") {
     summary.appendChild(el("article", "ia-card", "尚未生成 Topic Dossier"));
+    syncResearchControls();
     return;
   }
   var topics = Array.isArray(dossier.topics) ? dossier.topics.length : 0;
@@ -2258,6 +2111,7 @@ function renderResearchDossier(dossier) {
   });
   if (!evidence.length) {
     evidenceList.appendChild(el("li", "run-empty", "没有可展示的证据；请查看上方诊断。"));
+    syncResearchControls();
     return;
   }
   evidence.forEach(function (item) {
@@ -2279,6 +2133,7 @@ function renderResearchDossier(dossier) {
     if (item.snippet) { row.appendChild(el("p", "", String(item.snippet).slice(0, 500))); }
     evidenceList.appendChild(row);
   });
+  syncResearchControls();
 }
 
 function runResearch() {
@@ -2339,8 +2194,6 @@ function setAppPage(page) {
       loadSkills();
     }
   }
-  if (page === "creation" && state.lane === "skills") { setLane("hotspots"); }
-  if (page === "news" && previousPage !== "news" && state.lane !== "mixed") { setLane("mixed"); }
 }
 
 var WAIT_HINTS = {
@@ -2351,8 +2204,6 @@ var WAIT_HINTS = {
   github_fetch: {title: "正在抓取 GitHub 周榜", hint: "通常 5–20 秒；配了榜单模型会再改写简介"},
   github_render: {title: "正在生成周榜图片", hint: "每张大约 8–25 秒；11 张大约 2–5 分钟", unit: "张"},
   generate: {title: "正在生成文章", hint: "通常 15–90 秒，看模型和篇幅"},
-  hooks: {title: "正在找切口", hint: "通常 10–40 秒"},
-  related_search: {title: "正在检索相关新闻", hint: "通常几秒到几十秒"},
   original: {title: "正在读取原文", hint: "通常几秒"},
   original_tr: {title: "正在翻译原文", hint: "通常 10–40 秒"},
   models: {title: "正在获取可用模型", hint: "通常几秒到十几秒"},
@@ -2772,7 +2623,6 @@ function applyPublishLabels() {
 }
 
 function resetArticle() {
-  invalidateRelatedSearch();
   state.draft = null;
   state.creatorUrl = "";
   state.pendingPublish = false;
@@ -2792,93 +2642,14 @@ function resetArticle() {
   $("schedule-btn").disabled = true;
   $("manual-box").hidden = true;
   $("save-article-btn").disabled = true;
-  if ($("related-search-btn")) { $("related-search-btn").disabled = true; }
   status("article-status", "");
   status("publish-status", "");
 }
 
-function articleContextKey(lane, platform) {
-  return String(lane || "hotspots") + "|" + String(platform || "wechat");
-}
 
-function articleTargetIds() {
-  var picked = pickedIdList();
-  if (picked.length) { return picked; }
-  return state.item && state.item.item_id ? [String(state.item.item_id)] : [];
-}
 
-function articleSessionKey(lane, platform, ids) {
-  return articleContextKey(lane, platform) + "|" + (ids || []).slice().sort().join(",");
-}
 
-function currentArticleSessionKey() {
-  var context = articleContextKey(state.lane, state.platform);
-  return state.articleLastKeys[context] || articleSessionKey(state.lane, state.platform, articleTargetIds());
-}
 
-function rememberArticleSession(lane) {
-  if (lane !== "hotspots" && lane !== "viewpoints") { return ""; }
-  var ids = articleTargetIds();
-  var context = articleContextKey(lane, state.platform);
-  var key = ids.length ? articleSessionKey(lane, state.platform, ids) : (state.articleLastKeys[context] || "");
-  if (!key) { return ""; }
-  state.articleSessions[key] = {
-    item: state.item,
-    draft: state.draft,
-    title: $("article-title").value,
-    body: $("article-body").value,
-    articleDirty: state.articleDirty,
-    creatorUrl: state.creatorUrl,
-  };
-  state.articleLastKeys[context] = key;
-  return key;
-}
-
-function storeGeneratedArticle(key, data, item) {
-  state.articleSessions[key] = {
-    item: item || null,
-    draft: data,
-    title: data.title || "",
-    body: data.body || "",
-    articleDirty: false,
-    creatorUrl: "",
-  };
-  var separator = key.indexOf("|");
-  var context = separator >= 0 ? key.slice(0, key.lastIndexOf("|")) : key;
-  state.articleLastKeys[context] = key;
-}
-
-function restoreArticleSession(lane) {
-  if (lane !== "hotspots" && lane !== "viewpoints") { return false; }
-  var key = state.articleLastKeys[articleContextKey(lane, state.platform)] || "";
-  var session = key ? state.articleSessions[key] : null;
-  if (!session) {
-    resetArticle();
-    return false;
-  }
-  state.item = session.item || null;
-  state.draft = session.draft || null;
-  state.creatorUrl = session.creatorUrl || "";
-  state.articleDirty = !!session.articleDirty;
-  if (!state.draft) {
-    resetArticle();
-    $("find-hooks-btn").disabled = !state.item;
-    $("open-original-btn").disabled = !state.item;
-    syncGenerateEnabled();
-    return false;
-  }
-  renderArticle(state.draft);
-  $("article-title").value = session.title || "";
-  $("article-body").value = session.body || "";
-  state.articleDirty = !!session.articleDirty;
-  $("publish-btn").disabled = false;
-  $("schedule-btn").disabled = false;
-  $("find-hooks-btn").disabled = !state.item;
-  $("open-original-btn").disabled = !state.item;
-  syncGenerateEnabled();
-  syncRelatedSearchEnabled();
-  return true;
-}
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
@@ -3308,22 +3079,18 @@ function selectHotspot(item, button) {
       node.setAttribute("aria-pressed", String(active));
       node.classList.toggle("selected", active);
     });
-    $("find-hooks-btn").disabled = false;
     $("open-original-btn").disabled = false;
     syncGenerateEnabled();
     if (typeof renderPickedDock === "function") renderPickedDock();
     return;
   }
-  state.newsFocus = null;
   state.item = item;
-  clearHooks();
   var nodes = $("hotspot-list").querySelectorAll(".hotspot-item");
   nodes.forEach(function (node) {
     var active = node === button;
     node.setAttribute("aria-pressed", String(active));
     node.classList.toggle("selected", active);
   });
-  $("find-hooks-btn").disabled = false;
   $("open-original-btn").disabled = false;
   syncGenerateEnabled();
   if (typeof renderPickedDock === "function") renderPickedDock();
@@ -3331,14 +3098,11 @@ function selectHotspot(item, button) {
 
 function clearHotspotSelection(keepArticle) {
   state.item = null;
-  state.newsFocus = null;
   if (!keepArticle) {
     state.articleRequestGen += 1;
     resetArticle();
   }
-  clearHooks();
   closeOriginal();
-  $("find-hooks-btn").disabled = true;
   $("open-original-btn").disabled = true;
   var list = $("hotspot-list");
   if (list) {
@@ -3354,7 +3118,6 @@ function clearHotspotSelection(keepArticle) {
 function clearFocusAfterGenerate() {
   // A1: 只在生成成功后清空「焦点」分组。正文、草稿、钩子与「已选 N」多选集合都不动。
   state.item = null;
-  state.newsFocus = null;
   var list = $("hotspot-list");
   if (list) {
     list.querySelectorAll(".hotspot-item").forEach(function (node) {
@@ -3362,7 +3125,6 @@ function clearFocusAfterGenerate() {
       node.classList.remove("selected");
     });
   }
-  $("find-hooks-btn").disabled = true;
   $("open-original-btn").disabled = true;
   syncGenerateEnabled();
   if (typeof renderPickedDock === "function") renderPickedDock();
@@ -3377,7 +3139,9 @@ function pickedIdList() {
 function syncGenerateEnabled() {
   var button = $("generate-btn");
   if (!button) { return; }
-  button.disabled = !(state.item || pickedIdList().length);
+  var context = state.articleContext;
+  var fromDossier = !!(context && context.source_type === "topic_dossier" && context.dossier_id);
+  button.disabled = !(fromDossier || state.item || pickedIdList().length);
 }
 
 function togglePicked(itemId) {
@@ -3399,13 +3163,7 @@ function renderPickedDock() {
   var ids = pickedIdList();
   dock.textContent = "";
   // 焦点与「已选 N」是两个互不覆盖的分组：多选非空时焦点仍然可见。
-  if (state.newsFocus) {
-    dock.hidden = false;
-    dock.appendChild(el("span", "picked-dock-label", "焦点"));
-    var newsFocusChip = el("span", "picked-dock-chip is-static");
-    newsFocusChip.appendChild(el("span", "picked-dock-chip-label", state.newsFocus.title || ""));
-    dock.appendChild(newsFocusChip);
-  } else if (state.item) {
+  if (state.item) {
     dock.hidden = false;
     dock.appendChild(el("span", "picked-dock-label", "焦点"));
     var focusChip = el("span", "picked-dock-chip is-static");
@@ -3446,7 +3204,7 @@ function renderPickedDock() {
     });
     return;
   }
-  if (!state.newsFocus && !state.item) {
+  if (!state.item) {
     dock.hidden = true;
   }
 }
@@ -3552,240 +3310,6 @@ function renderFavorites() {
   if (typeof renderPickedDock === "function") renderPickedDock();
 }
 
-function focusNewsSupplement(item) {
-  if (!item || typeof item !== "object") { return; }
-  var title = String(item.title || item.name || item.url || item.link || "相关新闻").trim();
-  if (!title) { return; }
-  state.newsFocus = {title: title, url: String(item.url || item.link || "").trim()};
-  renderNewsSupplements();
-  renderPickedDock();
-}
-
-function selectedArticleContext() {
-  var body = $("article-body");
-  if (!state.draft || !body) { return null; }
-  var start = Number(body.selectionStart);
-  var end = Number(body.selectionEnd);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) { return null; }
-  var text = body.value || "";
-  var selected = text.slice(start, end).trim();
-  if (!selected) { return null; }
-  var paragraphs = [];
-  var cursor = 0;
-  var separator = /\\r?\\n[ \\t]*\\r?\\n/g;
-  var match;
-  while ((match = separator.exec(text))) {
-    paragraphs.push({start: cursor, end: match.index});
-    cursor = match.index + match[0].length;
-  }
-  paragraphs.push({start: cursor, end: text.length});
-  var first = paragraphs.findIndex(function (paragraph) {
-    return start < paragraph.end && end > paragraph.start;
-  });
-  var lastPosition = Math.max(start, end - 1);
-  var last = paragraphs.findIndex(function (paragraph) {
-    return lastPosition >= paragraph.start && lastPosition < paragraph.end;
-  });
-  if (first < 0) { first = 0; }
-  if (last < first) { last = first; }
-  var contextStart = paragraphs[Math.max(0, first - 1)].start;
-  var contextEnd = paragraphs[Math.min(paragraphs.length - 1, last + 1)].end;
-  return {
-    body: text,
-    selected_text: selected,
-    selection_start: start,
-    selection_end: end,
-    context: text.slice(contextStart, contextEnd),
-  };
-}
-
-function syncRelatedSearchEnabled() {
-  var button = $("related-search-btn");
-  if (!button) { return; }
-  button.disabled = !selectedArticleContext();
-}
-
-function newsKey(item) {
-  if (!item || typeof item !== "object") { return ""; }
-  return String(item.url || item.link || item.source_url || item.title || "").trim();
-}
-
-function selectedNewsItems() {
-  var picked = state.pickedNewsKeys || {};
-  return (Array.isArray(state.newsSupplements) ? state.newsSupplements : []).filter(function (item) {
-    var key = newsKey(item);
-    return key && picked[key];
-  });
-}
-
-function toggleNewsPicked(item) {
-  var key = newsKey(item);
-  if (!key) { return; }
-  if (!state.pickedNewsKeys) { state.pickedNewsKeys = {}; }
-  if (state.pickedNewsKeys[key]) { delete state.pickedNewsKeys[key]; }
-  else { state.pickedNewsKeys[key] = true; }
-  renderNewsSupplements();
-}
-
-function newsPickToggle(item) {
-  var key = newsKey(item);
-  var picked = !!(state.pickedNewsKeys && state.pickedNewsKeys[key]);
-  var toggle = el("button", "ht-pick" + (picked ? " is-on" : ""));
-  toggle.type = "button";
-  toggle.setAttribute("role", "checkbox");
-  toggle.setAttribute("aria-checked", String(picked));
-  toggle.setAttribute("aria-label", picked ? "取消选用这条新闻" : "选用这条新闻生成文章");
-  toggle.appendChild(el("span", "ht-pick-box", picked ? "✓" : ""));
-  toggle.addEventListener("click", function (event) {
-    event.preventDefault();
-    event.stopPropagation();
-    toggleNewsPicked(item);
-  });
-  return toggle;
-}
-
-function renderNewsSupplements() {
-  var list = $("news-supplement-list");
-  if (!list) { return; }
-  list.textContent = "";
-  var items = Array.isArray(state.newsSupplements) ? state.newsSupplements : [];
-  if (!items.length) {
-    list.appendChild(el("li", "muted", "暂无相关新闻"));
-    return;
-  }
-  items.forEach(function (item) {
-    if (!item || typeof item !== "object") { return; }
-    var row = el("li", "news-supplement-item");
-    var title = String(item.title || item.name || item.url || item.link || "相关新闻");
-    var url = String(item.url || item.link || item.source_url || "").trim();
-    var isFocus = state.newsFocus && state.newsFocus.url === url && state.newsFocus.title === title;
-    var key = newsKey(item);
-    row.classList.toggle("is-focus", !!isFocus);
-    row.classList.toggle("is-picked", !!(key && state.pickedNewsKeys && state.pickedNewsKeys[key]));
-    if (key) { row.appendChild(newsPickToggle(item)); }
-    if (/^https?:\/\//i.test(url)) {
-      var link = document.createElement("a");
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = title;
-      if (isFocus) { link.setAttribute("aria-current", "true"); }
-      link.addEventListener("click", function () { focusNewsSupplement(item); });
-      row.appendChild(link);
-    } else {
-      var newsTitle = el("span", "news-title", title);
-      newsTitle.tabIndex = 0;
-      newsTitle.setAttribute("role", "button");
-      if (isFocus) { newsTitle.setAttribute("aria-current", "true"); }
-      newsTitle.addEventListener("click", function () { focusNewsSupplement(item); });
-      newsTitle.addEventListener("keydown", function (event) {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          focusNewsSupplement(item);
-        }
-      });
-      row.appendChild(newsTitle);
-    }
-    var summary = String(item.snippet || item.summary || item.description || "").trim();
-    if (summary) { row.appendChild(el("span", "news-summary", summary)); }
-    var meta = [item.source || item.source_id || "", item.published_at || item.published || ""]
-      .map(function (value) { return String(value || "").trim(); })
-      .filter(Boolean);
-    if (meta.length) { row.appendChild(el("span", "news-meta", meta.join(" · "))); }
-    list.appendChild(row);
-  });
-}
-
-function invalidateRelatedSearch() {
-  state.relatedSearchGen += 1;
-  if (waitRunning("related_search")) { waitStop("related_search"); }
-  state.newsSupplements = [];
-  state.pickedNewsKeys = {};
-  state.newsFocus = null;
-  renderNewsSupplements();
-  renderPickedDock();
-}
-
-function toggleNewsSupplementDrawer(open) {
-  var next = open === undefined ? !document.body.classList.contains("news-supplement-open") : !!open;
-  if (next) { toggleFavoritesDrawer(false); }
-  document.body.classList.toggle("news-supplement-open", next);
-  var drawer = $("news-supplement-drawer");
-  var button = $("news-supplement-btn");
-  if (drawer) { drawer.hidden = !next; }
-  if (button) { button.setAttribute("aria-expanded", String(next)); }
-  if (next) { renderNewsSupplements(); }
-}
-
-var RELATED_SEARCH_FAILURE_HINTS = {
-  timeout: "检索超时：这段选区太久没有源返回结果。可以选短一点，或稍后重试。",
-  transport_unavailable: "网络不可达：新闻源当前都连不上。稍后重试，或检查代理设置。",
-  parse_error: "检索结果解析失败：源返回的内容无法识别，换一段选区再试。"
-};
-
-function relatedSearchFailureMessage(error) {
-  var cause = String((error && error.code) || "");
-  var hint = RELATED_SEARCH_FAILURE_HINTS[cause] || "";
-  if (hint) { return hint; }
-  return showApiError("相关检索失败：", error);
-}
-
-function relatedSearch() {
-  var selection = selectedArticleContext();
-  if (!selection) {
-    syncRelatedSearchEnabled();
-    status("article-status", "请先选中正文中的关键词或句子", "error");
-    return;
-  }
-  if (!state.draft || waitRunning("related_search")) { return; }
-  var requestDraftId = state.draft.draft_id;
-  var requestSessionKey = currentArticleSessionKey();
-  var gen = ++state.relatedSearchGen;
-  var button = $("related-search-btn");
-  state.newsSupplements = [];
-  state.pickedNewsKeys = {};
-  renderNewsSupplements();
-  toggleNewsSupplementDrawer(true);
-  status("news-supplement-status", state.articleDirty ? "正在保存修改并检索相关新闻…" : "正在检索相关新闻…");
-  busy(button, true);
-  waitStart("related_search");
-  var save = state.articleDirty ? persistArticle("related_search") : Promise.resolve(state.draft);
-  save.then(function () {
-    if (waitCancelled("related_search") || gen !== state.relatedSearchGen) { return null; }
-    if (!state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return null; }
-    var body = $("article-body");
-    body.focus();
-    body.setSelectionRange(selection.selection_start, selection.selection_end);
-    var currentSelection = selectedArticleContext() || selection;
-    return waitApi("related_search", "/api/related-search", Object.assign({
-      draft_id: state.draft.draft_id,
-    }, currentSelection));
-  }).then(function (data) {
-    if (!data || waitCancelled("related_search") || gen !== state.relatedSearchGen) { return; }
-    if (!state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
-    state.newsSupplements = Array.isArray(data.items) ? data.items : [];
-    renderNewsSupplements();
-    // 「没找到」和「检索失败」是两回事：空结果不是错误。
-    var empty = String(data.search_status || "") === "empty" || !state.newsSupplements.length;
-    status(
-      "news-supplement-status",
-      state.newsSupplements.length
-        ? "找到 " + state.newsSupplements.length + " 条相关新闻"
-        : "没找到相关新闻：检索词「" + String(data.query || "").slice(0, 24) + "」没有匹配，换一段更具体的选区再试",
-      state.newsSupplements.length ? "ok" : ""
-    );
-    waitDone(state.newsSupplements.length ? "相关新闻已找到" : "没找到相关新闻", "related_search");
-  }).catch(function (error) {
-    if (isWaitAbort(error, "related_search")) { return; }
-    if (gen !== state.relatedSearchGen || !state.draft || state.draft.draft_id !== requestDraftId || currentArticleSessionKey() !== requestSessionKey) { return; }
-    var message = relatedSearchFailureMessage(error);
-    status("news-supplement-status", message, "error");
-    waitFail(message, "related_search");
-  }).then(function () {
-    if (gen === state.relatedSearchGen) { busy(button, false); }
-  });
-}
-
 function syncStars() {
   document.querySelectorAll("#hotspot-list .hotspot-row").forEach(function (row) {
     var card = row.querySelector(".hotspot-item");
@@ -3799,7 +3323,6 @@ function syncStars() {
 
 function toggleFavoritesDrawer(open) {
   var next = open === undefined ? !document.body.classList.contains("favorites-open") : !!open;
-  if (next) { toggleNewsSupplementDrawer(false); }
   document.body.classList.toggle("favorites-open", next);
   var drawer = $("favorites-drawer");
   var button = $("favorites-btn");
@@ -3846,7 +3369,7 @@ function applyHotspots(data, extraStatus) {
 function loadHotspots(translate, signal) {
   var gen = ++state.hotspotGen;
   var url = "/api/hotspots?hours=" + encodeURIComponent(currentHours())
-    + "&lane=" + encodeURIComponent(state.lane || "hotspots");
+    + "&scope=" + encodeURIComponent(state.newsScope || "all");
   if (translate) { url += "&translate=1"; }
   return fetch(url, signal ? {signal: signal} : {}).then(function (response) {
     return response.json().catch(function () { return {}; }).then(function (data) {
@@ -3892,9 +3415,7 @@ function translateTitles() {
   loadHotspots(true, waitSignal("translate")).then(function (data) {
     if (waitCancelled("translate")) { return; }
     var shown = rankedCount(data || {});
-    if (state.lane !== "github") {
-      status("hotspot-status", shown ? "共 " + shown + " 条候选 · 已尝试翻译标题" : "暂无候选", shown ? "ok" : "");
-    }
+    status("hotspot-status", shown ? "共 " + shown + " 条候选 · 已尝试翻译标题" : "暂无候选", shown ? "ok" : "");
     waitDone(shown ? "标题翻译完成" : "没有可翻译的标题", "translate");
   }).catch(function (error) {
     if (isWaitAbort(error, "translate")) { return; }
@@ -3906,23 +3427,19 @@ function translateTitles() {
 }
 
 function collect(sourceId) {
-  if ((state.lane || "hotspots") === "github") {
-    refreshGithubWeekly();
-    return;
-  }
   if (waitRunning("collect")) { return; }
-  var lane = state.lane || "hotspots";
+  var scope = state.newsScope || "all";
   var requestGen = ++state.collectGen;
   var hours = currentHours();
   if (sourceId) {
     waitStart("collect", {title: "正在刷新这一路订阅"});
-  } else if (lane === "viewpoints") {
-    waitStart("collect", {title: "正在抓取 Reddit 热帖"});
+  } else if (scope === "community") {
+    waitStart("collect", {title: "正在抓取社区来源"});
   } else {
     waitStart("collect");
   }
-  status("hotspot-status", sourceId ? "正在刷新该源，已有候选会留在上面…" : (lane === "viewpoints" ? "正在从 Reddit 抓取当前热帖，已有候选会留在上面…" : "正在从各订阅源抓取，已有候选会留在上面…"));
-  var payload = {hours: hours, force: true, lane: lane};
+  status("hotspot-status", sourceId ? "正在刷新该源，已有候选会留在上面…" : (scope === "community" ? "正在从社区来源抓取，已有候选会留在上面…" : "正在从各订阅源抓取，已有候选会留在上面…"));
+  var payload = {hours: hours, force: true, scope: scope};
   if (sourceId) { payload.source_id = sourceId; }
   waitApi("collect", "/api/collect", payload).then(function (data) {
     if (waitCancelled("collect")) { return; }
@@ -3937,18 +3454,20 @@ function collect(sourceId) {
     if (inserted) { extra += " · 新入库 " + inserted + " 条"; }
     if (failed) { extra += " · " + failed + " 个源失败"; }
     var doneText = inserted ? ("抓取完成 · 新入库 " + inserted + " 条") : "抓取完成";
-    if (state.lane === lane) {
-      applyHotspots(data, extra);
-      if (!rankedCount(data)) {
-        return widenIfEmpty(data, hours).then(function (next) {
-          if (next && failed && state.lane === lane) {
-            $("hotspot-status").className = "status-error";
-          }
-          waitDone(doneText, "collect");
-        });
-      }
-      if (failed) { $("hotspot-status").className = "status-error"; }
+    if ((state.newsScope || "all") !== scope) {
+      waitDone(doneText, "collect");
+      return;
     }
+    applyHotspots(data, extra);
+    if (!rankedCount(data)) {
+      return widenIfEmpty(data, hours).then(function (next) {
+        if (next && failed) {
+          $("hotspot-status").className = "status-error";
+        }
+        waitDone(doneText, "collect");
+      });
+    }
+    if (failed) { $("hotspot-status").className = "status-error"; }
     waitDone(doneText, "collect");
   }).catch(function (error) {
     if (isWaitAbort(error, "collect")) { return; }
@@ -3958,7 +3477,7 @@ function collect(sourceId) {
     }
     status("hotspot-status", "抓取失败：" + error.message, "error");
     waitFail(error.message || "抓取失败", "collect");
-    if (state.lane === lane) { loadHotspots(); }
+    if ((state.newsScope || "all") === scope) { loadHotspots(); }
   });
 }
 
@@ -4257,7 +3776,6 @@ function renderArticle(data) {
   $("save-article-btn").disabled = false;
   state.articleDirty = false;
   fitArticleBody();
-  syncRelatedSearchEnabled();
 }
 
 function renderXhsStudio(data) {
@@ -4291,105 +3809,6 @@ function renderXhsStudio(data) {
       node.appendChild(el("p", "xhs-copy", card.text || ""));
     }
     root.appendChild(node);
-  });
-}
-
-state.hooks = [];
-state.chosenHookIds = [];
-state.findHooksGen = 0;
-
-function clearHooks() {
-  state.hooks = [];
-  state.chosenHookIds = [];
-  $("hook-list").textContent = "";
-  $("hook-list").hidden = true;
-}
-
-function selectedHookCards() {
-  return state.chosenHookIds.map(function (id) {
-    return state.hooks.find(function (hook) { return hook.hook_id === id; });
-  }).filter(Boolean);
-}
-
-function relabelHookCards() {
-  $("hook-list").querySelectorAll(".hook-card").forEach(function (card) {
-    var label = card.querySelector(".hook-priority");
-    if (!label) { return; }
-    var pos = state.chosenHookIds.indexOf(card.dataset.hookId);
-    label.textContent = pos === 0 ? "主切口" : (pos > 0 ? "须进开头" : "");
-  });
-}
-
-function renderHooks(hooks) {
-  state.hooks = hooks || [];
-  state.chosenHookIds = [];
-  var list = $("hook-list");
-  list.textContent = "";
-  state.hooks.forEach(function (hook) {
-    var card = el("li", "hook-card");
-    card.dataset.hookId = hook.hook_id;
-    var row = el("div", "hook-row");
-    var check = document.createElement("input");
-    check.type = "checkbox";
-    check.addEventListener("change", function () {
-      var id = hook.hook_id;
-      var pos = state.chosenHookIds.indexOf(id);
-      if (check.checked) {
-        if (pos < 0) { state.chosenHookIds.push(id); }
-      } else if (pos >= 0) {
-        state.chosenHookIds.splice(pos, 1);
-      }
-      relabelHookCards();
-    });
-    row.appendChild(check);
-    var body = el("div", "hook-body");
-    var titleRow = el("div", "hook-title-row");
-    titleRow.appendChild(el("span", "hook-phrase", hook.phrase || ""));
-    titleRow.appendChild(el("span", "hook-kind", hook.kind || ""));
-    titleRow.appendChild(el("span", "hook-priority", ""));
-    body.appendChild(titleRow);
-    if (hook.why) { body.appendChild(el("p", "hook-why", hook.why)); }
-    var results = el("ul", "hook-results");
-    (hook.results || []).slice(0, 3).forEach(function (result) {
-      var item = document.createElement("li");
-      var link = document.createElement("a");
-      link.href = result.url || "";
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = result.title || result.url || "";
-      item.appendChild(link);
-      if (result.snippet) { item.appendChild(el("span", "hook-snippet", result.snippet)); }
-      results.appendChild(item);
-    });
-    if (results.childNodes.length) { body.appendChild(results); }
-    row.appendChild(body);
-    card.appendChild(row);
-    list.appendChild(card);
-  });
-  list.hidden = state.hooks.length === 0;
-}
-
-function findHooks() {
-  if (!state.item) { return; }
-  var itemId = state.item.item_id;
-  var gen = ++state.findHooksGen;
-  var button = $("find-hooks-btn");
-  busy(button, true);
-  waitStart("hooks");
-  status("article-status", "正在找切口…");
-  waitApi("hooks", "/api/hooks/find", {item_id: itemId}).then(function (data) {
-    if (waitCancelled("hooks")) { return; }
-    if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
-    renderHooks(data.hooks || []);
-    status("article-status", (data.hooks && data.hooks.length) ? "" : (data.message || "未发现可用切口"), (data.hooks && data.hooks.length) ? "" : "error");
-    waitDone((data.hooks && data.hooks.length) ? ("找到 " + data.hooks.length + " 个切口") : "未发现可用切口", "hooks");
-  }).catch(function (error) {
-    if (isWaitAbort(error, "hooks")) { return; }
-    if (!state.item || state.item.item_id !== itemId || gen !== state.findHooksGen) { return; }
-    status("article-status", showApiError("找切口失败：", error), "error");
-    waitFail(error.message || "找切口失败", "hooks");
-  }).then(function () {
-    if (gen === state.findHooksGen) { busy(button, false); }
   });
 }
 
@@ -4485,13 +3904,13 @@ function translateOriginal() {
 }
 
 function generate() {
-  var picked = pickedIdList();
-  if (!state.item && !picked.length) { return; }
-  var requestLane = state.lane;
+  var context = state.articleContext;
+  var dossierId = context && context.source_type === "topic_dossier" ? String(context.dossier_id || "") : "";
+  var picked = dossierId ? [] : pickedIdList();
+  if (!dossierId && !state.item && !picked.length) { return; }
   var requestPlatform = state.platform;
   var requestItem = state.item;
-  var requestIds = picked.length ? picked.slice() : [state.item.item_id];
-  var requestKey = articleSessionKey(requestLane, requestPlatform, requestIds);
+  var requestIds = dossierId ? [] : (picked.length ? picked.slice() : [state.item.item_id]);
   var requestGen = ++state.articleRequestGen;
   var button = $("generate-btn");
   var llm = selectedLLM();
@@ -4505,27 +3924,23 @@ function generate() {
     effort: llm.effort,
     prompt_style: $("prompt-style-select").value,
   };
-  if (picked.length >= 1) {
+  if (dossierId) {
+    // The Topic Dossier is the single source of truth: no hooks, no re-search.
+    payload.dossier_id = dossierId;
+  } else if (picked.length >= 1) {
     payload.item_ids = picked;
   } else {
     payload.item_id = state.item.item_id;
   }
-  var chosen = selectedHookCards();
-  if (chosen.length > 0) {
-    payload.chosen_hooks = chosen;
-  }
   var pasted = String((($("article-paste") || {}).value) || "").trim();
   if (pasted) { payload.pasted_text = pasted.slice(0, 20000); }
-  var related = selectedNewsItems();
-  if (related.length) { payload.related_items = related; }
   if (waitRunning("generate")) { return; }
   busy(button, true);
   waitStart("generate");
   status("article-status", "正在生成文章…");
   waitApi("generate", "/api/articles", payload).then(function (data) {
     if (waitCancelled("generate") || requestGen !== state.articleRequestGen) { return; }
-    storeGeneratedArticle(requestKey, data, requestItem);
-    if (state.lane !== requestLane || state.platform !== requestPlatform) { return; }
+    if (state.platform !== requestPlatform) { return; }
     state.draft = data;
     renderArticle(data);
     applyPublishLabels();
@@ -4578,7 +3993,6 @@ function saveArticle() {
 
 function setPlatform(platform) {
   if (state.platform !== platform) {
-    state.articleLastKeys[articleContextKey(state.lane, state.platform)] = "";
     state.articleRequestGen += 1;
     state.collectGen += 1;
   }
@@ -4816,29 +4230,8 @@ function renderGithubWeekly(payload) {
   if (savedPalette.accent && $("gh-color-accent")) { $("gh-color-accent").value = savedPalette.accent; }
   if (visual.poster_template) { setPosterTemplate(visual.poster_template, true); }
   var repos = state.githubWeekly.repos || [];
-  var list = $("github-list");
-  list.textContent = "";
-  repos.forEach(function (repo) {
-    var row = el("li", "gh-row");
-    row.appendChild(el("span", "muted", String(repo.rank)));
-    var img = document.createElement("img");
-    img.src = githubIcon(repo.icon_url);
-    img.alt = repo.name;
-    row.appendChild(img);
-    var meta = document.createElement("div");
-    meta.appendChild(el("strong", "", repo.name));
-    meta.appendChild(el("span", "gh-kind", (repo.kind || repo.language || "AI 工具") + (repo.fresh ? " · 本周新建" : " · 本周涨星")));
-    row.appendChild(meta);
-    var stars = el("div", "gh-stars");
-    var bar = el("div", "gh-bar");
-    var fill = document.createElement("span");
-    fill.style.width = Math.max(8, Math.round((repo.star_share || 0) * 100)) + "%";
-    bar.appendChild(fill);
-    stars.appendChild(bar);
-    stars.appendChild(el("span", "", repo.stars_label || String(repo.stars || 0)));
-    row.appendChild(stars);
-    list.appendChild(row);
-  });
+  // The retired hidden list is gone: the visible gallery below is the one
+  // surface that shows this week's repos, so a duplicate cannot drift from it.
   renderGithubGallery();
   $("github-xhs-title").value = state.githubWeekly.xhs_title || "本周值得关注的github ai项目前10";
   $("github-xhs-body").value = state.githubWeekly.xhs_body || "";
@@ -4937,35 +4330,15 @@ function openGithubLightbox(index) {
   openImageLightbox(start);
 }
 function loadGithubWeekly() {
-  status("hotspot-status", "正在读取周榜…");
+  status("studio-status", "正在读取周榜…");
   return fetch("/api/github-weekly").then(function (response) { return response.json(); }).then(function (data) {
     renderGithubWeekly(data);
     renderResourceGithubResults(data.repos || []);
     var count = (data.repos || []).length;
-    status("hotspot-status", count ? "已显示 " + count + " 个仓库，可再点抓取周榜刷新" : "还没有周榜。点「抓取周榜」拉取本周新建的 AI 仓库，不够再用本周涨星补齐。", count ? "ok" : "");
+    status("studio-status", count ? "已显示 " + count + " 个仓库，可再点抓取周榜刷新" : "还没有周榜。点「抓取周榜」拉取本周新建的 AI 仓库，不够再用本周涨星补齐。", count ? "ok" : "");
     return data;
   }).catch(function (error) {
-    status("hotspot-status", "读取周榜失败：" + error.message, "error");
-  });
-}
-function refreshGithubWeekly() {
-  if (waitRunning("github_fetch")) { return; }
-  waitStart("github_fetch");
-  status("hotspot-status", "正在按星标抓取本周 GitHub AI 项目…");
-  waitApi("github_fetch", "/api/github-weekly", {}).then(function (data) {
-    if (waitCancelled("github_fetch")) { return; }
-    renderGithubWeekly(data);
-    renderResourceGithubResults(data.repos || []);
-    var count = (data.repos || []).length;
-    var extra = data.model_used ? " · 榜单模型已改写简介" : " · 未配置榜单模型，简介用仓库描述";
-    if (state.lane === "github") {
-      status("hotspot-status", (count ? "已抓取 " + count + " 个仓库" : "没有抓到仓库") + extra + "。选配色后点「生成图片」。", count ? "ok" : "error");
-    }
-    waitDone(count ? ("已抓取 " + count + " 个仓库") : "没有抓到仓库", "github_fetch");
-  }).catch(function (error) {
-    if (isWaitAbort(error, "github_fetch")) { return; }
-    status("hotspot-status", "抓取周榜失败：" + error.message, "error");
-    waitFail(error.message || "抓取周榜失败", "github_fetch");
+    status("studio-status", "读取周榜失败：" + error.message, "error");
   });
 }
 function githubThemeDefaults(theme) {
@@ -5012,12 +4385,12 @@ function setGithubTheme(theme) {
 function renderGithubWeeklyImages() {
   var button = $("github-render-btn");
   if (!(state.githubWeekly.repos || []).length) {
-    status("hotspot-status", "请先点「抓取周榜」，再生成图片", "error");
+    status("studio-status", "请先点「抓取周榜」，再生成图片", "error");
     return;
   }
   var images = githubImages();
   if (!images.length) {
-    status("hotspot-status", "没有可生成的图片任务", "error");
+    status("studio-status", "没有可生成的图片任务", "error");
     return;
   }
   if (waitRunning("github_render")) { return; }
@@ -5035,7 +4408,7 @@ function renderGithubWeeklyImages() {
   });
   renderGithubGallery();
   waitStart("github_render", {current: 0, total: total, step: "准备开始"});
-  status("hotspot-status", "开始生成 1 / " + total + " 张周榜图…");
+  status("studio-status", "开始生成 1 / " + total + " 张周榜图…");
   function finishRender() {
     images.forEach(function (image) { image.queued = false; image.busy = false; });
     renderGithubGallery();
@@ -5051,10 +4424,10 @@ function renderGithubWeeklyImages() {
       var done = total - failed;
       if (failed && !done) {
         waitFail("全部 " + total + " 张都没有生成", "github_render");
-        status("hotspot-status", "出图失败：全部 " + total + " 张都没有生成", "error");
+        status("studio-status", "出图失败：全部 " + total + " 张都没有生成", "error");
       } else {
         waitDone(failed ? ("已生成 " + done + " / " + total + " 张，失败 " + failed + " 张") : ("已全部生成 " + done + " 张"), "github_render");
-        status("hotspot-status", failed ? ("已生成 " + done + " 张，失败 " + failed + " 张") : ("已全部生成 " + done + " 张周榜图，勾选后可导出"), failed ? "error" : "ok");
+        status("studio-status", failed ? ("已生成 " + done + " 张，失败 " + failed + " 张") : ("已全部生成 " + done + " 张周榜图，勾选后可导出"), failed ? "error" : "ok");
       }
       finishRender();
       return;
@@ -5065,9 +4438,7 @@ function renderGithubWeeklyImages() {
     job.error = "";
     state.githubGalleryIndex = index;
     waitProgress(index + 1, total, job.title || job.id, "github_render");
-    if (state.lane === "github") {
-      status("hotspot-status", "正在生成第 " + (index + 1) + " / " + total + " 张 · " + (job.title || job.id));
-    }
+    status("studio-status", "正在生成第 " + (index + 1) + " / " + total + " 张 · " + (job.title || job.id));
     renderGithubGallery();
     // 逐张调用 /api/github-weekly/image；全量 /api/github-weekly/render 仍给脚本用
     waitApi("github_render", "/api/github-weekly/image", {id: job.id, theme: theme, palette: palette, poster_template: state.posterTemplate || "1"}).then(function (data) {
@@ -5099,10 +4470,10 @@ function copyGithubXhs() {
   var text = ($("github-xhs-title").value || "") + "\\n\\n" + ($("github-xhs-body").value || "");
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(function () {
-      status("hotspot-status", "小红书文案已复制", "ok");
+      status("studio-status", "小红书文案已复制", "ok");
     }).catch(function () {
       $("github-xhs-body").select();
-      status("hotspot-status", "请手动复制文案", "");
+      status("studio-status", "请手动复制文案", "");
     });
   } else {
     $("github-xhs-body").select();
@@ -5249,11 +4620,11 @@ function exportGithubImages() {
   });
   chain.then(function () {
     if (waitCancelled("export")) { return; }
-    status("hotspot-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
+    status("studio-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
     waitDone("已导出 " + selected.length + " 张", "export");
   }).catch(function (error) {
     if (isWaitAbort(error, "export")) { return; }
-    status("hotspot-status", "导出失败：" + error.message, "error");
+    status("studio-status", "导出失败：" + error.message, "error");
     waitFail(error.message || "导出失败", "export");
   }).then(function () {
     if (button) { busy(button, false); }
@@ -5295,7 +4666,7 @@ function degradedSummary(reasons) {
   var labels = reasons.map(degradeLabel).filter(function (item) { return !!item; });
   var text = "部分来源本次没有返回：" + (labels.length ? labels.join("；") : "已降级") + "，结果可能偏少。";
   if (reasons.indexOf("github:rate_limited") >= 0 && !state.githubTokenConfigured) {
-    text += "配好下面的 GitHub Token 后，GitHub 每小时额度从 60 次升到 5000 次，收录会明显变多。";
+    text += "去「设置」配好 GitHub Token 后，GitHub 每小时额度从 60 次升到 5000 次，收录会明显变多。";
   }
   return text;
 }
@@ -5315,7 +4686,7 @@ function skillSourceLabel(skill) {
 // whole of the old stage-chip + gap-note area: the user asked where the skills
 // came from, not which coverage stage the search plan happened to define.
 function renderSkillSourceChips(skills) {
-  var chips = $("skill-source-chips");
+  var chips = $("skills-source-chips");
   if (!chips) { return; }
   chips.textContent = "";
   var counts = {};
@@ -5340,36 +4711,6 @@ function renderSkillSourceChips(skills) {
     chip.appendChild(button);
     chips.appendChild(chip);
   });
-}
-function renderCrawlSources(pack) {
-  var toggle = $("skill-source-toggle");
-  var list = $("skill-crawl-sources");
-  if (!toggle || !list) { return; }
-  var sources = (pack && pack.crawl_sources) || [];
-  var count = Number((pack && pack.crawl_source_count) || sources.length || 0);
-  toggle.hidden = !sources.length;
-  toggle.textContent = sources.length
-    ? ("当前自动抓取 skill 的源：" + count + " 个 · 点击" + (state.crawlSourcesOpen ? "收起" : "展开"))
-    : "";
-  toggle.setAttribute("aria-expanded", String(!!state.crawlSourcesOpen));
-  list.textContent = "";
-  list.hidden = !state.crawlSourcesOpen || !sources.length;
-  sources.forEach(function (source) {
-    var row = el("li", "");
-    row.appendChild(el("strong", "", source.name || source.id || ""));
-    var link = document.createElement("a");
-    link.href = String(source.url || "#");
-    link.target = "_blank";
-    link.rel = "noreferrer noopener";
-    link.textContent = String(source.url || "");
-    row.appendChild(link);
-    row.appendChild(el("span", "", (source.enabled === "1" ? "已启用" : "未启用") + " · " + String(source.detail || "")));
-    list.appendChild(row);
-  });
-}
-function toggleCrawlSources() {
-  state.crawlSourcesOpen = !state.crawlSourcesOpen;
-  renderCrawlSources(state.skillsPackage || {});
 }
 function skillIdentity(skill) {
   var key = String((skill && (skill.source_id || skill.full_name || skill.name)) || "").toLowerCase();
@@ -5417,41 +4758,6 @@ function toggleSkillsBySource(label) {
     pack.images = queuedSkillImages(pack);
   }
   renderSkillPackage(pack);
-}
-function renderSkillList(skills) {
-  var list = $("skill-list");
-  if (!list) { return; }
-  list.textContent = "";
-  var rows = (skills || []).filter(function (skill) { return skill && !skill.gap; });
-  if (!rows.length) {
-    list.hidden = true;
-    return;
-  }
-  list.hidden = false;
-  rows.forEach(function (skill) {
-    var row = el("li", skill.selected === false ? "" : "is-selected");
-    var box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = skill.selected !== false;
-    box.setAttribute("aria-label", "选中后生成图片");
-    box.addEventListener("change", function () { toggleSkillIncluded(skill, box.checked); });
-    row.appendChild(box);
-    var url = skillPageUrl(skill);
-    var name = skill.name || skill.source_id || "未命名";
-    if (url) {
-      var link = document.createElement("a");
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noreferrer noopener";
-      link.textContent = name;
-      row.appendChild(link);
-    } else {
-      row.appendChild(el("span", "", name));
-    }
-    var source = skillSourceLabel(skill);
-    if (source) { row.appendChild(el("span", "skill-source", source)); }
-    list.appendChild(row);
-  });
 }
 function resourceKindLabel(kind) {
   return {repo: "Repo", skill: "Skill", website: "Web", tool: "Tool", other: "Other"}[String(kind || "")] || "资源";
@@ -5573,13 +4879,11 @@ function sendResourcesToStudio() {
   }
   setAppPage("creation");
   if (links) {
-    if ($("skill-links")) { $("skill-links").value = links; growSkillLinks(); }
     status("studio-status", "正在读取粘贴的 Skill…", "");
-    pasteSkills();
+    pasteSkills(links);
   } else {
-    if ($("skill-query")) { $("skill-query").value = query; }
     status("studio-status", "正在按资源需求查找 Skill…", "");
-    searchSkills();
+    searchSkills(query);
   }
 }
 function openWeeklyStudio() {
@@ -5594,6 +4898,7 @@ function fetchGithubWeekly() {
   status("studio-status", "正在抓取本周周榜…", "");
   return waitApi("github_fetch", "/api/github-weekly", {}).then(function (data) {
     renderGithubWeekly(data);
+    renderResourceGithubResults(data.repos || []);
     var count = (data.repos || []).length;
     status("studio-status", count ? ("已抓取 " + count + " 个仓库，可生成图片") : "本周没有抓到合适的仓库", count ? "ok" : "error");
     waitDone(count ? ("已抓取 " + count + " 个仓库") : "没有抓到仓库", "github_fetch");
@@ -5708,14 +5013,6 @@ function linkifySkillArticle(body, skills) {
   });
   return html;
 }
-function toggleSkillIncluded(skill, on) {
-  skill.selected = !!on;
-  var pack = state.skillsPackage || {};
-  if (!(pack.images || []).some(function (image) { return image && image.url; })) {
-    pack.images = queuedSkillImages(pack);
-  }
-  renderSkillPackage(pack);
-}
 function renderSkillPackage(payload) {
   state.skillsPackage = payload || state.skillsPackage || {};
   var pack = state.skillsPackage;
@@ -5730,10 +5027,9 @@ function renderSkillPackage(payload) {
   pack.skills = skills;
   if (pack.visual && pack.visual.poster_template) { setPosterTemplate(pack.visual.poster_template, true); }
   renderSkillSourceChips(skills);
-  renderCrawlSources(pack);
   // B1: a degraded source must be visible, not silent — GitHub results still
   // count, but the user should know one source did not answer.
-  var degradedNote = $("skill-degraded-note");
+  var degradedNote = $("skills-degraded-note");
   if (degradedNote) {
     var reasons = (pack.degraded_reasons || []).map(function (item) {
       return typeof item === "string" ? item : (item && (item.reason || item.source)) || "";
@@ -5759,7 +5055,6 @@ function renderSkillPackage(payload) {
     bodyNode.textContent = fallbackBody;
   }
   $("skills-article").classList.toggle("is-empty", !String(articleBody).trim());
-  renderSkillList(skills);
   renderResourceResults(skills);
   renderSkillsGallery();
   var images = skillImages();
@@ -5849,42 +5144,37 @@ function renderSkillsGallery() {
   gallery.appendChild(tile);
   paintCarouselNav("skills-gallery-nav", "skills-gallery-prev", "skills-gallery-next", "skills-gallery-counter", index, images.length);
 }
-function toggleSkillImage(imageId) {
-  skillImages().forEach(function (image) {
-    if (image.id === imageId) {
-      image.selected = image.selected === false;
-    }
+// A poster tile stands for exactly one collected skill — the plan names it after
+// the skill — and the render request is built from the collected skills, so a
+// tile checkbox has to move that selection too. Toggling only the image used to
+// leave 生成图片 with nothing to do but 「超过条目上限」.
+function skillsForImage(image) {
+  if (!image || image.kind !== "poster") { return []; }
+  var title = String(image.title || "");
+  if (!title) { return []; }
+  return collectedSkills(state.skillsPackage || {}).filter(function (skill) {
+    return String(skill.name || skill.source_id || "") === title;
   });
+}
+function toggleSkillImage(imageId) {
+  var target = null;
+  skillImages().forEach(function (image) {
+    if (image.id === imageId) { target = image; }
+  });
+  if (!target) { return; }
+  var next = target.selected === false;
+  target.selected = next;
+  skillsForImage(target).forEach(function (skill) { skill.selected = next; });
   renderSkillPackage(state.skillsPackage);
 }
 function selectAllSkillImages() {
   var images = skillImages();
   var allOn = images.length && images.every(function (image) { return image.selected !== false; });
-  images.forEach(function (image) { image.selected = !allOn; });
+  images.forEach(function (image) {
+    image.selected = !allOn;
+    skillsForImage(image).forEach(function (skill) { skill.selected = !allOn; });
+  });
   renderSkillPackage(state.skillsPackage);
-}
-function setPasteStatus(text, kind) {
-  // 粘贴结果单独一行：紧随其后的出图会覆写共享状态行，不这样做结果就永远看不见。
-  var node = $("skill-paste-status");
-  if (!node) { return; }
-  node.textContent = text || "";
-  node.hidden = !text;
-  node.className = kind ? "status-" + kind : "";
-}
-// The paste box grows with its content instead of scrolling one line at a time:
-// a real paste is several links plus whatever prose came with them.
-function growSkillLinks() {
-  var box = $("skill-links");
-  if (!box) { return; }
-  var ceiling = Math.round(window.innerHeight * 0.4);
-  box.style.height = "auto";
-  box.style.height = Math.min(Math.max(box.scrollHeight, 76), ceiling) + "px";
-}
-function resetSkillLinks() {
-  var box = $("skill-links");
-  if (!box) { return; }
-  box.value = "";
-  growSkillLinks();
 }
 var skillTitleTimer = null;
 var skillTitleInFlight = false;
@@ -5910,7 +5200,7 @@ function saveSkillTitle() {
     // the user typed while it was in flight.
     if (!skillTitleDirty) { renderSkillPackage(data); }
   }).catch(function (error) {
-    status("hotspot-status", "标题保存失败：" + (error.reason || error.message), "error");
+    status("studio-status", "标题保存失败：" + (error.reason || error.message), "error");
   }).then(function () {
     skillTitleInFlight = false;
     if (skillTitleDirty) {
@@ -5928,44 +5218,43 @@ function scheduleSkillTitleSave() {
 }
 function clearSkills() {
   if (waitRunning("skill_search") || waitRunning("skill_render")) {
-    status("hotspot-status", "正在查找或出图，等这一轮结束再清空", "error");
+    status("studio-status", "正在查找或出图，等这一轮结束再清空", "error");
     return;
   }
-  var button = $("skill-clear-btn");
+  var button = $("skills-clear-btn");
   if (button) { busy(button, true); }
   api("/api/skills/clear", {}).then(function (data) {
     renderSkillPackage(data);
-    status("hotspot-status", "已清空收录的 skill（标题保留）", "ok");
+    status("studio-status", "已清空收录的 skill（标题保留）", "ok");
   }).catch(function (error) {
-    status("hotspot-status", "清空失败：" + (error.reason || error.message), "error");
+    status("studio-status", "清空失败：" + (error.reason || error.message), "error");
   }).then(function () {
     if (button) { busy(button, false); }
   });
 }
-function pasteSkills() {
+function pasteSkills(links) {
   // 粘贴进来的 skill 与检索到的一样：先进包（拿阶段、写介绍文），再出海报。
-  var links = ($("skill-links").value || "").trim();
+  links = String(links || "").trim();
   if (!links) {
-    status("hotspot-status", "请先粘贴 skill 链接", "error");
+    status("studio-status", "请先在资源探索粘贴 skill 链接", "error");
     return;
   }
   if (links.length > 20000) {
     // 输入框不再截断，所以超长要在这里说清楚，而不是把尾巴上的链接切一半当成仓库名。
-    setPasteStatus("链接太长（" + links.length + " 字，上限 20000），请分几次粘贴", "error");
-    status("hotspot-status", "粘贴内容过长，请分几次粘贴", "error");
+    status("studio-status", "粘贴内容过长（" + links.length + " 字，上限 20000），请分几次粘贴", "error");
     return;
   }
   if (waitRunning("skill_paste")) { return; }
   if (waitRunning("skill_render")) {
-    setPasteStatus("正在出图，等这一轮出完再粘贴", "error");
-    status("hotspot-status", "正在出图，等这一轮出完再粘贴", "error");
+    status("studio-status", "正在出图，等这一轮出完再粘贴", "error");
     return;
   }
-  var button = $("skill-paste-btn");
-  if (button) { busy(button, true); }
-  setPasteStatus("");
+  if (waitRunning("skill_search")) {
+    status("studio-status", "查找还在进行，等它结束再粘贴", "error");
+    return;
+  }
   waitStart("skill_paste");
-  status("hotspot-status", "正在读取粘贴的 skill…");
+  status("studio-status", "正在读取粘贴的 skill…");
   waitApi("skill_paste", "/api/skills/paste", {links: links}).then(function (data) {
     if (waitCancelled("skill_paste")) { return; }
     renderSkillPackage(data);
@@ -5973,12 +5262,10 @@ function pasteSkills() {
     var replaced = Number(data.replaced || 0);
     var rejected = Number(data.rejected_count || (data.rejected || []).length);
     var unverified = (data.unverified || []).length;
-    resetSkillLinks();
     var count = (data.skills || []).length;
     if (!added && !replaced) {
       var empty = rejected ? ("没有可加入的链接，已跳过 " + rejected + " 条") : "没有识别到 skill 链接";
-      setPasteStatus(empty, "error");
-      status("hotspot-status", empty, "error");
+      status("studio-status", empty, "error");
       waitFail(empty, "skill_paste");
       return;
     }
@@ -5988,8 +5275,7 @@ function pasteSkills() {
     if (rejected) { parts.push("跳过 " + rejected + " 条"); }
     if (unverified) { parts.push("有 " + unverified + " 条没读到 SKILL.md，海报会用模板文案"); }
     var summary = parts.join("，") + "；当前共 " + count + " 个 skill";
-    setPasteStatus(summary, unverified ? "" : "ok");
-    status("hotspot-status", summary + "，正在出图…", unverified ? "" : "ok");
+    status("studio-status", summary + "，正在出图…", unverified ? "" : "ok");
     waitDone(summary, "skill_paste");
     renderSkillImages();
   }).catch(function (error) {
@@ -6001,8 +5287,7 @@ function pasteSkills() {
     } else if (code.indexOf("skill_render_running") >= 0) {
       reason = "正在出图，等这一轮出完再粘贴";
     }
-    setPasteStatus("加入失败：" + reason, "error");
-    status("hotspot-status", "加入失败：" + reason, "error");
+    status("studio-status", "加入失败：" + reason, "error");
     waitFail(reason, "skill_paste");
   }).then(function () {
     if (button) { busy(button, false); }
@@ -6011,12 +5296,7 @@ function pasteSkills() {
 function renderGithubTokenState(data) {
   var configured = !!(data && (data.github_token !== undefined ? data.github_token : data.configured));
   state.githubTokenConfigured = configured;
-  var box = $("skill-token-status");
-  if (box) {
-    box.textContent = configured
-      ? "已配置 GitHub Token：每小时 5000 次额度，收录更稳。"
-      : "未配置。不配也能用，但 GitHub 接口每小时只给 60 次，容易限流。";
-  }
+  // One token card, in Settings. The creation page used to duplicate it.
   var settingsBox = $("settings-github-status");
   if (settingsBox) {
     settingsBox.textContent = configured ? "已配置（Token 不回显）" : "未配置";
@@ -6030,29 +5310,6 @@ function renderResearchRuntime(data) {
   var planner = runtime.planner_configured ? "已配置" : "降级规则";
   var jev = runtime.jev_configured ? "已配置" : "未配置（保留 Jev 诊断）";
   node.textContent = "Planner：" + planner + " · Jev：" + jev + "。模型密钥由现有端点/钥匙串管理。";
-}
-function saveGithubToken() {
-  var input = $("skill-github-token");
-  var token = (input && input.value || "").trim();
-  if (!token) {
-    status("hotspot-status", "请先粘贴 GitHub Token", "error");
-    return;
-  }
-  api("/api/skills/github-token", {token: token}).then(function (data) {
-    if (input) { input.value = ""; }
-    renderGithubTokenState(data);
-    status("hotspot-status", "GitHub Token 已保存，下次查找生效", "ok");
-  }).catch(function (error) {
-    status("hotspot-status", "保存失败：" + (error.reason || error.message), "error");
-  });
-}
-function clearGithubToken() {
-  api("/api/skills/github-token", {token: ""}).then(function (data) {
-    renderGithubTokenState(data);
-    status("hotspot-status", "GitHub Token 已清除", "ok");
-  }).catch(function (error) {
-    status("hotspot-status", "清除失败：" + (error.reason || error.message), "error");
-  });
 }
 function openSkillsLightbox(index) {
   var images = skillImages().filter(function (image) { return image.url; });
@@ -6073,14 +5330,14 @@ function openSkillsLightbox(index) {
   openImageLightbox(start);
 }
 function loadSkills() {
-  status("hotspot-status", "正在读取技能包…");
+  status("studio-status", "正在读取技能包…");
   return fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
     renderSkillPackage(data);
     var count = (data.skills || []).length;
-    status("hotspot-status", count ? "已收录 " + count + " 个 skill；再输入关键词可继续累加，点「生成图片」做汇总出图" : "输入关键词（空格分隔多个），点「查找」；也可以直接粘贴 skill 链接。", count ? "ok" : "");
+    status("studio-status", count ? "已收录 " + count + " 个 skill，点「生成图片」做汇总出图" : "还没有收录 skill。去「资源探索」输入关键词或粘贴 skill 链接，再点「送到创作页」。", count ? "ok" : "");
     return data;
   }).catch(function (error) {
-    status("hotspot-status", "读取技能包失败：" + error.message, "error");
+    status("studio-status", "读取技能包失败：" + error.message, "error");
   });
 }
 function abortSkillSearch(query) {
@@ -6100,9 +5357,9 @@ var SKILL_POLL_PHASES = {
 // unreachable database) must end as a visible failure, not an endless spinner.
 var SKILL_POLL_MAX_TICKS = 1800;
 var skillPollTicks = 0;
-function pollSkillSnapshot() {
+function pollSkillSnapshot(query) {
   if (waitCancelled("skill_search")) {
-    return abortSkillSearch(($("skill-query").value || "").trim());
+    return abortSkillSearch(query);
   }
   skillPollTicks += 1;
   if (skillPollTicks > SKILL_POLL_MAX_TICKS) {
@@ -6121,30 +5378,30 @@ function pollSkillSnapshot() {
     }
     if (!phase || SKILL_POLL_PHASES[phase]) {
       return new Promise(function (resolve, reject) {
-        window.setTimeout(function () { pollSkillSnapshot().then(resolve, reject); }, 350);
+        window.setTimeout(function () { pollSkillSnapshot(query).then(resolve, reject); }, 350);
       });
     }
     return data;
   });
 }
-function searchSkills() {
-  var query = ($("skill-query").value || "").trim();
+function searchSkills(query) {
+  query = String(query || "").trim();
   if (!query) {
-    status("hotspot-status", "请先输入关键词", "error");
+    status("studio-status", "请先在资源探索输入关键词", "error");
     return;
   }
   if (waitRunning("skill_search")) { return; }
-  var button = $("skill-search-btn");
+  var button = $("skills-fetch-btn");
   if (button) { busy(button, true); }
   skillPollTicks = 0;
   waitStart("skill_search");
-  status("hotspot-status", "正在按关键词去各来源抓取 skill…");
+  status("studio-status", "正在按关键词去各来源抓取 skill…");
   waitApi("skill_search", "/api/skills/search", {query: query}).then(function (data) {
     if (waitCancelled("skill_search")) { return abortSkillSearch(query); }
     renderSkillPackage(data);
     var phase = data.phase || "";
     if (phase === "searching" || !phase || !skillArticleReady(data)) {
-      return pollSkillSnapshot();
+      return pollSkillSnapshot(query);
     }
     return data;
   }).then(function (data) {
@@ -6160,14 +5417,14 @@ function searchSkills() {
       // made room. 粘贴的 skill 不会被挤掉，让位的只会是检索到的。
       text += "；已达 " + (data.skill_cap || 16) + " 个上限，让位 " + dropped.length + " 个检索结果（" + dropped.slice(0, 3).join("、") + (dropped.length > 3 ? " 等" : "") + "）";
     }
-    status("hotspot-status", text, count ? "ok" : "error");
+    status("studio-status", text, count ? "ok" : "error");
     waitDone(count ? ("已收录 " + count + " 个 skill") : "没有找到合格 skill", "skill_search");
   }).catch(function (error) {
     if (isWaitAbort(error, "skill_search")) {
       abortSkillSearch(query);
       return;
     }
-    status("hotspot-status", "查找失败：" + (error.reason || error.message), "error");
+    status("studio-status", "查找失败：" + (error.reason || error.message), "error");
     waitFail(error.message || "查找失败", "skill_search");
   }).then(function () {
     if (button) { busy(button, false); }
@@ -6183,17 +5440,17 @@ function queueSkillImagesForRender() {
 function renderSkillCoverOnly() {
   var pack = state.skillsPackage || {};
   if (!skillImages().some(function (image) { return image.kind === "cover" && image.url; })) {
-    status("hotspot-status", "请先生成图片，再只更新封面", "error");
+    status("studio-status", "请先生成图片，再只更新封面", "error");
     return;
   }
   if (waitRunning("skill_render")) { return; }
   var button = $("skills-cover-btn");
   if (button) { busy(button, true); }
   waitStart("skill_render");
-  var laneStatus = function (text, kind) {
-    if (state.lane === "skills") { status("hotspot-status", text, kind); }
+  var studioStatus = function (text, kind) {
+    status("studio-status", text, kind);
   };
-  laneStatus("正在只重新生成封面海报…");
+  studioStatus("正在只重新生成封面海报…");
   waitApi("skill_render", "/api/skills/render", {
     theme: state.githubTheme || "dark",
     palette: visualPalette(),
@@ -6203,12 +5460,12 @@ function renderSkillCoverOnly() {
   }).then(function (data) {
     if (waitCancelled("skill_render")) { return; }
     renderSkillPackage(data);
-    laneStatus("封面海报已更新", "ok");
+    studioStatus("封面海报已更新", "ok");
     waitDone("封面海报已更新", "skill_render");
   }).catch(function (error) {
     if (isWaitAbort(error, "skill_render")) { return; }
     var reason = error.reason || error.message || "封面更新失败";
-    laneStatus("封面更新失败：" + reason, "error");
+    studioStatus("封面更新失败：" + reason, "error");
     waitFail(reason, "skill_render");
   }).then(function () {
     if (button) { busy(button, false); }
@@ -6217,15 +5474,15 @@ function renderSkillCoverOnly() {
 function renderSkillImages() {
   var pack = state.skillsPackage || {};
   if (!collectedSkills(pack).length) {
-    status("hotspot-status", "还没有收录 skill：先输入关键词查找，或粘贴 skill 链接", "error");
+    status("studio-status", "还没有收录 skill。去「资源探索」输入关键词或粘贴 skill 链接，再点「送到创作页」。", "error");
     return;
   }
   if (!selectedSkills(pack).length) {
-    status("hotspot-status", "请先勾选要出图的 skill", "error");
+    status("studio-status", "请先勾选要出图的 skill", "error");
     return;
   }
   if (selectedSkills(pack).length > 10) {
-    status("hotspot-status", "超过条目上限", "error");
+    status("studio-status", "超过条目上限", "error");
     return;
   }
   if (waitRunning("skill_render")) { return; }
@@ -6233,11 +5490,10 @@ function renderSkillImages() {
   if (button) { busy(button, true); }
   queueSkillImagesForRender();
   waitStart("skill_render");
-  var laneStatus = function (text, kind) {
-    // 结果只报给还在第四栏的用户；切走以后别在别人的状态行里喊。
-    if (state.lane === "skills") { status("hotspot-status", text, kind); }
+  var studioStatus = function (text, kind) {
+    status("studio-status", text, kind);
   };
-  laneStatus("正在生成技能包封面和项目卡…");
+  studioStatus("正在生成技能包封面和项目卡…");
   var poll = window.setInterval(function () {
     if (waitCancelled("skill_render")) { return; }
     fetch("/api/skills").then(function (response) { return response.json(); }).then(function (data) {
@@ -6254,7 +5510,7 @@ function renderSkillImages() {
     if (waitCancelled("skill_render")) { return; }
     renderSkillPackage(data);
     var images = skillImages().filter(function (image) { return image.url; });
-    laneStatus(images.length ? "已生成 " + images.length + " 张，勾选后可导出" : "没有生成图片", images.length ? "ok" : "error");
+    studioStatus(images.length ? "已生成 " + images.length + " 张，勾选后可导出" : "没有生成图片", images.length ? "ok" : "error");
     waitDone(images.length ? ("已生成 " + images.length + " 张") : "没有生成图片", "skill_render");
   }).catch(function (error) {
     if (isWaitAbort(error, "skill_render")) { return; }
@@ -6273,7 +5529,7 @@ function renderSkillImages() {
       }
     });
     renderSkillsGallery();
-    laneStatus("出图失败：" + reason, "error");
+    studioStatus("出图失败：" + reason, "error");
     waitFail(reason, "skill_render");
   }).then(function () {
     window.clearInterval(poll);
@@ -6302,11 +5558,11 @@ function exportSkillImages() {
   });
   chain.then(function () {
     if (waitCancelled("export")) { return; }
-    status("hotspot-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
+    status("studio-status", "已按当前顺序导出 " + selected.length + " 张选中图片", "ok");
     waitDone("已导出 " + selected.length + " 张", "export");
   }).catch(function (error) {
     if (isWaitAbort(error, "export")) { return; }
-    status("hotspot-status", "导出失败：" + error.message, "error");
+    status("studio-status", "导出失败：" + error.message, "error");
     waitFail(error.message || "导出失败", "export");
   }).then(function () {
     if (button) { busy(button, false); }
@@ -6411,51 +5667,20 @@ function exportXhsImages() {
     if (button) { busy(button, false); }
   });
 }
-function setLane(lane) {
-  if (lane !== "hotspots" && lane !== "viewpoints" && lane !== "mixed" && lane !== "github" && lane !== "skills") { return; }
-  if (state.lane === lane) { return; }
+function applyNewsScope() {
+  var select = $("news-scope-select");
+  if (select) { select.value = state.newsScope || "all"; }
+}
+
+function setNewsScope(scope) {
+  var next = String(scope || "all");
+  if (next !== "official" && next !== "community" && next !== "all") { next = "all"; }
+  if (state.newsScope === next) { return; }
+  state.newsScope = next;
   state.collectGen += 1;
-  invalidateRelatedSearch();
-  rememberArticleSession(state.lane);
-  var select = $("prompt-style-select");
-  if ((state.lane === "hotspots" || state.lane === "mixed") && select && select.value !== "经验分享") {
-    state.newsStyle = select.value;
-  }
-  state.lane = lane;
-  document.body.classList.toggle("lane-github", lane === "github");
-  document.body.classList.toggle("lane-skills", lane === "skills");
-  document.querySelectorAll("[data-lane]").forEach(function (tab) {
-    var on = tab.dataset.lane === lane;
-    tab.classList.toggle("active", on);
-    tab.setAttribute("aria-selected", String(on));
-  });
-  $("collect-btn").textContent = lane === "github" ? "抓取周榜" : "刷新全部";
-  delete $("collect-btn").dataset.originalLabel;
-  $("h-hotspots").textContent = lane === "github" ? "GitHub AI 项目周榜" : (lane === "skills" ? "资源探索" : "资讯探索");
-  $("hotspot-sub").textContent = lane === "github"
-    ? "优先本周新建的 AI 仓库，不够再用本周涨星补齐。先抓取周榜，再选浅色/暗色和三色盘后点生成图片。"
-    : (lane === "viewpoints"
-    ? "社区来源已并入资讯探索，仍保留旧接口兼容。"
-    : (lane === "skills"
-    ? "输入关键词（空格分隔多个），直接去 GitHub / skills.sh / 网页抓 skill；也可以粘贴链接。点「生成图片」把所有已收录 skill 汇总成封面 + 每个 skill 一张海报。"
-    : "按综合分、时效与独立来源聚合资讯事件；选择一个或多个事件后可继续研究"));
-  $("source-health-wrap").hidden = lane !== "hotspots";
-  if (select) {
-    select.value = lane === "viewpoints" ? "经验分享" : (state.newsStyle || "AI专家");
-  }
-  if (lane === "github") {
-    clearHotspotSelection(true);
-    loadGithubWeekly();
-    return;
-  }
-  if (lane === "skills") {
-    clearHotspotSelection(true);
-    growSkillLinks();
-    loadSkills();
-    return;
-  }
+  applyNewsScope();
+  // A scope change re-reads the same window; it never re-collects sources.
   clearHotspotSelection(true);
-  restoreArticleSession(lane);
   loadHotspots().then(function (data) {
     return widenIfEmpty(data || {}, currentHours());
   });
@@ -6497,7 +5722,7 @@ $("resource-kind-filter").addEventListener("change", function () {
 });
 $("source-refresh-all").addEventListener("click", function () {
   setAppPage("news");
-  setLane("hotspots");
+  setNewsScope("all");
   collect();
 });
 $("source-open-runs").addEventListener("click", function () { setAppPage("runs"); });
@@ -6526,16 +5751,19 @@ $("settings-open-research").addEventListener("click", function () {
   status("hotspot-status", "请选择一个或多个资讯事件后开始研究", "");
 });
 $("settings-open-sources").addEventListener("click", function () { setAppPage("sources"); });
-document.querySelectorAll("[data-lane]").forEach(function (tab) {
-  tab.addEventListener("click", function () { setLane(tab.dataset.lane); });
-});
 $("seg-wechat").addEventListener("click", function () { setPlatform("wechat"); });
 $("seg-xhs").addEventListener("click", function () { setPlatform("xiaohongshu"); });
-$("find-hooks-btn").addEventListener("click", findHooks);
 $("open-original-btn").addEventListener("click", function () { openOriginal(); });
 $("research-btn").addEventListener("click", runResearch);
 $("research-run-btn").addEventListener("click", runResearch);
 $("research-back-news").addEventListener("click", function () { setAppPage("news"); });
+$("research-to-creation-btn").addEventListener("click", function () {
+  setArticleContextFromDossier(state.research.dossier);
+});
+$("article-context-clear").addEventListener("click", clearArticleContext);
+$("news-scope-select").addEventListener("change", function () {
+  setNewsScope($("news-scope-select").value);
+});
 $("original-translate").addEventListener("click", translateOriginal);
 $("original-close").addEventListener("click", closeOriginal);
 $("original-dialog").addEventListener("cancel", closeOriginal);
@@ -6572,7 +5800,6 @@ document.querySelectorAll("[data-template]").forEach(function (node) {
   }
   $(id).addEventListener("input", function () {
     if (id === "article-body") { fitArticleBody(); }
-    if (id === "article-body") { syncRelatedSearchEnabled(); }
     if (!state.draft) { return; }
     state.articleDirty = true;
     $("publish-btn").disabled = false;
@@ -6580,9 +5807,6 @@ document.querySelectorAll("[data-template]").forEach(function (node) {
     status("article-status", "有未保存的修改");
   });
 });
-$("article-body").addEventListener("select", syncRelatedSearchEnabled);
-$("article-body").addEventListener("mouseup", syncRelatedSearchEnabled);
-$("article-body").addEventListener("keyup", syncRelatedSearchEnabled);
 $("article-model").addEventListener("change", function (event) { changeMainModel("article", event); });
 $("publish-btn").addEventListener("click", publish);
 $("schedule-btn").addEventListener("click", schedulePublish);
@@ -6595,9 +5819,6 @@ $("config-btn").addEventListener("click", function () {
 });
 $("favorites-btn").addEventListener("click", function () { toggleFavoritesDrawer(); });
 $("favorites-close").addEventListener("click", function () { toggleFavoritesDrawer(false); });
-$("news-supplement-btn").addEventListener("click", function () { toggleNewsSupplementDrawer(); });
-$("news-supplement-close").addEventListener("click", function () { toggleNewsSupplementDrawer(false); });
-$("related-search-btn").addEventListener("click", relatedSearch);
 if ($("article-paste")) {
   $("article-paste").addEventListener("input", function () {
     var box = $("article-paste");
@@ -6621,29 +5842,9 @@ $("config-form").elements.leaderboard_provider.addEventListener("change", functi
 $("github-export-btn").addEventListener("click", exportGithubImages);
 $("github-select-all").addEventListener("click", selectAllGithubImages);
 $("github-render-btn").addEventListener("click", renderGithubWeeklyImages);
-$("skill-search-btn").addEventListener("click", searchSkills);
-$("skill-query").addEventListener("keydown", function (event) {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    searchSkills();
-  }
-});
-$("skill-paste-btn").addEventListener("click", pasteSkills);
-// In a textarea Enter is the user's line break, so pasting is the button only:
-// Ctrl/Cmd+Enter is the shortcut for "加入".
-$("skill-links").addEventListener("input", growSkillLinks);
-$("skill-links").addEventListener("keydown", function (event) {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-    event.preventDefault();
-    pasteSkills();
-  }
-});
-$("skill-clear-btn").addEventListener("click", clearSkills);
-$("skill-source-toggle").addEventListener("click", toggleCrawlSources);
+$("skills-clear-btn").addEventListener("click", clearSkills);
 $("skill-title").addEventListener("input", scheduleSkillTitleSave);
 $("skill-title").addEventListener("change", saveSkillTitle);
-$("skill-token-save").addEventListener("click", saveGithubToken);
-$("skill-token-clear").addEventListener("click", clearGithubToken);
 $("settings-save-github-token").addEventListener("click", function () {
   var input = $("settings-github-token");
   var token = String(input && input.value || "").trim();
@@ -6797,6 +5998,9 @@ fetch("/api/status").then(function (response) { return response.json(); }).then(
   if (data.sources) { renderSourceHealth(data.sources); }
   if (data.collection_run || data.run) { renderCollectionRun(data.collection_run || data.run); }
   loadFavorites();
+  // The home card reports the latest persisted run, so it must not wait for the
+  // runs page to be opened before it says anything.
+  loadCollectionRuns().catch(function () {});
   loadHotspots().then(function (hotspots) {
     return widenIfEmpty(hotspots || {}, currentHours());
   });
@@ -6930,16 +6134,20 @@ class WebApp:
         if callable(searcher):
             result = searcher(query)
             return result if isinstance(result, dict) else {"results": list(result or [])}
-        # Reuse the existing bounded related-news parser as the default web
-        # adapter; it keeps upstream payloads out of the ResourceSet diagnostics.
-        from .background import search_related_news
+        # Reuse the bounded related-news engine through its one bridge — the
+        # same adapter the research path uses — so its log/credential boundary
+        # is honoured here too and upstream payloads stay out of the ResourceSet
+        # diagnostics.  The adapter degrades instead of raising.
+        from .research.adapters import RelatedNewsSearchAdapter
 
-        report = search_related_news(query, fetcher=self.workbench.page_fetcher, limit=limit)
-        rows = [dict(item, source="web", kind="website") for item in report.results]
+        response = RelatedNewsSearchAdapter(fetcher=self.workbench.page_fetcher).search(
+            query, adapters=("related_search",), limit=limit
+        )
+        rows = [dict(item, source="web", kind="website") for item in response.results]
         return {
             "results": rows,
-            "degraded": bool(report.degraded),
-            "cause_code": report.cause_code,
+            "degraded": bool(response.degraded),
+            "cause_code": response.cause_code,
         }
 
     def _build_resource_discovery(self) -> ResourceDiscoveryService:
@@ -7333,10 +6541,10 @@ class WebApp:
         hours: int,
         force: bool = True,
         source_id: str | None = None,
-        lane: str = "hotspots",
+        scope: str = SCOPE_ALL,
     ) -> dict[str, object]:
         payload = self.hotspots.collect(
-            hours, force=force, source_id=source_id, lane=lane
+            hours, force=force, source_id=source_id, scope=scope
         )
         payload["sources"] = _decorate_source_health(payload.get("sources"))
         collection = payload.get("collection")
@@ -7358,9 +6566,9 @@ class WebApp:
         }
 
     def hotspots_window(
-        self, hours: int, translate: bool = False, lane: str = "hotspots"
+        self, hours: int, translate: bool = False, scope: str = SCOPE_ALL
     ) -> dict[str, object]:
-        payload = self.hotspots.list_window(hours, translate=translate, lane=lane)
+        payload = self.hotspots.list_window(hours, translate=translate, scope=scope)
         payload["sources"] = _decorate_source_health(payload.get("sources"))
         self._remember_hotspot_payloads(payload)
         return {
@@ -7438,33 +6646,6 @@ class WebApp:
         if not self.database.remove_hotspot_favorite(item_id):
             raise KeyError(item_id)
         return {"ok": True, "item_id": item_id}
-
-    def find_hooks(self, item_id: str) -> dict[str, object]:
-        return self.workbench.find_hooks(item_id)
-
-    def related_search(self, payload: object) -> dict[str, object]:
-        if not isinstance(payload, dict):
-            raise ValueError("related search payload must be a JSON object")
-        draft_id = payload.get("draft_id")
-        selection = payload.get("selected_text", payload.get("selection"))
-        start = payload.get("selection_start")
-        end = payload.get("selection_end")
-        if not isinstance(draft_id, str) or not draft_id.strip():
-            raise ValueError("draft_id required")
-        if not isinstance(selection, str) or not selection.strip():
-            raise ValueError("selection required")
-        if len(selection) > RELATED_SELECTION_LIMIT:
-            raise ValueError(f"selection must be at most {RELATED_SELECTION_LIMIT} characters")
-        if (
-            isinstance(start, bool)
-            or not isinstance(start, int)
-            or isinstance(end, bool)
-            or not isinstance(end, int)
-        ):
-            raise ValueError("selection_start and selection_end must be integers")
-        return self.workbench.related_search(
-            draft_id.strip(), selection, start, end
-        )
 
     def original(self, item_id: str) -> dict[str, object]:
         cached = self._original_text_cache.get(item_id)
@@ -7606,36 +6787,36 @@ class WebApp:
         model: str | None = None,
         provider: str | None = None,
         effort: str | None = None,
-        chosen_hooks: object = None,
         prompt_style: str = DEFAULT_ARTICLE_PROMPT_STYLE,
         item_ids: list[str] | None = None,
         pasted_text: str | None = None,
-        related_items: object = None,
+        dossier_id: str | None = None,
     ) -> dict[str, object]:
         if not self._article_model_configured:
             raise ValueError("article_model_not_configured")
-        radar_event = self._radar_events.get(str(item_id or "").strip())
-        if radar_event is None and isinstance(item_ids, (list, tuple)):
-            for candidate_id in item_ids:
-                radar_event = self._radar_events.get(str(candidate_id or "").strip())
-                if radar_event is not None:
-                    break
+        radar_event = None
+        if not (dossier_id and str(dossier_id).strip()):
+            radar_event = self._radar_events.get(str(item_id or "").strip())
+            if radar_event is None and isinstance(item_ids, (list, tuple)):
+                for candidate_id in item_ids:
+                    radar_event = self._radar_events.get(str(candidate_id or "").strip())
+                    if radar_event is not None:
+                        break
         return {
             "ok": True,
             **self.workbench.generate_article(
                 item_id,
                 platform,
-                model,
-                provider,
-                effort,
-                self.article_style,
-                chosen_hooks,
-                prompt_style,
-                self.xiaohongshu_config.get("account_name") or "",
-                item_ids,
+                model=model,
+                provider=provider,
+                effort=effort,
+                style=self.article_style,
+                prompt_style=prompt_style,
+                xhs_handle=self.xiaohongshu_config.get("account_name") or "",
+                item_ids=item_ids,
                 pasted_text=pasted_text,
-                related_items=related_items,
                 radar_event=radar_event,
+                dossier_id=dossier_id,
             ),
         }
 
@@ -9117,11 +8298,13 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         )
                     translate_flag = (parse_qs(parsed.query).get("translate") or ["0"])[0]
                     translate = translate_flag.lower() in {"1", "true", "yes"}
-                    lane = (parse_qs(parsed.query).get("lane") or ["hotspots"])[0]
-                    if lane not in {"hotspots", "viewpoints", "mixed"}:
-                        raise ValueError("lane must be hotspots, viewpoints, or mixed")
+                    query = parse_qs(parsed.query)
+                    scope = resolve_scope(
+                        (query.get("scope") or [None])[0],
+                        (query.get("lane") or [None])[0],
+                    )
                     self._send_json(
-                        200, app.hotspots_window(hours, translate=translate, lane=lane)
+                        200, app.hotspots_window(hours, translate=translate, scope=scope)
                     )
                     return
                 if parsed.path == "/api/schedule":
@@ -9257,17 +8440,16 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         not isinstance(source_id, str) or not source_id.strip()
                     ):
                         raise ValueError("source_id must be a non-empty string")
-                    lane = payload.get("lane", "hotspots") if isinstance(payload, dict) else "hotspots"
-                    if lane not in {"hotspots", "viewpoints", "mixed"}:
-                        raise ValueError("lane must be hotspots, viewpoints, or mixed")
+                    scope = resolve_scope(
+                        payload.get("scope") if isinstance(payload, dict) else None,
+                        payload.get("lane") if isinstance(payload, dict) else None,
+                    )
                     result = app.collect(
                         hours,
                         force=force,
                         source_id=source_id.strip() if source_id else None,
-                        lane=lane,
+                        scope=scope,
                     )
-                elif self.path == "/api/hooks/find":
-                    result = app.find_hooks(self._require_string(payload, "item_id"))
                 elif self.path == "/api/original":
                     result = app.original(self._require_string(payload, "item_id"))
                 elif self.path == "/api/original/translate":
@@ -9275,6 +8457,13 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                 elif self.path == "/api/favorites":
                     result = app.add_favorite(self._require_string(payload, "item_id"))
                 elif self.path == "/api/articles":
+                    dossier_id = payload.get("dossier_id") if isinstance(payload, dict) else None
+                    if dossier_id is not None:
+                        if not isinstance(dossier_id, str) or not dossier_id.strip():
+                            # Same vocabulary as every other dossier failure, so
+                            # the UI can branch on one error code set.
+                            raise ArticleContextError("dossier_id_required")
+                        dossier_id = dossier_id.strip()
                     item_ids = payload.get("item_ids") if isinstance(payload, dict) else None
                     if item_ids is not None:
                         if not isinstance(item_ids, list) or any(
@@ -9289,25 +8478,29 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                             item_id = sorted(
                                 {value.strip() for value in item_ids if value.strip()}
                             )[0]
+                    elif dossier_id:
+                        # A Topic Dossier already carries its own events and
+                        # sources, so no candidate item is required.
+                        item_ids = None
+                        item_id = ""
                     else:
                         item_ids = None
                         item_id = self._require_string(payload, "item_id")
                     result = app.articles(
                         item_id,
                         self._require_string(payload, "platform"),
-                        payload.get("model") if isinstance(payload, dict) else None,
-                        payload.get("provider") if isinstance(payload, dict) else None,
-                        payload.get("effort") if isinstance(payload, dict) else None,
-                        payload.get("chosen_hooks") if isinstance(payload, dict) else None,
-                        payload.get("prompt_style", DEFAULT_ARTICLE_PROMPT_STYLE)
-                        if isinstance(payload, dict)
-                        else DEFAULT_ARTICLE_PROMPT_STYLE,
-                        item_ids,
-                        payload.get("pasted_text") if isinstance(payload, dict) else None,
-                        payload.get("related_items") if isinstance(payload, dict) else None,
+                        model=payload.get("model") if isinstance(payload, dict) else None,
+                        provider=payload.get("provider") if isinstance(payload, dict) else None,
+                        effort=payload.get("effort") if isinstance(payload, dict) else None,
+                        prompt_style=(
+                            payload.get("prompt_style", DEFAULT_ARTICLE_PROMPT_STYLE)
+                            if isinstance(payload, dict)
+                            else DEFAULT_ARTICLE_PROMPT_STYLE
+                        ),
+                        item_ids=item_ids,
+                        pasted_text=payload.get("pasted_text") if isinstance(payload, dict) else None,
+                        dossier_id=dossier_id,
                     )
-                elif self.path == "/api/related-search":
-                    result = app.related_search(payload)
                 elif self.path == "/api/config":
                     result = app.set_config(payload)
                 elif self.path == "/api/config/delete":
@@ -9392,6 +8585,18 @@ def _make_handler(app: WebApp) -> type[BaseHTTPRequestHandler]:
                         "error": exc.code,
                         "error_reason": exc.reason,
                         "error_type": "ResearchError",
+                    },
+                )
+            except ArticleContextError as exc:
+                # A dossier that cannot feed the writer fails loudly and stably;
+                # it never falls back to a second research run.
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": exc.code,
+                        "error_reason": exc.reason,
+                        "error_type": "ArticleContextError",
                     },
                 )
             except (ValueError, PublicationError) as exc:

@@ -419,6 +419,10 @@ def _build_event(group: Sequence[Mapping[str, object]]) -> dict[str, object]:
     item_ids = [_text(item.get("item_id")) for item in group if _text(item.get("item_id"))]
     source_domains = sorted({_text(source.get("domain")) for source in sources if _text(source.get("domain"))})
     public_sources = [_public_source(source) for source in sorted(sources, key=lambda row: (_SOURCE_ROLE_RANK.get(_text(row.get("role")), 0), _text(row.get("source_id"))), reverse=True)]
+    unique_source_ids = sorted({_text(source.get("source_id")) for source in sources})
+    urls_by_id: dict[str, str] = {}
+    for source in sources:
+        urls_by_id.setdefault(_text(source.get("source_id")), _text(source.get("url")))
     supporting = [source for source in public_sources if source.get("role") == "supporting"]
     community = [source for source in public_sources if source.get("role") == "community"]
     discussion = [source for source in public_sources if source.get("role") == "discussion"]
@@ -444,7 +448,12 @@ def _build_event(group: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "community": community,
         "discussion": discussion,
         "sources": public_sources,
-        "source_ids": sorted({_text(source.get("source_id")) for source in sources}),
+        "source_ids": unique_source_ids,
+        # Aligned with `source_ids` index for index: a consumer that zips the two
+        # lists must never attribute one source's url to another source.  When a
+        # source id carries several urls the first record wins; the complete
+        # pairing stays available in `sources[]`, which is the source of truth.
+        "source_urls": [urls_by_id.get(source_id, "") for source_id in unique_source_ids],
         "source_domains": source_domains,
         "independent_source_count": len(source_domains),
         "items": [_strip_internal(item) for item in group],

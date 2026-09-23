@@ -895,25 +895,50 @@ class StageFilingTests(unittest.TestCase):
         self.assertEqual("a/b/SKILL.md", _url_path("a/b/SKILL.md"))
 
 
-class LaneMarkupTests(unittest.TestCase):
+class StudioMarkupTests(unittest.TestCase):
     """R3/R4/R6/R7/R8 as they appear in the served page."""
 
-    def test_skill_list_and_merged_source_block(self) -> None:
-        self.assertIn('id="skill-list"', INDEX_HTML)
-        self.assertNotIn('id="skill-stage-chips"', INDEX_HTML)
-        self.assertNotIn('id="skill-gap-note"', INDEX_HTML)
-        self.assertIn('id="skill-source-chips"', INDEX_HTML)
-        self.assertIn("renderSkillSourceChips", INDEX_HTML)
-        self.assertIn("function renderSkillList", INDEX_HTML)
+    def test_merged_source_block_replaces_the_hidden_skill_list(self) -> None:
+        """The source chips answer where each skill came from; the hidden list is gone.
 
-    def test_paste_box_is_a_growing_textarea(self) -> None:
-        self.assertIn('<textarea id="skill-links" rows="3"', INDEX_HTML)
-        self.assertNotIn('<input id="skill-links"', INDEX_HTML)
-        self.assertIn("function growSkillLinks()", INDEX_HTML)
-        self.assertIn("Math.min(Math.max(box.scrollHeight, 76)", INDEX_HTML)
-        self.assertIn("$(\"skill-links\").addEventListener(\"input\", growSkillLinks)", INDEX_HTML)
-        # Plain Enter must insert a newline; the shortcut takes a modifier.
-        self.assertIn('event.key === "Enter" && (event.metaKey || event.ctrlKey)', INDEX_HTML)
+        Selection now happens on the gallery tiles (gh-check -> toggleSkillImage),
+        so the studio no longer needs a hidden #skill-list to tick.
+        """
+        self.assertIn('id="skills-sources"', INDEX_HTML)
+        self.assertIn('<ul id="skills-source-chips"', INDEX_HTML)
+        self.assertIn("function renderSkillSourceChips(", INDEX_HTML)
+        self.assertIn("function toggleSkillsBySource(", INDEX_HTML)
+        # One chip per source; clicking it selects or deselects that whole source.
+        self.assertIn('button.title = "点击全选或取消来自" + label + "的 skill"', INDEX_HTML)
+        self.assertIn("toggleSkillsBySource(label)", INDEX_HTML)
+        # Retired: the hidden list, and the stage chips / gap note it had replaced.
+        for gone in (
+            'id="skill-list"',
+            "function renderSkillList",
+            'id="skill-stage-chips"',
+            'id="skill-gap-note"',
+        ):
+            self.assertNotIn(gone, INDEX_HTML, msg=f"{gone} 已从出图工作台移除")
+        # The selection surface that replaced the list.
+        self.assertIn("function toggleSkillImage(", INDEX_HTML)
+        self.assertIn('id="skills-select-all"', INDEX_HTML)
+
+    def test_paste_box_is_a_multiline_textarea_on_the_resource_page(self) -> None:
+        """The paste box moved to 资源探索 and stays a real multi-line textarea.
+
+        1.5.0 retires the auto-grow helper and the Ctrl/Cmd+Enter shortcut: the box
+        is capped at MAX_PASTE_CHARS by the browser and checked again by the client,
+        and the handoff is the explicit 送入 Skill 出图 button.
+        """
+        self.assertIn('<textarea id="resource-pasted-text" rows="2" maxlength="20000"', INDEX_HTML)
+        self.assertNotIn('<input id="resource-pasted-text"', INDEX_HTML)
+        # The cap the browser applies is the same one the client refuses to exceed.
+        self.assertIn("links.length > 20000", INDEX_HTML)
+        self.assertIn("上限 20000", INDEX_HTML)
+        self.assertIn('id="resource-studio-btn"', INDEX_HTML)
+        for gone in ('id="skill-links"', "function growSkillLinks", "function resetSkillLinks"):
+            self.assertNotIn(gone, INDEX_HTML, msg=f"{gone} 已随技能栏移除")
+        self.assertNotIn("event.metaKey || event.ctrlKey", INDEX_HTML)
 
     def test_title_box_travels_to_the_cover_and_the_text_area(self) -> None:
         self.assertIn('id="skill-title"', INDEX_HTML)
@@ -921,14 +946,13 @@ class LaneMarkupTests(unittest.TestCase):
         self.assertIn('title: String((($("skill-title") || {}).value) || "").trim()', INDEX_HTML)
         self.assertIn('$("skills-title").textContent = userTitle || articleTitle', INDEX_HTML)
 
-    def test_status_line_offers_the_crawl_source_list(self) -> None:
-        self.assertIn('id="skill-source-toggle"', INDEX_HTML)
-        self.assertIn('id="skill-crawl-sources"', INDEX_HTML)
-        self.assertIn("当前自动抓取 skill 的源：", INDEX_HTML)
-        self.assertIn('$("skill-source-toggle").addEventListener("click", toggleCrawlSources)', INDEX_HTML)
-
-    def test_lane_text_describes_keyword_search(self) -> None:
-        self.assertIn("输入关键词（空格分隔多个）", INDEX_HTML)
+    def test_skill_copy_points_at_the_resource_page(self) -> None:
+        # The studio no longer searches; it consumes whatever the resource page
+        # sent, so every "how do I get skills" line must point there.
+        self.assertIn("去「资源探索」输入关键词或粘贴 skill 链接", INDEX_HTML)
+        self.assertIn("再点「送到创作页」", INDEX_HTML)
+        # The retired in-studio search wording and the coverage-map copy are gone.
+        self.assertNotIn("输入关键词（空格分隔多个）", INDEX_HTML)
         self.assertNotIn("按覆盖地图", INDEX_HTML)
 
 

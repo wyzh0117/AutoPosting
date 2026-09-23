@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -454,7 +455,7 @@ class WebApiTests(unittest.TestCase):
         status, payload = self._request("GET", "/api/status")
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
-        self.assertEqual("3.2.0", payload["version"])
+        self.assertEqual("3.2.1", payload["version"])
         self.assertEqual("unconfigured", payload["llm"]["model"])
         self.assertEqual("openai-compatible", payload["llm"]["provider"])
         self.assertEqual("none", payload["llm"]["effort"])
@@ -891,7 +892,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("https://lab.example/w1", first["body"])
         self.assertNotIn("【信息来源", first["body"])
         self.assertEqual(
-            "openai-compatible/unconfigured:none:article-v12",
+            "openai-compatible/unconfigured:none:article-v13",
             self.db.get_draft(first["draft_id"])["generator"],
         )
 
@@ -899,155 +900,6 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(400, status)
         status, payload = self._request("POST", "/api/articles", {"item_id": "missing", "platform": "wechat"})
         self.assertEqual(404, status)
-
-    def test_related_search_uses_draft_context_and_search_web(self) -> None:
-        item_id = self._insert_item(
-            self.sources[0], "related", "Model One news", "https://lab.example/related"
-        )
-        _, article = self._request(
-            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
-        )
-        body = "第一段背景。\n\n第二段包含选中关键词。\n\n第三段补充。\n\n第四段不应传给模型。\n\nAIGC lab_blog"
-        self._request(
-            "POST",
-            "/api/articles/edit",
-            {"draft_id": article["draft_id"], "title": "Model One news", "body": body},
-        )
-        search_html = (
-            '<a class="result__a" href="https://news.example/unrelated">无关结果</a>'
-            '<div class="result__snippet">其他新闻</div>'
-            '<a class="result__a" href="https://news.example/model">选中关键词相关新闻</a>'
-            '<div class="result__snippet">选中关键词最新进展摘要</div>'
-        ).encode("utf-8")
-        requested_urls: list[str] = []
-
-        def fetch_related(url: str) -> bytes:
-            requested_urls.append(url)
-            return search_html if "duckduckgo.com/html" in url else b""
-
-        self.app.workbench.page_fetcher = fetch_related
-        self.app._article_model_configured = False
-        selection = "选中关键词"
-        start = body.index(selection)
-        model_calls_before = len(self.model.calls)
-        status, payload = self._request(
-            "POST",
-            "/api/related-search",
-            {
-                "draft_id": article["draft_id"],
-                "selected_text": selection,
-                "selection_start": start,
-                "selection_end": start + len(selection),
-            },
-        )
-        self.assertEqual(200, status)
-        self.assertEqual(selection, payload["query"])
-        self.assertEqual(selection, parse_qs(urlsplit(requested_urls[0]).query)["q"][0])
-        self.assertEqual("https://news.example/model", payload["items"][0]["url"])
-        self.assertEqual(1, len(payload["items"]))
-        self.assertEqual(model_calls_before, len(self.model.calls))
-
-    def test_related_search_default_fetch_route_is_thread_safe(self) -> None:
-        item_id = self._insert_item(
-            self.sources[0], "related-default", "Default related", "https://lab.example/related-default"
-        )
-        _, article = self._request(
-            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
-        )
-        body = (
-            "背景。\n\nOpenAI rogue agent swarm。\n\n补充。\n\n"
-            "[原文](https://lab.example/related-default)\n\n"
-            "AIGC 声明：本文由 AI 辅助生成。"
-        )
-        self._request(
-            "POST",
-            "/api/articles/edit",
-            {"draft_id": article["draft_id"], "title": "Default related", "body": body},
-        )
-        self.app.workbench.page_fetcher = default_page_fetcher
-        with patch(
-            "autoposting.workbench.search_related_news",
-            return_value=("OpenAI rogue agent swarm", [{
-                "title": "相关报道", "url": "https://news.example/report", "snippet": "摘要"
-            }]),
-        ) as search:
-            selection = "OpenAI rogue agent swarm。"
-            start = body.index(selection)
-            payload = {
-                "draft_id": article["draft_id"],
-                "selected_text": selection,
-                "selection_start": start,
-                "selection_end": start + len(selection),
-            }
-            responses: list[tuple[int, dict[str, object]]] = []
-
-            def request() -> None:
-                responses.append(self._request("POST", "/api/related-search", payload))
-
-            threads = [threading.Thread(target=request) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(10)
-
-        self.assertEqual([(200, responses[0][1]), (200, responses[1][1])], responses)
-        self.assertEqual(2, search.call_count)
-        self.assertTrue(all(call.kwargs["fetcher"] is None for call in search.call_args_list))
-
-    def test_related_search_rejects_invalid_selection_offsets(self) -> None:
-        item_id = self._insert_item(
-            self.sources[0], "related-invalid", "Model One news", "https://lab.example/related-invalid"
-        )
-        _, article = self._request(
-            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
-        )
-        status, payload = self._request(
-            "POST",
-            "/api/related-search",
-            {
-                "draft_id": article["draft_id"],
-                "selection": "伪造内容",
-                "selection_start": 0,
-                "selection_end": 4,
-            },
-        )
-        self.assertEqual(400, status)
-        self.assertIn("selection", payload["error"])
-
-    def test_related_search_hides_unexpected_search_errors(self) -> None:
-        item_id = self._insert_item(
-            self.sources[0], "related-error", "Model One news", "https://lab.example/related-error"
-        )
-        _, article = self._request(
-            "POST", "/api/articles", {"item_id": item_id, "platform": "wechat"}
-        )
-        body = str(article["body"])
-        model = RelatedSearchModel()
-        service = LLMService(self.db, runner=model)
-        self.app.llm_service = service
-        self.app.workbench.llm_service = service
-        self.app._article_model_configured = True
-
-        def fail_fetcher(_url: str) -> bytes:
-            raise RuntimeError("secret upstream failure")
-
-        self.app.workbench.page_fetcher = fail_fetcher
-        paragraphs = [part.strip() for part in body.splitlines() if part.strip()]
-        selection = paragraphs[0][: min(12, len(paragraphs[0]))]
-        start = body.index(selection)
-        status, payload = self._request(
-            "POST",
-            "/api/related-search",
-            {
-                "draft_id": article["draft_id"],
-                "selected_text": selection,
-                "selection_start": start,
-                "selection_end": start + len(selection),
-            },
-        )
-        self.assertEqual(502, status, payload)
-        self.assertEqual("related_search_failed", payload["error"])
-        self.assertNotIn("secret upstream failure", json.dumps(payload, ensure_ascii=False))
 
     def test_article_prompt_style_selects_file_and_scopes_cache(self) -> None:
         item_id = self._insert_item(self.sources[0], "style", "Style news", "https://lab.example/style")
@@ -1328,52 +1180,6 @@ class WebApiTests(unittest.TestCase):
 
         self.assertTrue(original["translatable"])
         self.assertIn("中文摘要", translated["translation"])
-
-    def test_find_hooks_endpoint_and_articles_accept_chosen_hooks(self) -> None:
-        self.db.insert_item(
-            self.sources[0],
-            FeedItem(
-                "hook-api",
-                "https://lab.example/hook-api",
-                "中国医生用 GPT-5.6 破解数学题",
-                "本科经协和医学院4+4试点班转入临床医学。",
-                None,
-                {},
-            ),
-        )
-        item_id = str(self.db.connect().execute("SELECT item_id FROM items LIMIT 1").fetchone()["item_id"])
-
-        def fake_fetch(url: str) -> bytes:
-            if "4" in url and "试点" in url or "4%2B4" in url or "%E8%AF%95%E7%82%B9" in url:
-                return (
-                    "<html><body>"
-                    '<a class="result__a" href="https://news.example/4plus4">协和4+4试点班争议</a>'
-                    '<a class="result__snippet">该项目曾引发舆论质疑。</a>'
-                    "</body></html>"
-                ).encode("utf-8")
-            return b"<html></html>"
-
-        self.app.workbench.page_fetcher = fake_fetch
-
-        status, payload = self._request("POST", "/api/hooks/find", {"item_id": "missing"})
-        self.assertEqual(404, status)
-
-        status, payload = self._request("POST", "/api/hooks/find", {"item_id": item_id})
-        self.assertEqual(200, status)
-        self.assertTrue(payload["ok"])
-        self.assertIn("hooks", payload)
-
-        status, article = self._request(
-            "POST",
-            "/api/articles",
-            {
-                "item_id": item_id,
-                "platform": "wechat",
-                "chosen_hooks": [{"phrase": "协和4+4试点班", "why": "公开检索出现争议"}],
-            },
-        )
-        self.assertEqual(200, status)
-        self.assertIn("AIGC", article["body"])
 
     def test_articles_returns_502_with_stable_code_when_llm_unavailable(self) -> None:
         item_id = self._insert_item(self.sources[0], "w1", "Model One news", "https://lab.example/w1")
@@ -2329,25 +2135,68 @@ class WebApiTests(unittest.TestCase):
             self.assertIn("text/html", response.headers["Content-Type"])
             return response.read().decode("utf-8")
 
-    def test_find_hooks_workbench_contract(self) -> None:
-        html = self._index()
-        self.assertIn("找切口", html)
-        self.assertIn('id="find-hooks-btn"', html)
-        self.assertIn('id="hook-list"', html)
-        self.assertIn('waitApi("hooks", "/api/hooks/find"', html)
-        self.assertIn("chosen_hooks", html)
-        self.assertIn("主切口", html)
-        self.assertIn("须进开头", html)
-        self.assertIn("state.chosenHookIds", html)
-        self.assertIn("function clearHooks()", html)
-        self.assertIn("clearHooks()", html)
-        self.assertIn("var itemId = state.item.item_id", html)
-        self.assertIn("state.item.item_id !== itemId", html)
-        self.assertLess(html.index("找切口"), html.index("生成文章"))
-        self.assertNotIn('waitApi("hooks"', html.split("function generate()")[1].split("function persistArticle(")[0])
+
+class SkillPosterSelectionTests(unittest.TestCase):
+    """A poster tile checkbox is the same selection as the skill checkbox.
+
+    The render request is built from the collected skills, so toggling only the
+    image flag left 生成图片 reporting 「超过条目上限」 with no way to lower the
+    count from the gallery.
+    """
+
+    def test_the_tile_checkbox_moves_the_skill_selection(self) -> None:
+        self.assertIn("function skillsForImage(image)", INDEX_HTML)
+        self.assertIn('if (!image || image.kind !== "poster") { return []; }', INDEX_HTML)
+
+    def test_both_gallery_controls_use_the_mapping(self) -> None:
+        for name in ("function toggleSkillImage(imageId)", "function selectAllSkillImages()"):
+            start = INDEX_HTML.index(name)
+            body = INDEX_HTML[start : INDEX_HTML.index("\n}", start)]
+            self.assertIn("skillsForImage(", body, name)
+
+    def test_the_render_request_still_comes_from_the_skills(self) -> None:
+        # One source of truth: whatever the gallery does, the request reads the
+        # collected skills.
+        self.assertIn("selected_ids: selectedSkills(pack).map(skillIdentity)", INDEX_HTML)
+
+
+class HomeActivityCardTests(unittest.TestCase):
+    """The home card reports the latest persisted run on a cold page load."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "home.db")
+        self.db.initialize()
+        self.app = WebApp(self.db, Path("config/sources.example.json"), Path(self.tmp.name) / "packages")
+
+    def test_the_home_card_is_filled_without_opening_the_runs_page(self) -> None:
+        html = INDEX_HTML
+        # The boot path loads the runs feed ...
+        self.assertIn("loadCollectionRuns().catch(function () {});", html)
+        # ... and the renderer writes the card for the latest persisted run,
+        # instead of leaving the "loading" placeholder on screen forever.
+        self.assertIn("最近一次采集：", html)
+        self.assertIn('homeSummary.textContent = "最近一次采集："', html)
+        self.assertIn('"还没有采集运行记录，去「资讯探索」刷新一次来源。"', html)
+
+    def test_the_card_still_names_the_placeholder_before_any_run(self) -> None:
+        html = INDEX_HTML
+        self.assertIn("加载状态后，这里会显示最近的资讯运行、研究和草稿。", html)
+
+    def test_an_empty_run_list_does_not_leave_the_placeholder(self) -> None:
+        html = INDEX_HTML
+        # An empty history is reported as an instruction, not as a loading state.
+        self.assertIn("还没有采集运行记录", html)
 
 
 class IndexPageContractTests(unittest.TestCase):
+    def _index(self) -> str:
+        request = urllib.request.Request(self.base_url + "/", method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertIn("text/html", response.headers["Content-Type"])
+            return response.read().decode("utf-8")
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -2442,7 +2291,12 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertLess(html.index('id="wait-banner"'), html.index("<main>"))
         # Retained capabilities: the unified search API and the poster galleries.
         self.assertIn("/api/skills/search", html)
-        self.assertIn('id="skill-query"', html)
+        # Skill search/paste input lives on the resource page; the studio only
+        # renders the collected package.
+        self.assertIn('id="resource-query"', html)
+        self.assertIn('id="resource-pasted-text"', html)
+        self.assertIn('id="resource-studio-btn"', html)
+        self.assertNotIn('id="skill-query"', html)
         self.assertIn('id="skills-gallery"', html)
         self.assertIn('id="github-studio"', html)
         self.assertIn('id="skills-studio"', html)
@@ -2487,7 +2341,13 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('/api/collection-runs?limit=20', html)
         self.assertIn('/api/research', html)
         self.assertIn('/api/research/" + encodeURIComponent', html)
-        self.assertIn('lane !== "mixed"', html)
+        # The editorial/community filter is the `scope` contract now, and the
+        # retired `lane` name appears nowhere in the client.
+        self.assertIn('state.newsScope', html)
+        self.assertIn('id="news-scope-select"', html)
+        client = html.split("<script>", 1)[1]
+        for retired in ("state.lane", "setLane(", "laneStatus", "data-lane", "body.lane-", "lane !== "):
+            self.assertNotIn(retired, client)
         for legacy_route in ('/api/status', '/api/hotspots?hours=', '/api/collect'):
             self.assertIn(legacy_route, html)
 
@@ -2508,33 +2368,24 @@ class IndexPageContractTests(unittest.TestCase):
         """Lane-era skill search blocks stay retired, while both poster studios
         are reachable inside the creation page."""
         html = self._index()
-        # 1.4.0 merged the stage chips + gap note into one source block.
-        # 1.4.3 puts the collected-skill list back, with checkboxes, below it.
-        self.assertIn('id="skill-source-bar"', html)
-        self.assertIn('id="skill-source-chips"', html)
-        self.assertIn('id="skill-degraded-note"', html)
-        self.assertNotIn('id="skill-stage-chips"', html)
-        self.assertNotIn('id="skill-gap-note"', html)
-        self.assertIn('id="skill-list"', html)
-        style = html.split("</style>", 1)[0]
-        # The retired lane-era search/source blocks stay hidden by default.
-        self.assertRegex(
-            style,
-            r"#skill-search-row,[^{]*#skill-source-bar[^{]*"
-            r"#skill-degraded-note[^{]*\{[^}]*display:none",
-        )
-        # Their lane-scoped reveal rules are vestigial but still well-formed.
-        self.assertRegex(
-            style,
-            r"body\.lane-skills #skill-source-bar:not\(\[hidden\]\),\s*"
-            r"body\.lane-skills #skill-degraded-note:not\(\[hidden\]\)\{display:block;\}",
-        )
-        self.assertIn("#skill-degraded-note[hidden]{display:none;}", style)
-        for note in ("skill-source-bar", "skill-degraded-note"):
-            self.assertNotRegex(
-                style,
-                r"body\.lane-(?:hotspots|viewpoints|github)[^{]*#" + note,
-            )
+        # The source block and the degraded note are visible studio parts now,
+        # not hidden write targets: a user must be able to see where the
+        # collected skills came from and which source did not answer.
+        self.assertIn('id="skills-sources"', html)
+        self.assertIn('id="skills-source-chips"', html)
+        self.assertIn('id="skills-degraded-note"', html)
+        # The 1.4.x stage chips and gap note stay retired, and so does the
+        # hidden collected-skill list the studio used to write into.
+        for retired in ("skill-source-bar", "skill-source-chips", "skill-degraded-note",
+                        "skill-stage-chips", "skill-gap-note", "skill-list"):
+            self.assertNotIn(f'id="{retired}"', html)
+        style = re.sub(r"/\*.*?\*/", "", html.split("</style>", 1)[0], flags=re.S)
+        # The retired lane-era hidden blocks stay retired in CSS too.
+        self.assertNotIn("#skill-search-row", style)
+        self.assertNotIn("#skill-degraded-note", style)
+        self.assertIn("#skills-degraded-note[hidden]{display:none;}", style)
+        # No lane-scoped rule may survive anywhere in the sheet.
+        self.assertNotIn("lane", style)
         # Iteration 2: the weekly 3:4 studio and the skill poster studio are
         # always available in the creation page instead of lane-gated.
         self.assertRegex(style, r"#github-studio,#skills-studio\{display:flex")
@@ -2646,12 +2497,15 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("资讯探索", html)
         self.assertIn("按综合分、时效与独立来源聚合资讯事件", html)
         self.assertIn("研究已选事件", html)
-        self.assertIn("function setLane(", html)
-        # The weekly 3:4 capability stays, now as a creation-page studio.
+        self.assertNotIn("function setLane(", html)
+        self.assertIn("function setNewsScope(", html)
+        self.assertIn("function applyNewsScope(", html)
+        # The weekly 3:4 capability stays, now as a creation-page studio with a
+        # fixed heading instead of a lane-conditional one.
         self.assertIn("GitHub 周榜出图工作台", html)
-        self.assertIn("GitHub AI 项目周榜", html)
+        self.assertNotIn("GitHub AI 项目周榜", html)
         self.assertNotIn("GitHub AI项目周榜", html)
-        self.assertIn("body.lane-github .rank-toolbar", html)
+        self.assertNotIn("body.lane-", html)
         self.assertIn('id="github-studio"', html)
         self.assertIn('id="github-fetch-btn"', html)
         self.assertIn("榜单模型", html)
@@ -2706,7 +2560,6 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('waitStart("github_render"', html)
         self.assertIn('waitStart("collect"', html)
         self.assertIn('waitStart("generate"', html)
-        self.assertIn('waitStart("hooks"', html)
         self.assertIn('waitStart("github_fetch"', html)
         self.assertIn('waitStart("translate"', html)
         self.assertNotIn('waitStart("chat"', html)
@@ -2735,11 +2588,13 @@ class IndexPageContractTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertIn("AutoPosting", html)
         self.assertIn("GitHub 周榜", html)
-        self.assertIn("GitHub AI 项目周榜", html)
+        self.assertIn("GitHub 周榜出图工作台", html)
+        # The retired lane-conditional heading must not come back.
+        self.assertNotIn("GitHub AI 项目周榜", html)
 
     def test_version_badge(self) -> None:
         html = self._index()
-        self.assertIn("3.2.0", html)
+        self.assertIn("3.2.1", html)
         self.assertIn("没有已选配图时才生成标题大字报", html)
         self.assertIn('card.kind === "cover" && !card.image_url', html)
         self.assertNotIn('"700 72px "', html)
@@ -2780,7 +2635,6 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns:repeat(3", html)
         self.assertIn("aspect-ratio:9/16", html)
         self.assertIn("canvas.height = 1920", html)
-        self.assertLess(html.index('id="prompt-style-select"'), html.index('id="find-hooks-btn"'))
         self.assertIn('prompt_style: $("prompt-style-select").value', html)
         self.assertIn('id="open-original-btn" disabled', html)
         self.assertLess(html.index("时间优先"), html.index("打开原文"))
@@ -2845,43 +2699,6 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertNotIn("body.chat-expanded", html)
         self.assertNotIn(".chat-section", html)
 
-    def test_related_search_and_news_supplement_contract(self) -> None:
-        html = self._index()
-        for element_id in (
-            "related-search-btn",
-            "news-supplement-btn",
-            "news-supplement-drawer",
-            "news-supplement-list",
-        ):
-            self.assertIn(f'id="{element_id}"', html)
-        self.assertIn("function selectedArticleContext()", html)
-        self.assertIn("selectionStart", html)
-        self.assertIn("selectionEnd", html)
-        self.assertIn('waitApi("related_search", "/api/related-search"', html)
-        self.assertIn("function renderNewsSupplements()", html)
-        self.assertIn("function toggleNewsSupplementDrawer(", html)
-        self.assertIn("function newsPickToggle(", html)
-        self.assertIn("function selectedNewsItems()", html)
-        self.assertIn("payload.related_items = related", html)
-        self.assertIn("pickedNewsKeys", html)
-        self.assertIn("toggleNewsSupplementDrawer(true)", html)
-        self.assertIn('link.rel = "noopener noreferrer"', html)
-        self.assertIn(r"var separator = /\r?\n[ \t]*\r?\n/g;", html)
-        self.assertIn('if (next) { toggleFavoritesDrawer(false); }', html)
-        self.assertIn('if (next) { toggleNewsSupplementDrawer(false); }', html)
-        self.assertIn("function invalidateRelatedSearch()", html)
-        self.assertIn('if (waitRunning("related_search")) { waitStop("related_search"); }', html)
-        self.assertIn("requestDraftId", html)
-        self.assertIn("requestSessionKey", html)
-        self.assertIn("state.articleDirty ? persistArticle(\"related_search\")", html)
-
-    def test_news_supplement_title_focuses_picked_dock(self) -> None:
-        html = self._index()
-        supplements_js = html.split("function renderNewsSupplements(", 1)[1].split("\nfunction ", 1)[0]
-        self.assertIn("focusNewsSupplement(item)", supplements_js)
-        self.assertIn("function focusNewsSupplement(item)", html)
-        self.assertIn("state.newsFocus", html)
-
     def test_favorites_open_redraws_focus_dock_and_refresh_keeps_favorite_focus(self) -> None:
         html = self._index()
         self.assertIn("var favorite = state.favoriteIds && state.favoriteIds[selectedId];", html)
@@ -2903,16 +2720,15 @@ class IndexPageContractTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
 
-    def test_article_session_survives_lane_switch_and_late_generation(self) -> None:
+    def test_late_generation_cannot_overwrite_a_newer_request(self) -> None:
+        """The per-request generation guards survive; the lane-era article
+        session cache does not, because nothing restores across pages."""
         html = self._index()
-        self.assertIn("articleSessions: {}", html)
-        self.assertIn("function articleSessionKey(", html)
-        self.assertIn("function rememberArticleSession(", html)
-        self.assertIn("function restoreArticleSession(", html)
-        self.assertIn("rememberArticleSession(state.lane)", html)
-        self.assertIn("restoreArticleSession(lane)", html)
-        self.assertIn("var requestLane = state.lane", html)
-        self.assertIn("storeGeneratedArticle(requestKey, data, requestItem)", html)
+        self.assertNotIn("articleSessions", html)
+        self.assertNotIn("articleLastKeys", html)
+        for retired in ("articleSessionKey", "currentArticleSessionKey",
+                        "storeGeneratedArticle", "articleTargetIds", "articleContextKey"):
+            self.assertNotIn(f"function {retired}(", html)
         self.assertIn("requestGen !== state.articleRequestGen", html)
         self.assertIn("collectGen: 0", html)
         self.assertIn("var requestGen = ++state.collectGen", html)
@@ -3149,7 +2965,6 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn('id="skills-gallery-counter"', skills)
         self.assertIn("function clampCarouselIndex", html)
         self.assertIn("function paintCarouselNav", html)
-        self.assertIn("function stepImagePicker", html)
         self.assertIn("imagePickerIndex", html)
         self.assertIn("githubGalleryIndex", html)
         self.assertIn("skillsGalleryIndex", html)
@@ -3205,29 +3020,38 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("function toggleSkillsBySource", html)
         self.assertIn("pack.manual_skills", html)
         chips_fn = html[
-            html.index("function renderSkillSourceChips(") : html.index("function renderCrawlSources(")
+            html.index("function renderSkillSourceChips(") : html.index("function skillIdentity(")
         ]
         self.assertIn("toggleSkillsBySource", chips_fn)
         self.assertIn("label + \" \" + counts[label]", chips_fn)
-        list_fn = html[
-            html.index("function renderSkillList(") : html.index("function toggleSkillIncluded(")
-        ]
-        self.assertIn("collectedSkills", html[html.index("function selectedSkills(") : html.index("function renderSkillList(")])
-        self.assertIn('type = "checkbox"', list_fn)
-        self.assertIn("skillPageUrl", list_fn)
+        self.assertIn('button.title = "点击全选或取消来自" + label + "的 skill"', chips_fn)
+        # Selecting by source must land on the same collector the gallery and
+        # the payload use, so a chip toggle really changes what gets generated.
+        toggle_fn = html[html.index("function toggleSkillsBySource(") : html.index("function renderSkillPackage(")]
+        self.assertIn("collectedSkills(pack)", toggle_fn)
+        self.assertIn("skill.selected = allOn ? false : true;", toggle_fn)
+        self.assertIn("renderSkillPackage(pack);", toggle_fn)
+        self.assertIn("collectedSkills", html[html.index("function selectedSkills(") : html.index("function toggleSkillsBySource(")])
         pack_fn = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
         self.assertIn("collectedSkills", pack_fn)
+        self.assertIn("selected_ids: selectedSkills(pack).map(skillIdentity)", html)
 
     def test_patch_144_poster_template_picker(self) -> None:
         html = self._index()
         self.assertIn('id="poster-template-dock"', html)
         self.assertIn("模版一", html)
         self.assertIn("模版二", html)
-        self.assertIn("body.lane-github #poster-template-dock", html)
-        self.assertIn("body.lane-skills #poster-template-dock", html)
+        # It used to be revealed only by a lane class; both poster studios are
+        # in the creation page now, so it is a plain visible control there.
+        self.assertNotIn("lane-github", html)
         self.assertIn("posterTemplate", html)
         self.assertIn("poster_template", html)
-        self.assertLess(html.index('id="poster-template-dock"'), html.index('id="hotspot-list"'))
+        self.assertRegex(html, r"#poster-template-dock\{[^}]*margin:")
+        self.assertNotIn("#poster-template-dock{display:none", html)
+        creation = html[html.index('id="page-creation"') : html.index('id="page-publishing"')]
+        self.assertIn('id="poster-template-dock"', creation)
+        self.assertLess(creation.index('id="poster-template-dock"'), creation.index('id="github-studio"'))
+        self.assertNotIn('id="poster-template-dock"', html[: html.index('id="page-creation"')])
         render_fn = html[
             html.index("function renderGithubWeeklyImages()") : html.index("function copyGithubXhs()")
         ]
@@ -3237,20 +3061,24 @@ class IndexPageContractTests(unittest.TestCase):
         ]
         self.assertIn("poster_template", skill_fn)
 
-    def test_patch_143_skill_selection_list(self) -> None:
+    def test_patch_143_skill_selection_surface(self) -> None:
+        """The collected-skill list became the studio gallery: selection is a
+        per-image check in the gallery plus a per-source toggle in the chips."""
         html = self._index()
-        self.assertLess(html.index('id="skill-source-bar"'), html.index('id="skill-list"'))
-        self.assertLess(html.index('id="skill-list"'), html.index('id="hotspot-list"'))
-        self.assertIn("function renderSkillList", html)
+        self.assertLess(html.index('id="skills-source-chips"'), html.index('id="skills-gallery"'))
         self.assertIn("function skillPageUrl", html)
         self.assertIn("function selectedSkills", html)
         self.assertIn("function skillIdentity", html)
-        self.assertIn("function toggleSkillIncluded", html)
-        self.assertIn("body.lane-skills #skill-list", html)
-        list_fn = html[html.index("function renderSkillList(") : html.index("function toggleSkillIncluded(")]
-        self.assertIn('type = "checkbox"', list_fn)
-        self.assertIn('target = "_blank"', list_fn)
-        self.assertIn("skillPageUrl", list_fn)
+        self.assertIn("function toggleSkillImage", html)
+        self.assertIn("function selectAllSkillImages", html)
+        # The retired hidden list and its per-row checkbox must not come back.
+        self.assertNotIn("function renderSkillList", html)
+        self.assertNotIn("function toggleSkillIncluded", html)
+        self.assertNotIn('id="skill-list"', html)
+        gallery_fn = html[html.index("function renderSkillsGallery(") : html.index("function toggleSkillImage(")]
+        self.assertIn('check.className = "gh-check"', gallery_fn)
+        self.assertIn("toggleSkillImage(image.id)", gallery_fn)
+        self.assertIn("skillPageUrl", html[html.index("function renderResourceResults(") : html.index("function renderResourceGithubResults(")])
         queued = html[html.index("function queuedSkillImages(") : html.index("function renderSkillsGallery(")]
         self.assertIn("selectedSkills", queued)
         render_fn = html[html.index("function renderSkillImages()") : html.index("function exportSkillImages(")]
@@ -3258,7 +3086,11 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertIn("selectedSkills", render_fn)
         self.assertIn("超过条目上限", render_fn)
         pack_fn = html[html.index("function renderSkillPackage(") : html.index("function queuedSkillImages(")]
-        self.assertIn("renderSkillList", pack_fn)
+        # The package render must paint the gallery and the source chips, not a
+        # retired hidden list.
+        self.assertIn("renderSkillsGallery()", pack_fn)
+        self.assertIn("renderSkillSourceChips(", pack_fn)
+        self.assertNotIn("renderSkillList", pack_fn)
         self.assertIn("linkifySkillArticle", html)
         self.assertIn('.replace(/\\n/g, "<br>")', html)
         self.assertIn("replacePlainToken", html)
@@ -3388,14 +3220,15 @@ class IndexPageContractTests(unittest.TestCase):
         html = self._index()
         helper = html.split("function clearFocusAfterGenerate()")[1].split("\nfunction ")[0]
         self.assertIn("state.item = null", helper)
-        self.assertIn("state.newsFocus = null", helper)
         self.assertIn("renderPickedDock()", helper)
-        # Must not disturb the article panel, the draft, the hooks or the multi-select set.
+        # Must not disturb the article panel, the draft or the multi-select set.
         self.assertNotIn("resetArticle()", helper)
         self.assertNotIn("state.draft", helper)
-        self.assertNotIn("clearHooks()", helper)
         self.assertNotIn("state.pickedIds", helper)
         self.assertNotIn("storeGeneratedArticle", helper)
+        # The retired 焦点 grouping and its hook clearing must not come back.
+        self.assertNotIn("newsFocus", helper)
+        self.assertNotIn("clearHooks", helper)
 
         generate_js = html.split("function generate()")[1].split("\nfunction persistArticle(")[0]
         self.assertIn('id="article-paste"', html)
@@ -3415,12 +3248,28 @@ class IndexPageContractTests(unittest.TestCase):
             generate_js.index("payload.item_id = state.item.item_id;"),
             generate_js.index("clearFocusAfterGenerate();"),
         )
-        self.assertIn("storeGeneratedArticle(requestKey, data, requestItem);", success_body)
+
+    def test_generate_sends_only_the_article_context_it_has(self) -> None:
+        """The payload carries a dossier id XOR an item/item_ids selection."""
+        html = self._index()
+        generate_js = html.split("function generate()")[1].split("\nfunction persistArticle(")[0]
+        self.assertIn("payload.dossier_id = dossierId;", generate_js)
+        self.assertIn("payload.item_ids = picked;", generate_js)
+        self.assertIn("payload.item_id = state.item.item_id;", generate_js)
+        # The retired payload fields must never be assembled again.
+        for retired in ("chosen_hooks", "related_items"):
+            self.assertNotIn(retired, generate_js)
+        # A late response for a superseded context must not overwrite the panel.
+        success = generate_js.split('waitApi("generate", "/api/articles", payload).then(')[1]
+        success_body = success.split("}).catch(")[0]
+        self.assertIn("requestGen !== state.articleRequestGen", success_body)
 
     def test_generate_still_sends_item_ids_from_picked_id_list_when_picks_exist(self) -> None:
         html = self._index()
         generate_js = html.split("function generate()")[1].split("function persistArticle(")[0]
-        self.assertIn("var picked = pickedIdList();", generate_js)
+        # A dossier article sends neither item ids nor an item: the dossier is the
+        # whole selection. Without one, the picked list wins over the single item.
+        self.assertIn("var picked = dossierId ? [] : pickedIdList();", generate_js)
         self.assertIn("if (picked.length >= 1)", generate_js)
         self.assertIn("payload.item_ids = picked;", generate_js)
         self.assertIn("payload.item_id = state.item.item_id;", generate_js)
@@ -3439,12 +3288,12 @@ class IndexPageContractTests(unittest.TestCase):
         self.assertGreater(html.index('id="picked-dock"'), html.index("</main>"))
         self.assertEqual(html.count('id="picked-dock"'), 1)
 
-    def test_picked_dock_css_hides_on_github_and_skills_lanes(self) -> None:
+    def test_picked_dock_css_is_lane_free_and_still_positioned(self) -> None:
         html = self._index()
-        self.assertRegex(
-            html,
-            r"body\.lane-github #picked-dock\s*,\s*body\.lane-skills #picked-dock\s*\{[^}]*display:\s*none\s*!important",
-        )
+        # The lane-scoped hiding rules retired with the lanes; the dock's own
+        # positioning contract is what still matters.
+        style = re.sub(r"/\*.*?\*/", "", html.split("</style>", 1)[0], flags=re.S)
+        self.assertNotIn("lane", style)
         dock_css = html.split("#picked-dock{")[1].split("}")[0]
         self.assertIn("position:fixed", dock_css)
         self.assertIn("bottom:", dock_css)
@@ -3573,3 +3422,62 @@ class IndexPageContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResourceWebBridgeTests(unittest.TestCase):
+    """The resource web leg goes through the retained engine's single bridge."""
+
+    def test_the_web_leg_uses_the_same_adapter_as_research(self) -> None:
+        import autoposting.research.adapters as adapters
+
+        calls: list[tuple[str, int]] = []
+
+        def fake_search(self, query, *, adapters, limit):  # noqa: A002 - protocol name
+            calls.append((query, limit))
+            return adapters_module.SearchResponse(
+                query=query,
+                results=({"title": "Guide", "url": "https://docs.example/guide"},),
+                adapters=adapters,
+            )
+
+        adapters_module = adapters
+        original = adapters.RelatedNewsSearchAdapter.search
+        adapters.RelatedNewsSearchAdapter.search = fake_search
+        try:
+            app = WebApp.__new__(WebApp)
+            app.skill_web_search = None
+            app.workbench = types.SimpleNamespace(page_fetcher=None)
+            payload = app._resource_web_adapter("ppt agent", limit=4)
+        finally:
+            adapters.RelatedNewsSearchAdapter.search = original
+
+        self.assertEqual([("ppt agent", 4)], calls)
+        self.assertEqual([{"title": "Guide", "url": "https://docs.example/guide", "source": "web", "kind": "website"}], payload["results"])
+
+    def test_a_degraded_bridge_response_does_not_raise(self) -> None:
+        import autoposting.background as background
+        import autoposting.research.adapters as adapters
+
+        def failing_searcher(*_args, **_kwargs):
+            raise background.RelatedSearchError(
+                "budget_timeout", detail="https://user:secret@host/path"
+            )
+
+        degraded = adapters.RelatedNewsSearchAdapter(searcher=failing_searcher).search(
+            "ppt agent", adapters=("related_search",), limit=2
+        )
+        self.assertTrue(degraded.degraded)
+
+        original = adapters.RelatedNewsSearchAdapter.search
+        adapters.RelatedNewsSearchAdapter.search = lambda *args, **kwargs: degraded
+        try:
+            app = WebApp.__new__(WebApp)
+            app.skill_web_search = None
+            app.workbench = types.SimpleNamespace(page_fetcher=None)
+            payload = app._resource_web_adapter("ppt agent", limit=2)
+        finally:
+            adapters.RelatedNewsSearchAdapter.search = original
+
+        self.assertTrue(payload["degraded"])
+        self.assertEqual("budget_timeout", payload["cause_code"])
+        self.assertNotIn("secret", json.dumps(payload))

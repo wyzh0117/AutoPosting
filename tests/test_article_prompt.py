@@ -55,22 +55,19 @@ class ArticlePromptDocTests(unittest.TestCase):
         self.assertEqual("docs", path.parent.name)
         text = load_article_prompt_doc()
         self.assertIn("文章生成基础约束", text)
-        self.assertEqual("article-v12", article_prompt_version())
+        self.assertEqual("article-v13", article_prompt_version())
         self.assertNotIn("一般人容易看漏的角度", text)
         expert = load_article_style_prompt("AI专家")
-        self.assertIn("chosen_hooks", expert)
+        # 找切口 retired: the style doc must not describe a chosen_hooks contract.
+        self.assertNotIn("chosen_hooks", expert)
+        self.assertIn("不要发明社会切口", expert)
         wechat = build_article_prompt(
             "wechat",
             ("lab_blog",),
             {
                 "title": "t",
                 "summary": "s",
-                "background": {
-                    "chosen_hooks": [
-                        {"phrase": "协和4+4试点班", "why": "公开检索出现争议"},
-                        {"phrase": "第二切口"},
-                    ]
-                },
+                "background": {"research_context": {"evidence": []}},
             },
             style="短句",
             preset_style=expert,
@@ -81,10 +78,10 @@ class ArticlePromptDocTests(unittest.TestCase):
         self.assertIn("写作风格要求：", wechat)
         self.assertIn("短句", wechat)
         self.assertIn('"title": "t"', wechat)
-        self.assertIn("协和4+4试点班", wechat)
-        self.assertIn("第二切口", wechat)
         self.assertGreater(wechat.rindex("键名必须是 title 和 body"), wechat.rindex('"summary": "s"'))
-        self.assertIn("主切口", wechat)
+        # 找切口 retired: the surviving opening rule must still be present.
+        self.assertNotIn("chosen_hooks", wechat)
+        self.assertIn("不要发明社会切口", wechat)
         self.assertIn("公开报道曾关注", wechat)
         preset = build_article_prompt(
             "wechat", ("lab_blog",), {"title": "t"}, preset_style=expert

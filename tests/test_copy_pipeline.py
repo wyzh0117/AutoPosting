@@ -259,35 +259,5 @@ class SkillFactsOnlyTests(unittest.TestCase):
         self.assertEqual("llm_api_failed", raised.exception.code)
 
 
-class HookExtractionFailFastTests(unittest.TestCase):
-    def test_invalid_json_raises_instead_of_empty_list(self) -> None:
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        service = LLMService(
-            _db(temp),
-            runner=FakeRunner(stdout="not-json"),
-            model="m",
-            base_url="https://api.example/v1",
-            api_key="sk",
-        )
-        with self.assertRaises(LLMError) as raised:
-            service.extract_hook_candidates("正文")
-        self.assertIn("LLM_HOOK_FAILED", raised.exception.reason)
-
-    def test_missing_candidates_array_raises(self) -> None:
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        service = LLMService(
-            _db(temp),
-            runner=FakeRunner(stdout="{}"),
-            model="m",
-            base_url="https://api.example/v1",
-            api_key="sk",
-        )
-        with self.assertRaises(LLMError) as raised:
-            service.extract_hook_candidates("正文")
-        self.assertIn("candidates", raised.exception.reason)
-
-
 if __name__ == "__main__":
     unittest.main()

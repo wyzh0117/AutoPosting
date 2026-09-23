@@ -1,6 +1,8 @@
 # AutoPosting MVP
 
-当前版本：`3.2.0`
+当前版本：`3.2.1`
+
+两轮重构状态：`Two-Iteration Refactor: CLOSED`。官方链路固定为 **Information Discovery → Event Cluster → Topic Dossier → Creation → Article Generation**：资讯页发现事件，研究页把选中事件变成可持久化的 Topic Dossier，创作页消费 Dossier 生成文章。「找切口」（hooks）、独立的相关搜索入口与 lane 产品机制都已从产品中删除，不再作为能力提供。
 
 本项目是一个本地优先、可配置的 AI 资讯自动化骨架。它使用 Python 3.11 标准库和 SQLite，覆盖 RSS 增量采集、规范化去重、热点汇总、事实清单、微信/小红书独立草稿、人工审批、本地发布包，以及可选的微信官方 live 发布适配器（需显式配置和选择）。小红书没有普通账号官方发文 API，始终走人工发布。
 
@@ -23,7 +25,7 @@ PYTHONPATH=src python3 -m autoposting.cli self-check --workspace data/self-check
 
 ## 配置
 
-- `config/sources.example.json`：来源注册表。默认启用一手 RSS（官方实验室 + 可靠媒体）以及 DeepSeek 官方文档 sitemap（`deepseek_official`，S1）。DeepSeek 没有公开 RSS，采集其官方 `api-docs.deepseek.com/sitemap.xml` 里的 `/news/news*` 静态页，不是二手聚合。`ithome` / `hn_frontpage` 带 `content_filter: "ai"`：标题必须是 AI 主题，早报、开售/优惠价、耳机手机汽车等零售稿即使正文里出现 “AI” 也会丢掉。生成文章前会读原文、查库内相关旧闻并做一次公开网页检索，把前因脉络写给没追过这件事的普通人。`aihot_aggregate` 保留但关闭。S4 讨论源（HN、可选 X 账号）可以直接写成观察帖；讨论量过阈值后该条升温为 S3 关注级，仍不是官方证实。X 抓取对齐 AIHOT 的方法：官方用户时间线、排除回复、丢掉纯转发、只收推文附图（`pbs.twimg.com/media`），不爬 X 网页、不把头像当配图。Bearer 只留进程内存；示例表登记了实验室官方号和观察号，默认关闭，填令牌后再启用。S4 讨论号可不做身份核验，S1/S2 仍要 `identity_verified=true`。成稿配图会丢掉头像、页眉图标和过小的方图。公众号没有公开 RSS，本仓库不抓。
+- `config/sources.example.json`：来源注册表。默认启用一手 RSS（官方实验室 + 可靠媒体）以及 DeepSeek 官方文档 sitemap（`deepseek_official`，S1）。DeepSeek 没有公开 RSS，采集其官方 `api-docs.deepseek.com/sitemap.xml` 里的 `/news/news*` 静态页，不是二手聚合。`ithome` / `hn_frontpage` 带 `content_filter: "ai"`：标题必须是 AI 主题，早报、开售/优惠价、耳机手机汽车等零售稿即使正文里出现 “AI” 也会丢掉。生成文章前会读原文、查库内相关旧闻并做一次公开网页检索，把前因脉络写给没追过这件事的普通人（手动选材的单条 / 多条融合路径仍如此；从 Topic Dossier 生成时不再二次检索，只消费 Dossier 已有证据）。`aihot_aggregate` 保留但关闭。S4 讨论源（HN、可选 X 账号）可以直接写成观察帖；讨论量过阈值后该条升温为 S3 关注级，仍不是官方证实。X 抓取对齐 AIHOT 的方法：官方用户时间线、排除回复、丢掉纯转发、只收推文附图（`pbs.twimg.com/media`），不爬 X 网页、不把头像当配图。Bearer 只留进程内存；示例表登记了实验室官方号和观察号，默认关闭，填令牌后再启用。S4 讨论号可不做身份核验，S1/S2 仍要 `identity_verified=true`。成稿配图会丢掉头像、页眉图标和过小的方图。公众号没有公开 RSS，本仓库不抓。
 - `.env.example`：部署时可能使用的本地路径和规则变量。当前 CLI 以命令行参数为准，不自动读取 `.env`。
 - `config/hotspot.example.json`：热点规则输入示例。
 - `config/facts.example.json`：结构化事实清单示例。
@@ -56,7 +58,7 @@ autoposting collect --db data/autoposting.db --sources config/sources.example.js
 autoposting daily-candidates --db data/autoposting.db --hours 24
 ```
 
-测试或记录热点候选：
+测试或记录事件候选：
 
 ```bash
 autoposting hotspot-check --input config/hotspot.example.json
@@ -103,20 +105,23 @@ macOS 可直接双击项目根目录的 `AutoPosting服务控制.command`。控�
 autoposting web --db data/autoposting.db --sources config/sources.example.json --port 8080
 ```
 
-浏览器打开 `http://127.0.0.1:8080/` 即单页工作台。页面按新的信息架构组织：**首页、资讯、资源、创作、发布、信息源、运行记录、设置**。旧的「热点候选 / 观点候选 / GitHub 周榜 / Skill 查找器」四个一级栏目已删除——社区来源并入统一资讯探索，GitHub 周榜降级为资源探索里的 Preset，Skill 只是资源探索的一种 Resource Type。资讯页以 Event Cluster 为展示单位，官方源与 Reddit 可在一次采集中合并并保留 Collection Run 记录；研究支持从多个事件生成可持久化 Dossier。资源页用自然语言同时搜索 Repo / Skill / Web，结果是与研究共享的 ResourceSet（含来源状态与诊断）；需要出图时从资源页送入创作页的「GitHub 周榜出图工作台」或「Skill 海报出图工作台」，两条工作台继续复用原来的 3:4 视觉、`SKILL.md`/monorepo/粘贴链接能力。发布页集中列出草稿、审批状态与最近发布尝试，微信与小红书动作仍复用同一条发布链路。创作页保留左右两栏：左栏默认高度刚好露出两条候选，其余在栏内滚动；原文配图收在独立配图栏内滚动，照片再多也不靠整页滚轮翻。标题和正文可在文章区修改并保存；模型选择和发布位于文章区右下角。文章生成区正下方提供独立的原生模型聊天框，聊天记录在首次输入/输出前不显示且只保存在当前浏览器会话；输出出现后页面保持上部尺寸并向下自然扩展，由页面滚动承载长对话。顶栏「设置」分别配置文章与翻译模型、聊天模型、微信公众号 API 和小红书账号；模型接口元数据持久化到 SQLite，API Key 与平台账号凭据存入 macOS 钥匙串，重启后自动恢复，可手动删除。小红书仍只生成本地包，需到官方创作中心人工提交。
+浏览器打开 `http://127.0.0.1:8080/` 即单页工作台。页面按信息架构组织：顶栏八个栏目**首页、资讯、资源、创作、发布、信息源、运行记录、设置**，对应 `data-app-page="home|news|resources|creation|publishing|sources|runs|settings"`；另有 `data-app-page="research"` 的「事件研究」页，由资讯页的「研究已选事件」进入，不在顶栏。旧的「热点候选 / 观点候选 / GitHub 周榜 / Skill 查找器」四个一级栏目已删除——社区来源并入统一资讯探索，GitHub 周榜降级为资源探索里的 Preset，Skill 只是资源探索的一种 Resource Type；`[data-lane]` 页签、`legacy-lane-tabs`、`body.lane-*` 与 lane 状态一并删除，编辑源 / 社区源的区分改由资讯工具栏的「来源范围」（`#news-scope-select`，`scope=all|official|community`）承担。资讯页以 Event Cluster 为展示单位，官方源与 Reddit 可在一次采集中合并并保留 Collection Run 记录；选中事件后点「研究已选事件」调用 `POST /api/research`，研究页展示 Topic Dossier 的状态、事件 / 主题 / 证据统计与证据清单、诊断。资源页用自然语言同时搜索 Repo / Skill / Web，结果是与研究共享的 ResourceSet（含来源状态与诊断）；需要出图时从资源页送入创作页的「GitHub 周榜出图工作台」或「Skill 海报出图工作台」，两条工作台继续复用原来的 3:4 视觉、`SKILL.md`/monorepo/粘贴链接能力，但只做「HTML/CSS → 浏览器截图」，Skill 的查找 / 粘贴输入留在资源探索页（`#resource-query` / `#resource-pasted-text`），工作室只按传入的关键词或链接出图，收录来源与降级说明在 `#skills-sources`（`#skills-source-chips` / `#skills-degraded-note`）里可见，GitHub Token 只在设置页配置。研究页的「进入创作」（`#research-to-creation-btn`，有 Dossier 后才可点）把当前 Dossier 作为 `ArticleGenerationContext` 带入创作页，文章区顶部出现 `#article-context` 横幅（可点 `#article-context-clear` 清除），此时不必再挑候选 item 就能生成文章；不带 Dossier 时仍可手动选 item 生成。发布页集中列出草稿、审批状态与最近发布尝试，微信与小红书动作仍复用同一条发布链路。创作页只有一栏文章区（候选列表在资讯页，选中状态跨页保留）：标题和正文可在文章区修改并保存；原文配图收在折叠的配图栏（`#image-picker`）内滚动，照片再多也不靠整页滚轮翻；模型选择和发布位于文章区；两块出图工作台在文章区下方。顶栏「设置」配置文章 / 翻译 / 榜单模型、写作风格、GitHub Token、微信公众号 API、小红书账号与 X 读取令牌（`POST /api/chat/model` 与 `POST /api/chat` 仍作为接口保留，但工作台当前没有聊天输入框）；模型接口元数据持久化到 SQLite，API Key 与平台账号凭据存入 macOS 钥匙串，重启后自动恢复，可手动删除。小红书仍只生成本地包，需到官方创作中心人工提交。
 
 `--host` 只接受 `127.0.0.1` 或 `localhost`，其他值直接拒绝，避免无认证暴露。端点为：
 
 ```bash
 curl http://127.0.0.1:8080/api/status
-curl -X POST http://127.0.0.1:8080/api/collect -d '{"hours": 4}'
+curl 'http://127.0.0.1:8080/api/hotspots?hours=24&scope=official'
+curl -X POST http://127.0.0.1:8080/api/collect -H 'Content-Type: application/json' -d '{"hours": 4, "scope": "all"}'
+curl -X POST http://127.0.0.1:8080/api/research -H 'Content-Type: application/json' -d '{"event_ids": ["EVENT_ID"], "query": "可选：限定研究问题"}'
+curl http://127.0.0.1:8080/api/research/DOSSIER_ID
 curl -X POST http://127.0.0.1:8080/api/schedule -d '{"draft_id": "DRAFT_ID", "platform": "wechat", "live": true, "run_at": "2026-08-13T20:00:00"}'
 curl -X POST http://127.0.0.1:8080/api/models -H 'Content-Type: application/json' -d '{"base_url": "https://api.example/v1", "api_key": "..."}'
 curl -X POST http://127.0.0.1:8080/api/model -H 'Content-Type: application/json' -d '{"model": "selected-model", "base_url": "https://api.example/v1", "api_key": "...", "effort": "high"}'
 curl -X POST http://127.0.0.1:8080/api/chat/model -H 'Content-Type: application/json' -d '{"model": "chat-model", "base_url": "https://api.example/v1", "api_key": "..."}'
 curl -X POST http://127.0.0.1:8080/api/chat -H 'Content-Type: application/json' -d '{"messages": [{"role": "user", "content": "你好"}]}'
-curl -X POST http://127.0.0.1:8080/api/hooks/find -H 'Content-Type: application/json' -d '{"item_id": "ITEM_ID"}'
-curl -X POST http://127.0.0.1:8080/api/articles -H 'Content-Type: application/json' -d '{"item_id": "ITEM_ID", "platform": "wechat", "model": "selected-model", "effort": "high", "chosen_hooks": []}'
+curl -X POST http://127.0.0.1:8080/api/articles -H 'Content-Type: application/json' -d '{"dossier_id": "DOSSIER_ID", "platform": "wechat", "model": "selected-model", "effort": "high"}'
+curl -X POST http://127.0.0.1:8080/api/articles -H 'Content-Type: application/json' -d '{"item_id": "ITEM_ID", "platform": "wechat", "model": "selected-model", "effort": "high"}'
 curl -X POST http://127.0.0.1:8080/api/articles/edit -d '{"draft_id": "DRAFT_ID", "title": "...", "body": "... AIGC ... SOURCE_ID ..."}'
 curl -X POST http://127.0.0.1:8080/api/approve -d '{"draft_id": "DRAFT_ID", "reviewer": "human"}'
 curl -X POST http://127.0.0.1:8080/api/config -d '{"platform": "wechat", "app_id": "...", "app_secret": "...", "author": "..."}'
@@ -133,16 +138,18 @@ curl http://127.0.0.1:8080/api/drafts?limit=20
 curl http://127.0.0.1:8080/api/drafts/DRAFT_ID
 ```
 
-- `collect` 默认强制刷新已启用一手 RSS（`force: true`）；可传 `source_id` 只刷新一个源。不抓 AIHOT 聚合页或 API。响应含 `rankings.heat`（独立来源数优先，其次新旧）和 `rankings.time`（新旧优先，其次来源数），以及 `sources` 健康状态（`ok`/`error`/`stale`/`never`/`disabled`）和 `collection.inserted`。`candidates` 仍是时间优先列表，兼容旧调用。窗口内最多各取 10 条，不是 `hotspot-check` 的统计显著热点。刷新全部只抓源、不阻塞翻译，列表先显示库里已有候选。`hours` 接受 1–720；工作台默认 4 小时，并提供 4/6/24/72/168/720 与自定义。左栏上方是话题/新闻卡片；底部折叠的是订阅源健康（抓取成功 / 只刷这个），不是新闻标题。左栏可切换热度优先 / 时间优先。网页逐步点选验收见 `docs/WEB_FUNCTIONAL_TEST.md`。
+- `collect` 默认强制刷新已启用一手 RSS（`force: true`）；可传 `source_id` 只刷新一个源。不抓 AIHOT 聚合页或 API。响应含 `rankings.heat`（独立来源数优先，其次新旧）和 `rankings.time`（新旧优先，其次来源数），以及 `sources` 健康状态（`ok`/`error`/`stale`/`never`/`disabled`）和 `collection.inserted`。`candidates` 仍是时间优先列表，兼容旧调用。窗口内最多各取 10 条，不是 `hotspot-check` 的统计显著热点。刷新全部只抓源、不阻塞翻译，列表先显示库里已有候选。`hours` 接受 1–720；工作台默认 4 小时，并提供 4/6/24/72/168/720 与自定义。资讯页是单栏：工具栏（来源范围、时间范围、刷新全部、翻译标题、排序、打开原文、研究已选事件）下面是话题/新闻卡片列表，列表底部折叠的是订阅源健康（抓取成功 / 只刷这个），不是新闻标题；排序可在热度优先 / 时间优先之间切换。网页逐步点选验收见 `docs/WEB_FUNCTIONAL_TEST.md`。
+- `scope` 取代了旧的 lane 页签，是编辑源 / 社区源的唯一产品概念：`scope=all`（默认，全部来源）、`official`（仅订阅源，即非 reddit 类型）、`community`（仅社区来源，即 reddit 类型）。`GET /api/hotspots?hours=24&scope=official` 用它过滤窗口，`POST /api/collect` 用它决定本次真正抓哪些源（`{"hours": 4, "scope": "community"}`）。非法值报错而不静默放宽。兼容说明：`lane=hotspots|viewpoints|mixed` 仍作为**薄 HTTP 边界别名**被接受（`GET /api/hotspots` 的查询参数、`POST /api/collect` 的请求体），分别映射到 `official` / `community` / `all`；同时传 `scope` 与 `lane` 时以 `scope` 为准。映射实现在 `src/autoposting/legacy_compat.py`，内部代码只说 `scope`，lane 已不是产品概念。
+- `research` 是 Topic Dossier 的唯一入口。`POST /api/research` 接收 `{"event_ids": ["EVENT_ID", ...], "query": "可选：限定研究问题"}`（`event_ids` 必须是非空字符串数组，否则以 `event_ids_must_be_list` / `event_ids_count_invalid` / `event_id_invalid` 等稳定码报 400），由 Research Service 统一编排：Planner 出计划 → Web 检索（复用保留的 related-search 引擎，`src/autoposting/research/adapters.py` 的 `RelatedNewsSearchAdapter` 即其适配器）→ Reader 读正文 → Decision/Jev 逐条判断证据，最后产出 `schema_version = "topic-dossier-v1"` 的 Dossier（含 `dossier_id`/`title`/`query`/`event_ids`/`topics`/`plan`/`evidence`/`groups`/`status`/`degraded`/`diagnostics`/`created_at`）并持久化到 SQLite。`GET /api/research?limit=N` 列出最近 Dossier（1–100），`GET /api/research/{dossier_id}` 回读单份。Jev 不可用时退回 objective-only 并保留诊断，单个来源失败不拖死整次研究。
 - `resources` 是资源探索的统一入口，替代原来的「GitHub 周榜 / Skill 查找器」两个一级栏目。`POST /api/resources/discover` 接收 `{"query":"自然语言需求","adapters":["github","skills","web"],"pasted_text":"可选 Skill 链接","limit":20,"persist":true}`；`preset":"github_weekly"` 时忽略 query，走原来的周榜抓取（`本周 AI 新项目`）。结果是一个版本化 ResourceSet：包含 Planner 计划、每个来源的 `adapter_status`（requested/attempted/status/count/cause_code）、脱敏 `diagnostics`、候选（kind = repo/skill/website/tool/other、客观分、两轮 Decision/Jev 判断与 `selected`）和 `degraded` 标记。`GET /api/resources?limit=N` 列出已持久化的 ResourceSet，`GET /api/resources/{set_id}` 回读，`POST /api/resources/{set_id}/refresh` 只回读不重跑外部搜索。核心约束：Jev 不可用时退回 objective-only 并保留诊断，单个来源失败不拖死整组结果；未知/损坏 payload 报稳定错误而不是静默为空。
 - `drafts` 是发布页的数据入口。`GET /api/drafts?limit=N` 返回最近草稿摘要（`draft_id`/`event_id`/`platform`/`title`/`status`/审批信息/时间戳/最近一次发布尝试 `attempt_status`），`GET /api/drafts/{draft_id}` 返回可载入创作页的完整草稿（标题、正文、来源 ID、配图选择、小红书卡片）。发布动作仍走既有的 `/api/approve`、`/api/publish`、`/api/schedule`，安全边界不变。
-- `github-weekly` 的出图能力保留在创作页的「GitHub 周榜出图工作台」，发现入口改由资源探索的 `github_weekly` preset 承担。`POST /api/github-weekly` 只抓仓库和文案，不生成图片。优先本周新建的 AI 仓库（Search `created:>=7d`），不够再用 Trending weekly 补齐，固定前 10。「生成图片」走 `POST /api/github-weekly/render`：出图只有一条链路——HTML/CSS 页面排版后用本机 Chrome 截 PNG，画布统一 3:4（1080×1440），周榜封面、项目卡与项目海报同为 1080×1440，小红书纸卡仍是 9:16 手写纸比例。工作室里可选浅色/暗色，以及主色、副色、强调色三个色盘；这三色写入 Design Token 后改卡片背景、表面和强调色。3 列 3:4 网格平铺，可点大图、勾选，只导出已勾选且保持网页顺序。设置里的「榜单模型」只改写简介四句。
-- `skills` 是资源探索里的一种 Resource Type，海报出图保留在创作页的「Skill 海报出图工作台」；原来的独立「Skill 查找器」一级页面已删除。`POST /api/skills/search` 接收 `{"query":"..."}`（1–200 字），**按用户自己的关键词抓取**：按空格 / 逗号 / 分号 / 斜杠切词（最多 6 个，去重保序），一个关键词一条检索 lane，同时打 GitHub 代码检索、skills.sh 站内搜索、网页检索，外加 `anthropics/skills` 兜底清单；质量门槛过滤后写入 `output/skills/<hash>/`，并生成总览文。**查找不再需要模型**（模型只在写介绍文时用，没配模型时介绍文按工作流环节机械生成；`coverage` 参数可显式传一份检索计划）。查找是**累加**的：上一轮的 skill 会重新归档保留，`POST /api/skills/clear` 回到空盘（保留标题）。`POST /api/skills/paste` 接收 `{"links":"..."}`（≤20000 字，一次最多 16 条，可多行/多个 GitHub 或 skills.sh 链接），解析出的 skill 与检索到的一样进入同一个包：按内容归到最合适的工作流环节（名字 > 描述 > `SKILL.md` 正文加权匹配；匹配不上进兜底桶「通用工具」）、抓 `SKILL.md`、重写介绍文、参与缩略图上限排序；同一个 monorepo 里的多个 skill 目录各算一条，重复粘贴只替换不翻倍，超出 16 条的以 `too_many` 报告。`POST /api/skills/github-token` 保存/清除可选 GitHub Token（`{"token":""}` 为清除），只回 `{configured}`，不回显明文，清空后回落环境变量 `AUTOPOSTING_GITHUB_TOKEN` / `GITHUB_TOKEN`。`POST /api/skills/title` 接收 `{"title":"..."}`（≤120 字）保存用户标题：它决定封面海报大字与介绍文标题，且查找 / 粘贴 / 清空都不会冲掉它。`POST /api/skills/render` 把包内**全部** skill（检索到的 + 粘贴的）汇总成一份、按工作流顺序排好，出一张封面海报和每个 skill 一张海报，画布 3:4（1080×1440），项目卡复用周榜视觉。`GET /api/skills` 读上次结果，并返回 `crawl_sources` / `crawl_source_count`（当前配置的自动抓取源）。资源页负责「找」，工作室负责「出图」：`送入 Skill 出图` 会把资源页的关键词/粘贴链接接到同一条 skills 管线，再跳到创作页生成海报。来源降级（`degraded_reasons`）与订阅源列表仍由保留的隐藏区块承载，不再作为独立栏目展示。出图依赖本机 Chrome 写系统临时目录，服务不要跑在只允许写工作区的受限沙箱里；`explain_chrome_failure` 会把 Chrome 的原始报错翻成中文提示。
+- `github-weekly` 的出图能力保留在创作页的「GitHub 周榜出图工作台」，发现入口改由资源探索的 `github_weekly` preset 承担。`POST /api/github-weekly` 只抓仓库和文案，不生成图片。优先本周新建的 AI 仓库（Search `created:>=7d`），不够再用 Trending weekly 补齐，固定前 10。「生成图片」由界面逐张调用 `POST /api/github-weekly/image`（`{id, theme, palette, poster_template}`），批量入口 `POST /api/github-weekly/render` 仍保留给脚本用：出图只有一条链路——HTML/CSS 页面排版后用本机 Chrome 截 PNG（装了 Playwright 时优先走它，否则回落 Chrome/Chromium/Edge），画布统一 3:4（1080×1440），周榜封面、项目卡与项目海报同为 1080×1440，小红书纸卡仍是 9:16 手写纸比例。工作室里可选浅色/暗色，以及主色、副色、强调色三个色盘；这三色写入 Design Token 后改卡片背景、表面和强调色。3 列 3:4 网格平铺，可点大图、勾选，只导出已勾选且保持网页顺序。设置里的「榜单模型」只改写简介四句。
+- `skills` 是资源探索里的一种 Resource Type，海报出图保留在创作页的「Skill 海报出图工作台」；原来的独立「Skill 查找器」一级页面已删除。`POST /api/skills/search` 接收 `{"query":"..."}`（1–200 字），**按用户自己的关键词抓取**：按空格 / 逗号 / 分号 / 斜杠切词（最多 6 个，去重保序），一个关键词一条检索通道，同时打 GitHub 代码检索、skills.sh 站内搜索、网页检索，外加 `anthropics/skills` 兜底清单；质量门槛过滤后写入 `output/skills/<hash>/`，并生成总览文。**查找不再需要模型**（模型只在写介绍文时用，没配模型时介绍文按工作流环节机械生成；`coverage` 参数可显式传一份检索计划）。查找是**累加**的：上一轮的 skill 会重新归档保留，`POST /api/skills/clear` 回到空盘（保留标题）。`POST /api/skills/paste` 接收 `{"links":"..."}`（≤20000 字，一次最多 16 条，可多行/多个 GitHub 或 skills.sh 链接），解析出的 skill 与检索到的一样进入同一个包：按内容归到最合适的工作流环节（名字 > 描述 > `SKILL.md` 正文加权匹配；匹配不上进兜底桶「通用工具」）、抓 `SKILL.md`、重写介绍文、参与缩略图上限排序；同一个 monorepo 里的多个 skill 目录各算一条，重复粘贴只替换不翻倍，超出 16 条的以 `too_many` 报告。`POST /api/skills/github-token` 保存/清除可选 GitHub Token（`{"token":""}` 为清除），只回 `{configured}`，不回显明文，清空后回落环境变量 `AUTOPOSTING_GITHUB_TOKEN` / `GITHUB_TOKEN`。`POST /api/skills/title` 接收 `{"title":"..."}`（≤120 字）保存用户标题：它决定封面海报大字与介绍文标题，且查找 / 粘贴 / 清空都不会冲掉它。`POST /api/skills/render` 把包内**全部** skill（检索到的 + 粘贴的）汇总成一份、按工作流顺序排好，出一张封面海报和每个 skill 一张海报，画布 3:4（1080×1440），项目卡复用周榜视觉。`GET /api/skills` 读上次结果，并返回 `crawl_sources` / `crawl_source_count`（当前配置的自动抓取源）。资源页负责「找」，工作室负责「出图」：查找 / 粘贴的输入框在资源探索页（`#resource-query` / `#resource-pasted-text`），工作室的 `searchSkills(query)` / `pasteSkills(links)` 只消费调用方传入的关键词或链接；`送入 Skill 出图` 会把资源页的关键词/粘贴链接接到同一条 skills 管线，再跳到创作页生成海报。收录来源与降级说明在工作室**可见**：`#skills-sources` 里每个来源一颗 chip（`#skills-source-chips`，其中「手动粘贴」是虚线条，点一下可全选/取消该来源的 skill），`#skills-degraded-note` 用中文说明哪些来源本次没返回（原始 `degraded_reasons` 记号在该行 tooltip 里）；`#skills-clear-btn` 清空收录，GitHub Token 只在设置页的 `#settings-github-token` / `#settings-save-github-token` 配置，创作页不再有第二个 Token 输入框。出图依赖本机 Chrome 写系统临时目录，服务不要跑在只允许写工作区的受限沙箱里；`explain_chrome_failure` 会把 Chrome 的原始报错翻成中文提示。
 - GitHub 接口失败会分类上报：`degraded_reasons` 里是 `github:rate_limited` / `github:timeout` / `github:unreachable` / `github:server_error` 等记号（页面翻成中文，原始记号在 tooltip），404 不算来源故障。未鉴权 `api.github.com` 只有 60 次 core/小时与 10 次 search/分钟，配额耗尽时该额度桶在本次运行内熔断，候选改走 `raw.githubusercontent.com` 探测（不占 API 额度）；配置 GitHub Token 后额度为 5000 次/小时。
-- `models` 用 Hermes 式三步添加接口：接口地址 + API Key → 连接并拉取模型 → 点「用于文章」「用于翻译」「用于对话」或「用于榜单」。四个入口可共用同一接口。`model` 保存前会对所选模型执行一次真实 `/chat/completions` 请求；验证失败不会覆盖旧配置。文章与翻译只使用验证成功的模型，不再回退到预设 DeepSeek 模型。`effort` 支持 `none|minimal|low|medium|high|xhigh|max|ultra`，非 `none` 时以 `reasoning_effort` 发送。
-- `chat/model` 独立设置聊天模型的 OpenAI 兼容 `model`、`base_url` 和 `api_key`，不会改变文章生成或热点翻译模型；`chat` 接收最多 50 条 `user`/`assistant` 消息，每条最多 20,000 字符，原样转发给聊天模型。聊天记录不写入 SQLite、日志或响应；模型接口元数据写入 SQLite，API Key 只写入 macOS 钥匙串；请求体上限为 4 MiB。
-- `hooks/find` **已弃用（薄兼容入口，不再是推荐流程）**：它仍在创作页提供「找切口」按钮给文章素材做补充，但产品概念已由 `研究 / Topic Dossier` 取代，新流程请从资讯事件发起研究。行为不变：对已选 item 抽点并现场搜 `{短语} 争议`，返回可多选切口卡；一张没有则 `hooks` 为空并给稳定文案「未发现可用切口」。检索页只当素材，不写入事实清单、不分配 `source_id`。不点「找切口」或点「生成文章」都不会偷偷搜索。
-- `articles` 从所选 item 构建可追溯事实清单，通过来源门禁后生成中文平台稿；微信和小红书使用独立事件，可分别审批发布。可选 `chosen_hooks` 按勾选顺序回传完整切口卡。文章模型的共享调教在 `docs/ARTICLE_BASE_PROMPT.md`，可选写作类型在 `docs/article_styles/` 下的具名文件（AI专家、经验分享、klinkenborg）；下拉值为 `AI专家`、`经验分享` 与 `klinkenborg_style`，默认 AI专家。一次点击只生成一版。微信返回 `{title, body}`。小红书同一次调用返回 `{title, body, caption}`：`body` 是完整稿，排进 9:16 手写纸插图（封面=标题+所选封面图，没有封面图则标题+第一段；每张最上是 id/头像占位）；`caption` 是帖子正文。缺少 caption 仍生成：稿子 ≤500 字则正文完整引用，超过 500 字则提炼吸引阅读的要点。社区来源的原帖若含 GitHub 等作品外链，会抓取 README 并作为 `linked_works` 交给经验分享拆解（这是什么 / 场景 / 如何使用 / 亮点）。成稿区插图每行 3 张，文字区输出 caption。设置页“写作风格”是最高优先级的自由文本覆盖层。生成时抽取原文全部候选图（最多 16 张，不使用 AI 生图），默认只勾选封面，正文图保持未选，由作者按需勾选。工作台可预览缩略图、点击看大图、勾选封面/正文并调整正文顺序。`POST /api/articles/images` 保存选择；微信 live 把已选封面上传为永久素材（`material/add_material`），已选正文图经 `media/uploadimg` 按顺序填入。没有已选配图时才生成本地标题大字报。模型不可用时返回稳定 502 `article_generation_failed`，并附底层 `error_code` 和安全 `error_reason`，不落草稿。
+- `models` 用 Hermes 式三步添加接口：接口地址 + API Key → 连接并拉取模型 → 点「用于文章」「用于翻译」或「用于榜单」（聊天模型不在这三个入口里，走 `POST /api/chat/model`）。三个入口可共用同一接口。`model` 保存前会对所选模型执行一次真实 `/chat/completions` 请求；验证失败不会覆盖旧配置。文章与翻译只使用验证成功的模型，不再回退到预设 DeepSeek 模型。`effort` 支持 `none|minimal|low|medium|high|xhigh|max|ultra`，非 `none` 时以 `reasoning_effort` 发送。
+- `chat/model` 独立设置聊天模型的 OpenAI 兼容 `model`、`base_url` 和 `api_key`，不会改变文章生成或热点翻译模型；`chat` 接收最多 50 条 `user`/`assistant` 消息，每条最多 20,000 字符，原样转发给聊天模型。工作台没有聊天输入框，这两个接口供脚本或外部调用。聊天记录不写入 SQLite、日志或响应；模型接口元数据写入 SQLite，API Key 只写入 macOS 钥匙串；请求体上限为 4 MiB。
+- `hooks/find` 与「找切口」整条链都已**删除**，不是弃用：`POST /api/hooks/find`、`src/autoposting/hooks.py` 整个模块、`Workbench.find_hooks`、`App.find_hooks`、创作页的「找切口」按钮与 `#hook-list`、`hooks` 等待状态、文章请求体里的 `chosen_hooks` 字段都不存在了。文章素材只能来自 Topic Dossier（`dossier_id`）或手动选中的 item，创作页不会再现场搜索。相关搜索也不再是产品能力：`POST /api/related-search`、`App.related_search`、`Workbench.related_search`、资讯页的 `#related-search-btn` 与整个 `#news-supplement-*` 抽屉都已删除；引擎（`src/autoposting/background.py` 的 `search_related_news` 等）只作为 Research Service 的 Web 检索适配器保留，没有自己的 HTTP 端点。
+- `articles` 有两条输入路径，最终都落到同一个 `ArticleGenerationContext`（`src/autoposting/article_context.py`，`schema_version = "article-generation-context-v1"`；声明的来源类型是 `topic_dossier` / `resource_set` / `manual`）。传 `dossier_id` 走官方研究路径：从持久化的 Topic Dossier 重建上下文，**不需要候选 item**，也不会再发起任何检索（无找切口、无相关搜索）；Dossier 缺失或不可用时返回 400，`error` 是稳定码（`dossier_id_required` / `dossier_not_found` / `dossier_invalid` / `dossier_evidence_required` / `dossier_sources_required` 等）、`error_reason` 是中文说明、`error_type` 为 `ArticleContextError`。不传 `dossier_id` 时走保留的手动路径：`item_id`（单条）或 `item_ids`（多条融合），从所选 item 构建可追溯事实清单，通过来源门禁后生成中文平台稿；微信和小红书使用独立事件，可分别审批发布。文章模型的共享调教在 `docs/ARTICLE_BASE_PROMPT.md`，可选写作类型在 `docs/article_styles/` 下的具名文件（AI专家、经验分享、klinkenborg）；下拉值为 `AI专家`、`经验分享` 与 `klinkenborg_style`，默认 AI专家。一次点击只生成一版。微信返回 `{title, body}`。小红书同一次调用返回 `{title, body, caption}`：`body` 是完整稿，排进 9:16 手写纸插图（封面=标题+所选封面图，没有封面图则标题+第一段；每张最上是 id/头像占位）；`caption` 是帖子正文。缺少 caption 仍生成：稿子 ≤500 字则正文完整引用，超过 500 字则提炼吸引阅读的要点。社区来源的原帖若含 GitHub 等作品外链，会抓取 README 并作为 `linked_works` 交给经验分享拆解（这是什么 / 场景 / 如何使用 / 亮点）。成稿区插图每行 3 张，文字区输出 caption。设置页“写作风格”是最高优先级的自由文本覆盖层。生成时抽取原文全部候选图（最多 16 张，不使用 AI 生图），默认只勾选封面，正文图保持未选，由作者按需勾选。工作台可预览缩略图、点击看大图、勾选封面/正文并调整正文顺序。`POST /api/articles/images` 保存选择；微信 live 把已选封面上传为永久素材（`material/add_material`），已选正文图经 `media/uploadimg` 按顺序填入。没有已选配图时才生成本地标题大字报。模型不可用时返回稳定 502 `article_generation_failed`，并附底层 `error_code` 和安全 `error_reason`，不落草稿。
 - `articles/edit` 保存人工标题/正文；修改内容会撤销旧审批。标题、AIGC 声明和精确来源 ID 在保存前校验。
 - `config` 的微信凭据和平台账号写入 macOS 钥匙串（响应只回是否已配置）；模型接口元数据写入 SQLite，模型 API Key 写入 macOS 钥匙串。任何响应只回非敏感字段。
 - 本补丁直接复用现有 OpenAI 兼容 `/chat/completions` 入口，不部署 `new-api`；需要统一计费、多租户、渠道路由或重试策略时再单独部署网关。
@@ -153,7 +160,7 @@ curl http://127.0.0.1:8080/api/drafts/DRAFT_ID
 
 ## 视觉出版
 
-GitHub 周榜的中文信息图不再靠图像模型排字。`docs/image_prompts/` 拆成五层：Design System、Component Library、Page Schema、Content Schema、Rendering Rules。渲染器在 `src/autoposting/visual/`，画布统一输出 1080×1440（3:4）HTML，再用本机 Chrome 或可选 Playwright 截 PNG。1.3.0 已删除图像模型层：出图只有一条链路（HTML/CSS 页面 → 浏览器截图），设置页不再有「出图模型」，也不得再新增图像模型调用点。
+GitHub 周榜与 Skill 海报的中文信息图都不靠图像模型排字。`docs/image_prompts/` 拆成五层：Design System、Component Library、Page Schema、Content Schema、Rendering Rules。渲染器在 `src/autoposting/visual/`，画布统一输出 1080×1440（3:4）HTML，再用本机 Chrome 或可选 Playwright 截 PNG；两条视觉产线只有一份渲染实现——`src/autoposting/web.py` 的周榜工作台调用 `render_weekly_visual`，Skill 工作室的 `render_skill_package` 也复用它。1.3.0 已删除图像模型层（原 `STYLE.md`/`cover.md`/`poster.md`/`skill_cover.md` 与 `render_weekly_images`/`load_image_prompt` 只剩迁移记录）：出图只有一条链路（HTML/CSS 页面 → 浏览器截图），设置页不再有「出图模型」，也不得再新增图像模型调用点；`src/autoposting/image_gen.py` 只生成页面计划（`id`/`kind`/`rank`/`title`，没有 `prompt` 字段）。
 
 ```bash
 PYTHONPATH=src python3 -m autoposting.cli visual-render --example --out output/visual
@@ -170,27 +177,32 @@ PYTHONPATH=src python3 -m autoposting.cli visual-render --example --out output/v
 ## 数据流与状态
 
 ```text
+CLI / 手动路径：
 Schedule -> RSS -> normalize -> deduplicate -> topic -> event
          -> fact list -> WeChat/Xiaohongshu drafts -> validation
          -> human approval -> local dry-run package -> audit state
+
+Web 官方路径：
+Information Discovery -> Event Cluster -> Topic Dossier
+         -> ArticleGenerationContext -> Draft -> human approval -> publish
 ```
 
-核心表为 `sources`、`items`、`events`、`claims`、`drafts`、`publication_attempts`、`model_endpoints`、`model_endpoint_purposes`；`item_sources` 保留跨来源重复内容的完整溯源关系；`llm_cache` 保存模型翻译/文章结果以控制成本。模型 API Key 不写入 SQLite。
+核心表为 `sources`、`items`、`events`、`claims`、`drafts`、`publication_attempts`、`model_endpoints`、`model_endpoint_purposes`；Topic Dossier 存在 `topic_dossiers` 表里（`dossier_json` 保存整份 `topic-dossier-v1`，回读走 `GET /api/research/{dossier_id}`）；`item_sources` 保留跨来源重复内容的完整溯源关系；`llm_cache` 保存模型翻译/文章结果以控制成本。模型 API Key 不写入 SQLite。
 
 正常状态为 `NEW -> VERIFIED -> DRAFTED -> APPROVED -> PUBLISHED`。本阶段没有任何路径写入 `PUBLISHED`；失败和人工分支使用 `FAILED`、`REJECTED`。条目通过外部 ID、规范 URL 和内容哈希去重，事件、草稿和发布尝试均使用稳定幂等键。
 
 ## 热点规则
 
-资讯页不再分「热点候选 / 观点候选」两个页签：时间窗口内的 RSS 条目与 Reddit 等社区来源在一次采集里合并成一个 Event Cluster 列表，先由客观指标（时效、独立来源数、内容数、来源等级、互动量、spike）排序，再由 Decision/Jev 按 60/40 混合语义判断；Jev 不可用时退回 objective-only 并在结果里标 `degraded`。列表不代表统计显著热点，也不触发任何事件。
+资讯页不再分「热点候选 / 观点候选」两个页签：时间窗口内的 RSS 条目与 Reddit 等社区来源在一次采集里合并成一个 Event Cluster 列表，先由客观指标（时效、独立来源数、内容数、来源等级、互动量、spike）排序，再由 Decision/Jev 按 60/40 混合语义判断；Jev 不可用时退回 objective-only 并在结果里标 `degraded`。列表不代表统计显著热点，也不触发任何事件。编辑源 / 社区源的过滤由工具栏「来源范围」的 `scope` 承担，旧的 `lane` 参数只是 HTTP 兼容别名。
 
 统计热点由 `hotspot-check` 独立判定。默认规则全部透明且可配置：最近 60 分钟至少 6 条、至少 3 个独立来源、严格超过过去 7 天同期均值加 3 个总体标准差、至少一个 S1 或两个独立 S2/S3、触发后冷却 6 小时。互动量不是触发条件。S1 重大公告只进入候选，仍需人工审批。
 
 ## AI 模型与成本控制
 
-- 默认模型为 `unconfigured`；设置页可配置文章/翻译模型与独立聊天模型，Hermes 命令仍有 90 秒超时。
+- 默认模型为 `unconfigured`；设置页可配置文章 / 翻译 / 榜单模型；聊天模型只在 API 层配置（`POST /api/chat/model`，工作台没有聊天输入框）。Hermes 命令仍有 90 秒超时。
 - 缓存：`llm_cache` 按任务、平台、提示词版本、内容、模型、provider 和 effort 隔离，只存翻译/文章结果，不存凭据。
 - 失败降级：翻译失败时保留原文并显示原因/错误码；文章生成失败返回稳定 502、底层错误码与安全原因，不写草稿。
-- 平台稿约束（输出 JSON `title`/`body`，校验强制 CJK、精确来源 ID、AIGC 和标题长度）：微信标题 ≤ 64 字；小红书标题 ≤ 20 字。模型稿写入 `drafts`，`generator=<provider>/<model>:<effort>:<prompt-version>`。
+- 平台稿约束（输出 JSON `title`/`body`，校验强制 CJK、精确来源 ID、AIGC 和标题长度）：微信标题 ≤ 64 字；小红书标题 ≤ 20 字。模型稿写入 `drafts`，`generator=<provider>/<model>:<effort>:<prompt-version>`；当前文章 prompt 版本为 `article-v13`。
 
 ## 测试
 

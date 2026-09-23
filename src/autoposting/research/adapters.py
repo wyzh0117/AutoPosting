@@ -1,11 +1,17 @@
-"""Adapters that reuse the existing related-search and Reader services."""
+"""Adapters that reuse the retained related-search engine and Reader services.
+
+Because this adapter is now the *only* consumer of the related-search engine,
+it is also the place the engine's log/credential boundary has to be honoured:
+failure details pass through :func:`redact_related_detail` before they can
+reach a diagnostic that the research API and the dossier will carry.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
-from ..background import RelatedSearchError, search_related_news
+from ..background import RelatedSearchError, redact_related_detail, search_related_news
 from ..diagnostics import make_diagnostic
 from ..reader import ReaderService
 from .contracts import EvidenceCandidate, SearchResponse
@@ -54,7 +60,7 @@ class RelatedNewsSearchAdapter:
                 "research_search",
                 code="research_search_failed",
                 cause_code=exc.cause_code,
-                detail=exc.detail,
+                detail=redact_related_detail(exc.detail),
             )
             return SearchResponse(
                 query=query,
@@ -69,7 +75,7 @@ class RelatedNewsSearchAdapter:
                 "research_search",
                 code="research_search_failed",
                 cause_code="unknown_error",
-                detail=exc,
+                detail=redact_related_detail(exc),
             )
             return SearchResponse(
                 query=query,
