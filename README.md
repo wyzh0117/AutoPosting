@@ -26,7 +26,11 @@ autoposting collect --db data/autoposting.db --sources config/sources.example.js
 autoposting web --db data/autoposting.db --sources config/sources.example.json --port 8080
 ```
 
-然后在浏览器打开 http://127.0.0.1:8080/。资讯采集和工作台都只在本机运行。Windows 用户可用 `.venv\\Scripts\\activate` 激活环境。
+然后打开[本地工作台](http://127.0.0.1:8080/)。工作台仅监听本机地址；采集资讯和使用 AI 时会连接你配置的信息源或服务。Windows PowerShell 用户运行下面的命令：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
 
 ## 工作方式
 
