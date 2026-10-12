@@ -26,7 +26,7 @@ autoposting collect --db data/autoposting.db --sources config/sources.example.js
 autoposting web --db data/autoposting.db --sources config/sources.example.json --port 8080
 ```
 
-Open http://127.0.0.1:8080/ in your browser. Collection and the workbench run on your computer. On Windows, activate the environment with `\.venv\Scripts\activate`.
+Open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) in your browser. The workbench runs on your computer; collection and optional AI or publishing services connect to the endpoints you configure. On Windows, activate the environment in PowerShell with `.\.venv\Scripts\Activate.ps1`.
 
 ## How it works
 
