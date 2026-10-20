@@ -1,24 +1,87 @@
+# ============================================================================
+# AutoPosting — 忽略规则
+#
+# 目标：开发过程文档一律不入库、不上传 GitHub。
+#
+# ⚠️ 不要整目录忽略 docs/：src/ 在运行时会加载以下产品资源，
+#    缺失会导致新克隆无法工作，因此它们必须保持入库：
+#      docs/ARTICLE_BASE_PROMPT.md   -> src/autoposting/article_prompt.py
+#      docs/article_styles/          -> src/autoposting/article_prompt.py
+#      docs/image_prompts/           -> src/autoposting/leaderboard_prompt.py
+#                                       src/autoposting/visual/paths.py
+#      docs/skill_finder/            -> src/autoposting/skill_finder.py（COVERAGE.md）
+#      docs/RELATED_SEARCH_PROMPT.md -> 相关检索提示词（产品资产）
+#    下面只排除「开发文档」，运行时资源保持入库。
+# ============================================================================
+
+# ------------------------------------------------ 构建 / 缓存
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.venv/
-venv/
+.mypy_cache/
 build/
 dist/
 *.egg-info/
+.venv/
+venv/
 
+# ------------------------------------------------ 本地数据与密钥
 .env
+.env.*
+!.env.example
 data/
 output/
+*.db
+*.sqlite3
 
-.DS_Store
+# ------------------------------------------------ 开发文档：版本迭代说明
+docs/PATCH_*.md
+PATCH_*.md
+*_CLOSURE.md
+*_REPORT.md
+
+# ------------------------------------------------ 开发文档：规划 / 评审 / 诊断
+docs/superpowers/
+docs/PLAN.md
+docs/*PLAN*.md
+docs/*AUDIT*.md
+docs/*REMEDIATION*.md
+docs/DECISIONS.md
+
+# ------------------------------------------------ 开发文档：验收 / 测试手册
+docs/WEB_FUNCTIONAL_TEST.md
+docs/*FUNCTIONAL_TEST*.md
+
+# ------------------------------------------------ 开发文档：需求与改造方案
+docs/*NEWS_RADAR*.md
+docs/*NOTEBOOK*.md
+
+# ------------------------------------------------ 根目录开发报告 / 协作说明
+AUTOPOSTING_*.md
+AUTPOSTING_*.md
+*_PLAN*.md
+DEVELOPMENT_GUIDE*.md
+AGENTS.md
+CLAUDE.md
+
+# ------------------------------------------------ 历史归档产物（补丁包 / 快照）
+archives/
+
+# ------------------------------------------------ AI 协作工具配置
+.agents/
+.claude/
+.cursor/
 .superpowers/
+.mcp.json
+.ignore
 
-# Local history; 0.4.0 is already tracked
-archives/autoposting-patch-0.1*
-archives/autoposting-patch-0.2*
-archives/autoposting-patch-0.3*
+# ------------------------------------------------ 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
 
-# graft's local graph cache — regenerable, not committed (run `graft build`).
+# graft 本地上下文图缓存（可重建，不入库）
 graft/
